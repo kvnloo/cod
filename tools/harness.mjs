@@ -217,6 +217,15 @@ export class Session {
     );
   }
 
+  /**
+   * Runs a scripted input sequence so action moments (firing, aiming, sprinting)
+   * can be captured deterministically.
+   *   await session.act([{ hold: ['ads'], frames: 22 }, { hold: ['ads','fire'], frames: 4 }])
+   */
+  async act(steps) {
+    await this.page.evaluate((s) => globalThis.__BLACKOUT__.act(s), steps);
+  }
+
   async setHUD(on) {
     await this.page.evaluate((v) => (globalThis).__BLACKOUT__.setHUD(v), on);
   }

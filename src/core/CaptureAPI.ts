@@ -77,6 +77,27 @@ export interface BlackoutCaptureAPI {
   endProfile(): ProfileResult;
   /** Escape hatch for one-off automation; returns JSON-serialisable data. */
   probe(key: string, arg?: unknown): unknown;
+  /**
+   * Injects synthetic input, then advances `frames` steps. Lets the harness
+   * capture action moments — firing, aiming, sprinting — deterministically.
+   */
+  act(steps: ScriptedStep[]): Promise<void>;
+}
+
+/** One beat of a scripted capture sequence. */
+export interface ScriptedStep {
+  /** Actions to hold for the duration of this step. */
+  hold?: string[];
+  /** Actions to press once at the start of this step. */
+  press?: string[];
+  /** Mouse delta applied each frame of this step. */
+  lookX?: number;
+  lookY?: number;
+  /** Analog movement applied each frame, -1..1. */
+  moveX?: number;
+  moveY?: number;
+  frames?: number;
+  dt?: number;
 }
 
 declare global {

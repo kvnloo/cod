@@ -7,7 +7,7 @@
 
 import * as THREE from 'three';
 import type { Engine } from './Engine';
-import { input } from './Input';
+import { input, type Action } from './Input';
 import { settings, type QualityPreset } from './Settings';
 import { rng } from './Rand';
 import type { BlackoutCaptureAPI, FrameStats, ProfileResult, ShotDef, ShotOptions } from './CaptureAPI';
@@ -138,6 +138,24 @@ export class CaptureController {
         };
       },
       probe: (key, arg) => this.hooks.probes?.[key]?.(arg) ?? null,
+      act: async (steps) => {
+        for (const s of steps) {
+          const frames = s.frames ?? 1;
+          const dt = s.dt ?? 1 / 60;
+          if (s.press?.length) input.inject({ press: s.press as Action[] });
+          for (let i = 0; i < frames; i++) {
+            input.inject({
+              hold: (s.hold ?? []) as Action[],
+              mouseDX: s.lookX ?? 0,
+              mouseDY: s.lookY ?? 0,
+              moveX: s.moveX ?? 0,
+              moveY: s.moveY ?? 0,
+            });
+            engine.stepFrame(dt);
+          }
+          input.inject({ release: (s.hold ?? []) as Action[] });
+        }
+      },
     };
 
     globalThis.__BLACKOUT__ = api;

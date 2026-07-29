@@ -1,8 +1,6 @@
 /**
- * PlayerSystem — first-person controller: movement state machine, camera,
- * health and interaction.
- *
- * STUB: free-look + basic walk so the world can be inspected.
+ * PlayerSystem — binds input, movement, camera and health together and publishes
+ * everything the rest of the game needs on the bus.
  */
 
 import * as THREE from 'three';
@@ -11,78 +9,192 @@ import { ORDER } from '../core/Engine';
 import { input } from '../core/Input';
 import { settings } from '../core/Settings';
 import { bus } from '../core/EventBus';
-import type { PhysicsSystem } from '../physics/Physics';
-import { makeMoveResult } from '../physics/Physics';
-import type { CharacterController } from '../physics/types';
+import type { PhysicsAPI } from '../physics/types';
+import type { RenderAPI } from '../render/types';
+import { Movement, TUNING, type MoveState } from './Movement';
+import { CameraRig } from './CameraRig';
 
-export type MoveState = 'idle' | 'walk' | 'run' | 'sprint' | 'crouch' | 'crouchWalk' | 'prone' | 'slide' | 'air' | 'mantle';
+const HEALTH: Record<string, number> = {
+  max: 100,
+  /** Seconds without damage before regeneration begins. */
+  regenDelay: 4.2,
+  /** Health per second once regenerating. */
+  regenRate: 34,
+  /** Below this fraction the screen effects kick in hard. */
+  criticalFraction: 0.34,
+};
 
 export class PlayerSystem implements System {
   readonly name = 'player';
   readonly order = ORDER.PLAYER;
 
-  readonly position = new THREE.Vector3(0, 1.7, 8);
-  readonly velocity = new THREE.Vector3();
-  yaw = Math.PI;
-  pitch = 0;
-  state: MoveState = 'idle';
-  health = 100;
-  maxHealth = 100;
-  grounded = true;
-  eyeHeight = 1.68;
+  readonly movement = new Movement();
+  readonly camera = new CameraRig();
 
-  private controller: CharacterController | null = null;
-  private moveResult = makeMoveResult();
-  private physics!: PhysicsSystem;
+  health = HEALTH.max;
+  readonly maxHealth = HEALTH.max;
+  alive = true;
+  /** Entity id used by AI targeting and damage routing. */
+  readonly entityId = 1;
+
+  private timeSinceDamage = 999;
+  private adsBlend = 0;
+  private renderApi: RenderAPI | null = null;
+  private physics: PhysicsAPI | null = null;
+  private readonly _dir = new THREE.Vector3();
+  private readonly _spawn = new THREE.Vector3(0, TUNING.standHeight * 0.5, 8);
+  private spawnYaw = Math.PI;
 
   async init(ctx: EngineContext): Promise<void> {
-    this.physics = ctx.engine.get<PhysicsSystem>('physics');
-    this.controller = this.physics.createCharacter(0.36, 1.78);
-    bus.emit('player:spawn', { point: this.position.clone() });
+    this.physics = ctx.engine.tryGet<System & PhysicsAPI>('physics') ?? null;
+    this.renderApi = ctx.engine.tryGet<System & RenderAPI>('render') ?? null;
+    if (this.physics) this.movement.attach(this.physics);
+
+    this.movement.teleport(this._spawn, this.spawnYaw);
+    this.camera.reset(this.spawnYaw);
+
+    bus.on('damage:taken', (e) => this.applyDamage(e.amount, e.fromDirection, e.lethal));
+    bus.on('weapon:ads', (e) => { void e; });
+    bus.emit('player:spawn', { point: this._spawn.clone() });
   }
+
+  /** Places the player at a level-provided spawn. */
+  spawnAt(position: THREE.Vector3, yaw: number): void {
+    this._spawn.copy(position);
+    this.spawnYaw = yaw;
+    this.movement.teleport(position, yaw);
+    this.camera.reset(yaw);
+    this.health = HEALTH.max;
+    this.alive = true;
+    this.timeSinceDamage = 999;
+    bus.emit('player:spawn', { point: position.clone() });
+    bus.emit('player:health', { health: this.health, max: this.maxHealth, regen: false });
+  }
+
+  get position(): THREE.Vector3 { return this.movement.position; }
+  get velocity(): THREE.Vector3 { return this.movement.velocity; }
+  get state(): MoveState { return this.movement.out.state; }
+  get grounded(): boolean { return this.movement.out.grounded; }
+  get speed01(): number { return this.movement.out.speed01; }
+  get ads(): number { return this.adsBlend; }
 
   fixedUpdate(dt: number, _ctx: EngineContext): void {
+    if (!this.alive) return;
+
+    const prevState = this.movement.out.state;
+    const out = this.movement.step(dt, this.camera.yaw);
+
+    if (out.landImpact > 0) {
+      this.camera.land(out.landImpact);
+      bus.emit('player:land', {
+        point: this.position.clone(),
+        force: out.landImpact,
+        surface: out.groundSurface,
+      });
+      // Fall damage above a survivable drop.
+      if (out.landImpact > 15.5) {
+        const dmg = (out.landImpact - 15.5) * 9;
+        this._dir.set(0, 1, 0);
+        this.applyDamage(dmg, this._dir, false);
+      }
+    }
+    if (out.state !== prevState) bus.emit('player:move:state', { state: out.state });
+
+    /* --- health regeneration ------------------------------------------- */
+    this.timeSinceDamage += dt;
+    if (this.health < HEALTH.max && this.timeSinceDamage > HEALTH.regenDelay) {
+      const before = this.health;
+      this.health = Math.min(HEALTH.max, this.health + HEALTH.regenRate * dt);
+      if (Math.floor(before) !== Math.floor(this.health)) {
+        bus.emit('player:health', { health: this.health, max: this.maxHealth, regen: true });
+      }
+    }
+  }
+
+  update(dt: number, ctx: EngineContext): void {
     const s = input.state;
-    const speed = input.held('sprint') ? 7.2 : input.held('crouch') ? 2.2 : 4.6;
+    const adsHeld = input.held('ads');
 
-    const forward = new THREE.Vector3(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
-    const right = new THREE.Vector3(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
-    const wish = new THREE.Vector3()
-      .addScaledVector(forward, s.moveY)
-      .addScaledVector(right, s.moveX);
-    if (wish.lengthSq() > 1) wish.normalize();
+    // ADS blend is presentation-rate so it stays smooth above the sim rate.
+    const adsSpeed = adsHeld ? 9.5 : 12;
+    this.adsBlend += ((adsHeld ? 1 : 0) - this.adsBlend) * (1 - Math.exp(-adsSpeed * dt));
+    if (this.adsBlend < 0.001) this.adsBlend = 0;
+    this.camera.setAds(this.adsBlend);
 
-    this.velocity.x = wish.x * speed;
-    this.velocity.z = wish.z * speed;
-    this.velocity.y -= 22 * dt;
-    if (this.grounded && input.pressed('jump')) this.velocity.y = 6.2;
+    this.camera.look(s.mouseDX, s.mouseDY, dt, adsHeld);
+    if (s.usingGamepad) this.camera.stick(s.lookX, s.lookY, dt, adsHeld);
 
-    const motion = this.velocity.clone().multiplyScalar(dt);
-    if (this.controller) {
-      const next = this.controller.move(this.position, motion, dt, this.moveResult);
-      this.position.copy(next);
-      this.grounded = this.moveResult.grounded;
-      if (this.grounded && this.velocity.y < 0) this.velocity.y = 0;
-    } else {
-      this.position.add(motion);
+    this.camera.update(dt, this.movement.out, this.position, ctx.camera);
+
+    // Depth of field focuses where the player is looking.
+    if (this.renderApi && settings.gfx.dof) {
+      this._dir.set(0, 0, -1).applyQuaternion(ctx.camera.quaternion);
+      let focus = 12;
+      if (this.physics) {
+        const hit = this.physics.raycast(
+          ctx.camera.position, this._dir, 120, 0xffff,
+          (this.physics as unknown as { _scratchHit?: never })._scratchHit ?? scratchHit(),
+        );
+        if (hit.hit) focus = hit.distance;
+      }
+      this.renderApi.setFocusDistance(focus);
+      this.renderApi.setExposureCompensation(this.adsBlend * -0.25);
     }
 
-    const moving = wish.lengthSq() > 0.01;
-    this.state = !this.grounded ? 'air'
-      : input.held('crouch') ? (moving ? 'crouchWalk' : 'crouch')
-        : !moving ? 'idle'
-          : input.held('sprint') ? 'sprint' : 'run';
+    // Low-health screen feedback.
+    const frac = this.health / HEALTH.max;
+    if (this.renderApi && frac < HEALTH.criticalFraction) {
+      const t = 1 - frac / HEALTH.criticalFraction;
+      this.renderApi.screenEffect({ damage: { intensity: t * 0.55 } });
+    }
   }
 
-  update(_dt: number, ctx: EngineContext): void {
-    const g = settings.game;
-    const sens = g.sensitivity * 0.0022;
-    this.yaw -= input.state.mouseDX * sens;
-    this.pitch -= input.state.mouseDY * sens * (g.invertY ? -1 : 1);
-    this.pitch = THREE.MathUtils.clamp(this.pitch, -Math.PI / 2 + 0.02, Math.PI / 2 - 0.02);
+  applyDamage(amount: number, fromDirection: THREE.Vector3, forceLethal: boolean): void {
+    if (!this.alive || amount <= 0) return;
+    this.health -= amount;
+    this.timeSinceDamage = 0;
 
-    const cam = ctx.camera;
-    cam.position.set(this.position.x, this.position.y + (this.eyeHeight - 0.89), this.position.z);
-    cam.rotation.set(this.pitch, this.yaw, 0, 'YXZ');
+    this.camera.addShake(Math.min(0.09, amount * 0.0022), 26, 0.3);
+    this.renderApi?.screenEffect({ damage: { intensity: Math.min(1, amount / 45), direction: fromDirection.clone() } });
+    input.rumble(Math.min(1, amount / 60), 0.3, 160);
+    bus.emit('player:health', { health: Math.max(0, this.health), max: this.maxHealth, regen: false });
+
+    if (this.health <= 0 || forceLethal) {
+      this.health = 0;
+      this.alive = false;
+      bus.emit('entity:death', {
+        id: this.entityId, byPlayer: false, headshot: false,
+        name: 'player', point: this.position.clone(),
+      });
+    }
   }
+
+  heal(amount: number): void {
+    if (!this.alive) return;
+    this.health = Math.min(HEALTH.max, this.health + amount);
+    bus.emit('player:health', { health: this.health, max: this.maxHealth, regen: false });
+  }
+
+  revive(): void {
+    this.alive = true;
+    this.health = HEALTH.max;
+    this.timeSinceDamage = 999;
+    bus.emit('player:health', { health: this.health, max: this.maxHealth, regen: false });
+  }
+
+  dispose(): void { this.movement.dispose(); }
+}
+
+/** Lazily-created scratch hit so the DoF probe never allocates per frame. */
+let _hit: ReturnType<typeof makeHit> | null = null;
+function makeHit() {
+  return {
+    hit: false, point: new THREE.Vector3(), normal: new THREE.Vector3(0, 1, 0),
+    distance: Infinity, surface: 'concrete' as const, object: null,
+    entityId: -1, bodyHandle: -1, zone: 'none' as const, backface: false,
+  };
+}
+function scratchHit() {
+  if (!_hit) _hit = makeHit();
+  return _hit;
 }

@@ -1,0 +1,1 @@
+hermes-autoresearch @ git+https://github.com/AtlasOmnia/hermes-autoresearch.git@b086c2e2f32fcb3914940326c39f4446760696f1

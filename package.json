@@ -9,8 +9,10 @@
     "build": "vite build",
     "preview": "vite preview --port 4173 --strictPort",
     "typecheck": "tsc --noEmit",
+    "test": "node --test tools/autoresearch/*.test.mjs",
     "shots": "node tools/capture.mjs",
-    "perf": "node tools/perf.mjs"
+    "perf": "node tools/perf.mjs",
+    "autoresearch": "node tools/autoresearch/pipeline.mjs"
   },
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.19.3",

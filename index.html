@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="dark" />
+  <title>OPERATION BLACKOUT</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;500;600;700&family=Barlow:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap"
+    rel="stylesheet" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --hud-accent: #d9e6ff;
+      --hud-warn: #ff5a3c;
+      --hud-good: #7dffb2;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #05070a;
+      font-family: 'Barlow', system-ui, sans-serif;
+      color: #e8eef7;
+      -webkit-font-smoothing: antialiased;
+      touch-action: none;
+      overscroll-behavior: none;
+    }
+
+    #app { position: fixed; inset: 0; }
+
+    canvas#viewport {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      cursor: none;
+      touch-action: none;
+    }
+
+    #ui-root {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      user-select: none;
+      z-index: 10;
+    }
+
+    #boot {
+      position: absolute;
+      inset: 0;
+      z-index: 100;
+      display: grid;
+      place-items: center;
+      background: radial-gradient(120% 90% at 50% 40%, #0d1219 0%, #04060a 70%);
+      transition: opacity 700ms cubic-bezier(.22, 1, .36, 1);
+    }
+
+    #boot.done { opacity: 0; pointer-events: none; }
+
+    .boot-inner { text-align: center; width: min(560px, 78vw); }
+
+    .boot-title {
+      font-family: 'Barlow Condensed', sans-serif;
+      font-weight: 700;
+      font-size: clamp(34px, 7vw, 68px);
+      letter-spacing: .22em;
+      text-transform: uppercase;
+      color: #eef4ff;
+      text-shadow: 0 0 30px rgba(120, 170, 255, .28);
+    }
+
+    .boot-sub {
+      margin-top: 6px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      letter-spacing: .4em;
+      text-transform: uppercase;
+      color: #6d7d92;
+    }
+
+    .boot-bar {
+      margin-top: 34px;
+      height: 2px;
+      width: 100%;
+      background: rgba(255, 255, 255, .08);
+      overflow: hidden;
+    }
+
+    .boot-bar > i {
+      display: block;
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #4f7dff, #9ecbff);
+      box-shadow: 0 0 14px rgba(120, 170, 255, .8);
+      transition: width 240ms ease-out;
+    }
+
+    .boot-status {
+      margin-top: 12px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10.5px;
+      letter-spacing: .16em;
+      color: #5b6b80;
+      min-height: 14px;
+      text-transform: uppercase;
+    }
+
+    #fatal {
+      position: absolute;
+      inset: 0;
+      z-index: 200;
+      display: none;
+      place-items: center;
+      background: #07090d;
+      padding: 40px;
+    }
+
+    #fatal.show { display: grid; }
+
+    #fatal pre {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      line-height: 1.6;
+      color: #ff8f7a;
+      max-width: 900px;
+      max-height: 70vh;
+      overflow: auto;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="app">
+    <canvas id="viewport"></canvas>
+    <div id="ui-root"></div>
+    <div id="boot">
+      <div class="boot-inner">
+        <div class="boot-title">Operation Blackout</div>
+        <div class="boot-sub">Tactical Response Division</div>
+        <div class="boot-bar"><i id="boot-fill"></i></div>
+        <div class="boot-status" id="boot-status">Initialising</div>
+      </div>
+    </div>
+    <div id="fatal">
+      <pre id="fatal-text"></pre>
+    </div>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+
+</html>

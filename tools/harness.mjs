@@ -58,6 +58,16 @@ export function findChrome() {
 /* ------------------------------------------------------------------ server -- */
 
 let sharedServer = null;
+let signalCleanupStarted = false;
+
+for (const [signal, exitCode] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+  process.once(signal, async () => {
+    if (signalCleanupStarted) return;
+    signalCleanupStarted = true;
+    await stopServer();
+    process.exit(exitCode);
+  });
+}
 
 /**
  * Starts (once) a static server for the production build, or reuses an already
@@ -69,8 +79,7 @@ export async function ensureServer({ mode = 'preview', port = 4173, quiet = true
 
   const url = `http://127.0.0.1:${port}`;
   if (await isUp(url)) {
-    sharedServer = { url, proc: null };
-    return url;
+    throw new Error(`refusing to benchmark an unowned server already listening on ${url}`);
   }
 
   const args = mode === 'dev'
@@ -81,6 +90,10 @@ export async function ensureServer({ mode = 'preview', port = 4173, quiet = true
     cwd: ROOT,
     stdio: quiet ? ['ignore', 'pipe', 'pipe'] : 'inherit',
     env: { ...process.env, FORCE_COLOR: '0' },
+    // stopServer kills the negative PID so Vite and any child process must share
+    // their own process group. Without this, inherited pipe handles keep perf and
+    // capture CLIs alive after their work has completed.
+    detached: true,
   });
   proc.unref?.();
 
@@ -92,7 +105,7 @@ export async function ensureServer({ mode = 'preview', port = 4173, quiet = true
     }
     await sleep(300);
   }
-  proc.kill('SIGKILL');
+  try { process.kill(-proc.pid, 'SIGKILL'); } catch { proc.kill('SIGKILL'); }
   throw new Error(`server did not come up on ${url}`);
 }
 
@@ -199,6 +212,14 @@ export class Session {
   /** Names of every registered camera shot. */
   shots() {
     return this.page.evaluate(() => (globalThis).__BLACKOUT__.listShots());
+  }
+
+  shotInfo(name) {
+    return this.page.evaluate((n) => {
+      const info = (globalThis).__BLACKOUT__.shotInfo(n);
+      if (!info) return null;
+      return { ...info, setupSource: typeof info.setup === 'function' ? String(info.setup) : null };
+    }, name);
   }
 
   /** Positions the world/camera for a named shot and settles temporal effects. */

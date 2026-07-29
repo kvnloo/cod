@@ -2,6 +2,9 @@ node_modules/
 dist/
 dist-*/
 shots/
+runs/
+worktree/
+.autoresearch-venv/
 *.log
 .DS_Store
 .vite/

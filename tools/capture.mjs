@@ -59,12 +59,12 @@ async function main() {
 
   await session.setHUD(showHud);
   for (const name of names) {
-    const info = await session.page.evaluate((n) => globalThis.__BLACKOUT__.shotInfo(n), name);
+    const info = await session.shotInfo(name);
     await session.setShot(name, {});
     const file = path.join(outDir, `${name}.png`);
     await session.shoot(file);
     const stats = await session.stats();
-    manifest.shots.push({ name, file: path.relative(ROOT, file), description: info?.description ?? '', stats });
+    manifest.shots.push({ name, file: path.relative(ROOT, file), description: info?.description ?? '', definition: info, stats });
     console.log(
       `[capture] ${name.padEnd(22)} ${stats.drawCalls} calls  ` +
       `${(stats.triangles / 1000).toFixed(0)}k tris  ${stats.frameMs.toFixed(1)}ms`,

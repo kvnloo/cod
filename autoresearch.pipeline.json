@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "worktreeRoot": "worktree/autoresearch",
+  "harness": {
+    "repository": "https://github.com/AtlasOmnia/hermes-autoresearch.git",
+    "commit": "b086c2e2f32fcb3914940326c39f4446760696f1"
+  },
+  "loops": {
+    "performance": {
+      "branch": "autoresearch/performance",
+      "preset": "low",
+      "guardPreset": "cinematic",
+      "objective": "Improve worst-shot frame rate and frame pacing on the low preset without removing or weakening cinematic-only rendering features. Make exactly one measured, preset-gated optimization per trial.",
+      "allowlist": ["src"],
+      "protectedPaths": ["src/main.ts", "src/core/Capture.ts", "src/core/CaptureAPI.ts", "src/core/Shots.ts", "src/core/Settings.ts", "src/core/Engine.ts", "src/render/Renderer.ts"],
+      "expectedShots": ["overview", "eye-level"],
+      "maxTrials": 12,
+      "maxSeconds": 28800,
+      "stopAfterNoImprove": 3,
+      "minImprovement": 0.5,
+      "commandTimeoutSeconds": 1800,
+      "evaluator": {
+        "kind": "performance",
+        "width": 1920,
+        "height": 1080,
+        "measureMs": 3000,
+        "minFps": 60,
+        "maxP95Ms": 20,
+        "maxP99Ms": 33.4,
+        "maxGuardRegressionPercent": 5
+      }
+    },
+    "cinematic": {
+      "branch": "autoresearch/cinematic",
+      "preset": "cinematic",
+      "guardPreset": "low",
+      "objective": "Improve the deterministic cinematic shot pack against docs/VISUAL-BAR.md without weakening the low preset. Make exactly one focused, preset-gated visual improvement per trial; never game the camera, shot list, capture harness, or evaluator.",
+      "allowlist": ["src"],
+      "protectedPaths": ["src/main.ts", "src/core/Capture.ts", "src/core/CaptureAPI.ts", "src/core/Shots.ts", "src/core/Settings.ts", "src/core/Engine.ts", "src/render/Renderer.ts"],
+      "expectedShots": ["overview", "eye-level"],
+      "maxTrials": 8,
+      "maxSeconds": 28800,
+      "stopAfterNoImprove": 3,
+      "minImprovement": 0.25,
+      "targetScore": 60,
+      "commandTimeoutSeconds": 1800,
+      "evaluator": {
+        "kind": "cinematic",
+        "width": 2560,
+        "height": 1440,
+        "measureMs": 3000,
+        "minFps": 30,
+        "maxP95Ms": 40,
+        "minVisualScore": 0,
+        "maxGuardRegressionPercent": 5
+      }
+    }
+  }
+}

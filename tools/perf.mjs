@@ -38,9 +38,10 @@ async function main() {
     const session = await openSession({ url: base, width, height, quality: preset });
     const shots = await session.shots();
     for (const name of shots) {
+      const shotDefinition = await session.shotInfo(name);
       await session.setShot(name, {});
       const prof = await session.measure(ms);
-      results.push({ preset, shot: name, ...prof });
+      results.push({ preset, shot: name, shotDefinition, ...prof });
       const flag99 = prof.p99 > 16.7 ? '  ⚠ p99 over 60fps budget' : '';
       console.log(
         `${preset.padEnd(10)} ${name.padEnd(22)} ` +

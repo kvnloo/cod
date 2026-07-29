@@ -8,6 +8,7 @@ import { input } from './core/Input';
 import { settings, autoDetectPreset } from './core/Settings';
 import { bus } from './core/EventBus';
 import { CAPTURE_MODE, CaptureController } from './core/Capture';
+import { DEBUG_SCENE, allShots, debugSceneNames, getDebugScene } from './core/Shots';
 
 import { RenderSystem } from './render/Renderer';
 import { PhysicsSystem } from './physics/Physics';
@@ -84,9 +85,16 @@ async function boot(): Promise<void> {
   await render.renderer.compileAsync(engine.scene, engine.camera);
 
   progress(0.9, 'Arming capture');
+  // A debug scene, when requested, takes over the world entirely.
+  if (DEBUG_SCENE) {
+    const build = getDebugScene(DEBUG_SCENE);
+    if (build) await build({ engine, scene: engine.scene, camera: engine.camera, time: engine.time });
+    else console.warn(`[boot] unknown debug scene "${DEBUG_SCENE}"; have: ${debugSceneNames().join(', ')}`);
+  }
+
   const capture = new CaptureController(engine);
   const world = engine.get<WorldSystem>('world');
-  capture.registerShots(world.captureShots());
+  capture.registerShots([...world.captureShots(), ...allShots()]);
   capture.install(CAPTURE_MODE);
 
   input.attach(canvas);

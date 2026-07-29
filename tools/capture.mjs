@@ -47,7 +47,11 @@ async function main() {
   const base = await ensureServer({ port, outDir: distDir });
   await cleanDir(outDir);
 
-  const session = await openSession({ url: base, width, height, quality });
+  const debug = flag('debug');
+  const session = await openSession({
+    url: debug ? `${base}/?debug=${encodeURIComponent(String(debug))}` : base,
+    width, height, quality,
+  });
   console.log(`[capture] GPU: ${session.renderer}`);
 
   const names = only ?? (await session.shots());

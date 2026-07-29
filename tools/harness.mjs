@@ -162,7 +162,8 @@ export async function openSession({
     if (!/ERR_ABORTED/.test(f)) errors.push(`requestfailed ${r.url()} ${f}`);
   });
 
-  const target = `${base}/?capture=1&quality=${encodeURIComponent(quality)}&seed=${seed}`;
+  const sep = base.includes('?') ? '&' : '/?';
+  const target = `${base}${sep}capture=1&quality=${encodeURIComponent(quality)}&seed=${seed}`;
   await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 60_000 });
 
   // Wait for the game to report readiness through the capture contract.

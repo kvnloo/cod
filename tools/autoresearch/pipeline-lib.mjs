@@ -32,7 +32,7 @@ export function validatePipelineManifest(manifest) {
       || isolation.exclusiveSignalPauseCommands.some((command) => typeof command !== 'string' || !command)) {
     throw new Error('resource isolation requires an exclusiveSignalPauseCommands array');
   }
-  for (const field of ['maxCpuUtilization', 'maxGpuUtilization']) {
+  for (const field of ['maxCpuUtilization', 'maxGpuUtilization', 'maxMemoryPressure', 'maxIoPressure']) {
     const value = finiteNumber(isolation[field], `resourceIsolation.${field}`);
     if (value < 0 || value > 100) throw new Error(`resourceIsolation.${field} must be within 0..100`);
   }

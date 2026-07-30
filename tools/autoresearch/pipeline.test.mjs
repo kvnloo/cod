@@ -18,6 +18,8 @@ const manifest = {
     exclusiveSignalPauseCommands: ['python3'],
     maxCpuUtilization: 20,
     maxGpuUtilization: 20,
+    maxMemoryPressure: 1,
+    maxIoPressure: 1,
     quietSamples: 3,
     sampleIntervalMs: 1000,
     maxWaitSeconds: 60,

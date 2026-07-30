@@ -163,6 +163,15 @@ export class Animator {
 
   private dying = false;
   private frozen = false;
+  /**
+   * Holds the graph exactly where it stands.
+   *
+   * Capture tooling needs a character stopped at a chosen millisecond — the
+   * frame 120 ms into a hit reaction is the one that says whether it reads as
+   * an impact — and the character system updates every character it owns, so a
+   * debug driver cannot achieve that by simply not calling `update`.
+   */
+  paused = false;
 
   constructor(private rig: RigInstance, private root: THREE.Object3D) {
     this.footIK = new FootIK(rig);
@@ -336,7 +345,7 @@ export class Animator {
   /* --------------------------------------------------------------- update */
 
   update(dt: number): void {
-    if (this.frozen) return;
+    if (this.frozen || this.paused) return;
     const d = Math.min(dt, 0.1);
 
     this.advance(d);

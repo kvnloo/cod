@@ -198,14 +198,22 @@ export class AmmoPanel implements Widget {
       return;
     }
 
-    // One pip per round, grouped when the magazine is very large.
+    // One pip per round, grouped when the magazine is very large. Spent rounds
+    // keep most of their height and drop to a dark track instead of shrinking to
+    // dots — at 5.5 px the empty row read as a dashed rule, not a magazine.
     const group = mag > 60 ? Math.ceil(mag / 60) : 1;
     const count = Math.ceil(mag / group);
-    const gap = Math.max(1.4 * s, width / count * 0.28);
-    const pw = Math.max(1.6 * s, (width - gap * (count - 1)) / count);
+    const gap = Math.max(1.2 * s, width / count * 0.2);
+    const pw = Math.max(1.8 * s, (width - gap * (count - 1)) / count);
     const full = 15 * s;
-    const empty = 5.5 * s;
+    const empty = 9 * s;
     const loaded = Math.ceil(w.ammo / group);
+    const low = w.ammo / mag <= 0.25;
+
+    // Dark trough behind the whole strip: gives the spent rounds something to be
+    // spent *into*, and keeps the row readable over a bright wall.
+    c.fillStyle = 'rgba(2,5,10,0.5)';
+    c.fillRect(x - 1.5 * s, y - full - 1.5 * s, width + 3 * s, full + 3 * s);
 
     for (let i = 0; i < count; i++) {
       const lit = i < loaded;
@@ -213,10 +221,10 @@ export class AmmoPanel implements Widget {
       const h = lit ? full : empty;
       if (lit) {
         const edge = i === loaded - 1;
-        const col = w.ammo / mag <= 0.25 ? p.warn : p.ink;
-        c.fillStyle = rgba(edge ? lift(col, 0.5) : col, edge ? 1 : 0.88);
+        const col = low ? p.warn : p.ink;
+        c.fillStyle = rgba(edge ? lift(col, 0.5) : col, edge ? 1 : 0.92);
       } else {
-        c.fillStyle = rgba(p.hair, 0.2);
+        c.fillStyle = rgba(p.hair, 0.26);
       }
       c.fillRect(px, y - h, pw, h);
     }

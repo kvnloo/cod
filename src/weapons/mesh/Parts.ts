@@ -21,6 +21,7 @@ import {
   panelLines, picatinny, pipeZ, prismX, rod, screwHead, slingSocket, torusZ,
   ventRing, xf, type LoftRing, type Pt2, type ProfilePt,
 } from './Geo';
+import { makeReticle, type ReticleKind, type ReticleMode } from './Reticle';
 
 export interface BuildCtx {
   b: RigBuilder;
@@ -45,6 +46,8 @@ export interface BuildCtx {
   lowerTop: number;
   /** Centre-line Y of the upper receiver body. */
   upperMidY: number;
+  /** Optical axis height of the fitted sight, or 0 when there is no optic. */
+  opticAxisY: number;
 }
 
 export function makeCtx(b: RigBuilder, def: WeaponDef, attachments: readonly AttachmentDef[]): BuildCtx {
@@ -68,6 +71,7 @@ export function makeCtx(b: RigBuilder, def: WeaponDef, attachments: readonly Att
     topY,
     lowerTop: topY - upperH,
     upperMidY: topY - upperH * 0.5,
+    opticAxisY: 0,
   };
 }
 
@@ -748,6 +752,23 @@ export function optic(ctx: BuildCtx, att: AttachmentDef): void {
 
   b.part('optic', [0, railTop, mountZ]);
 
+  /**
+   * Declares the illuminated mark. `z` is the plane the dot is projected onto
+   * — always the *front* element, because that is where a reflex sight's dot
+   * actually lives and it is what makes the dot occlude correctly against the
+   * hood when the eye moves off axis.
+   */
+  const mark = (
+    r: ReticleKind, z: number, axisY: number, window: number, moa: number,
+    color: number, intensity: number, mode: ReticleMode = 'emissive',
+  ): void => {
+    // 1 MOA = 1/60°. The quad's half-width is the design half-angle, so the
+    // shader's unit circle is exactly the reticle envelope.
+    b.reticle(makeReticle({ kind: r, color, intensity, mode }), {
+      parent: 'optic', z, axisY, window, halfAngle: (moa / 60) * (Math.PI / 180),
+    });
+  };
+
   const mount = (w: number, len: number, h: number, z: number): void => {
     b.add(xf(chamferBox(w, h, len, 0.0012), { pos: [0, railTop + h / 2, z] }), 'alu');
     b.add(xf(chamferBox(w * 0.42, h * 0.9, 0.008, 0.0008), { pos: [w * 0.62, railTop + h * 0.45, z] }), 'alu');
@@ -788,29 +809,48 @@ export function optic(ctx: BuildCtx, att: AttachmentDef): void {
       b.add(xf(chamferBox(0.020, h + r * 0.7, len * 0.42, 0.0010),
         { pos: [0, railTop + (h + r * 0.7) * 0.5, mountZ + len * 0.02] }), 'alu');
       ctx.sight.set(0, cy, k - 0.004);
+      mark('dot', f + 0.004, cy, (r - wall) * 0.86, 44.0, 0xff3a12, 6.5);
+      ctx.opticAxisY = cy;
       break;
     }
     case 'holo': {
       const len = att.build.length ?? 0.086;
       const r = att.build.radius ?? 0.023;
       const h = (att.build.sightHeight ?? 0.040) - r * 0.55;
-      mount(0.030, len * 0.55, Math.max(0.004, h), mountZ + 0.010);
-      const cy = railTop + Math.max(0.004, h) + r * 0.55;
-      // Squared hood over a wide window.
-      b.add(xf(chamferBox(r * 1.7, r * 1.25, len * 0.55, 0.0016), { pos: [0, cy, mountZ + len * 0.20] }), mat);
+      const hb = Math.max(0.004, h);
+      mount(0.030, len * 0.42, hb, mountZ + len * 0.30);
+      const cy = railTop + hb + r * 0.55;
+      // An open rectangular hood, four plates, with the electronics housing
+      // slung *forward and low* — clear of the sight line. The previous build
+      // put a solid block across the rear of the window, so aiming the
+      // holographic sight meant staring at the back of a grey box.
+      const hw = r * 0.86, hh = r * 0.62;
+      const zF = mountZ - len * 0.40, zR = mountZ + len * 0.46;
+      const hoodLen = zR - zF;
+      const hoodZ = (zF + zR) * 0.5;
       for (const s of [1, -1]) {
-        b.add(xf(chamferBox(0.0032, r * 1.30, len * 0.46, 0.0009),
-          { pos: [s * (r * 0.82), cy, mountZ - len * 0.25] }), mat);
+        b.add(xf(chamferBox(0.0032, hh * 2.1, hoodLen, 0.0009),
+          { pos: [s * hw, cy, hoodZ] }), mat);
       }
-      b.add(xf(chamferBox(r * 1.7, 0.0032, len * 0.46, 0.0009), { pos: [0, cy + r * 0.63, mountZ - len * 0.25] }), mat);
-      b.add(xf(chamferBox(r * 1.7, 0.0032, len * 0.46, 0.0009), { pos: [0, cy - r * 0.63, mountZ - len * 0.25] }), mat);
-      b.add(xf(chamferBox(r * 1.52, r * 1.16, 0.0022, 0.0005), { pos: [0, cy, mountZ - len * 0.05] }), 'lens');
-      // Buttons.
-      for (const s of [1, -1]) {
-        b.add(xf(chamferBox(0.0055, 0.005, 0.0075, 0.0008),
-          { pos: [s * 0.004, cy - r * 0.66, mountZ + len * 0.40] }), mat);
+      b.add(xf(chamferBox(hw * 2.1, 0.0034, hoodLen, 0.0009), { pos: [0, cy + hh, hoodZ] }), mat);
+      b.add(xf(chamferBox(hw * 2.1, 0.0034, hoodLen * 0.55, 0.0009),
+        { pos: [0, cy - hh, hoodZ + hoodLen * 0.22] }), mat);
+      // Housing: laser module and battery, under the optical path at the front.
+      b.add(xf(chamferBox(hw * 2.0, r * 0.62, len * 0.40, 0.0014),
+        { pos: [0, cy - hh - r * 0.30, mountZ - len * 0.26] }), mat);
+      b.add(xf(chamferBox(hw * 1.5, r * 0.34, len * 0.16, 0.0010),
+        { pos: [0, cy - hh - r * 0.62, mountZ - len * 0.30] }), 'alu');
+      // Rear glass: what the hologram is projected onto.
+      b.add(xf(chamferBox(hw * 1.9, hh * 1.85, 0.0022, 0.0005),
+        { pos: [0, cy, mountZ + len * 0.28] }), 'lens');
+      // Buttons on the left of the housing.
+      for (const s of [0, 1]) {
+        b.add(xf(chamferBox(0.0055, 0.0050, 0.0075, 0.0008),
+          { pos: [-hw - 0.004, cy - hh - r * 0.30, mountZ - len * 0.16 + s * 0.010] }), mat);
       }
-      ctx.sight.set(0, cy, mountZ + len * 0.44);
+      ctx.sight.set(0, cy, mountZ + len * 0.46);
+      mark('holoRing', mountZ + len * 0.26, cy, hh * 0.92, 38, 0xff2a10, 5.0);
+      ctx.opticAxisY = cy;
       break;
     }
     case 'acog': {
@@ -841,6 +881,10 @@ export function optic(ctx: BuildCtx, att: AttachmentDef): void {
       b.add(xf(lathe([[-len * 0.16, 0.0016], [len * 0.10, 0.0016]], 8),
         { pos: [0, cy + r * 1.02, mountZ - len * 0.06] }), 'brass');
       ctx.sight.set(0, cy, mountZ + len * 0.47);
+      // 4× magnification: the chevron subtends a quarter of the angle it would
+      // at 1×, which is why a magnified reticle looks so much finer.
+      mark('chevron', mountZ - len * 0.44, cy, r * 0.80, 96, 0xff3a14, 2.4, 'etched');
+      ctx.opticAxisY = cy;
       break;
     }
     case 'sniperScope': {
@@ -875,6 +919,9 @@ export function optic(ctx: BuildCtx, att: AttachmentDef): void {
       b.add(xf(lathe([[0, 0.0075], [0.008, 0.0075]], 12),
         { pos: [-r * 0.70, cy, mountZ - len * 0.02], rot: [0, -Math.PI / 2, 0] }), mat);
       ctx.sight.set(0, cy, mountZ + len * 0.485);
+      // 9×: an etched duplex, black on the image the objective forms.
+      mark('mildot', mountZ - len * 0.45, cy, r * 0.88, 170, 0x080604, 1.0, 'etched');
+      ctx.opticAxisY = cy;
       break;
     }
     default:

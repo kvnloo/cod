@@ -94,16 +94,16 @@ export class SmokeFX {
     const rand = w.rand;
     const q = w.quads;
     const dist = w.distanceToCamera(point.x, point.y, point.z);
-    const prox = clamp(1 - dist / 22, 0, 1);
+    const prox = clamp(1 - dist / 15, 0, 1);
 
     // World-space bloom — visible to anyone who is not the one blinded.
     q.begin({
       px: point.x, py: point.y, pz: point.z,
       w0: 0.5, h0: 0.5, w1: 9, h1: 9,
       r: 1, g: 0.99, b: 0.96, alpha: 1,
-      life: 0.30, cell: CELL.FLASH_DISC, frames: 1,
+      life: 0.20, cell: CELL.FLASH_DISC, frames: 1,
       mode: QUAD_MODE.BILLBOARD, blend: QUAD_BLEND.ADD,
-      fadeIn: 0.02, fadeOut: 0.10, soft: 0, intensity: 13,
+      fadeIn: 0.02, fadeOut: 0.06, soft: 0, intensity: 6,
       rot: rand.range(0, 6.28),
     });
     q.push();
@@ -111,20 +111,23 @@ export class SmokeFX {
       px: point.x, py: point.y, pz: point.z,
       w0: 1.0, h0: 1.0, w1: 16, h1: 16,
       r: 1, g: 0.98, b: 0.92, alpha: 1,
-      life: 0.22, cell: CELL.MUZZLE_STAR, frames: 1,
+      life: 0.16, cell: CELL.MUZZLE_STAR, frames: 1,
       mode: QUAD_MODE.BILLBOARD, blend: QUAD_BLEND.ADD,
-      fadeIn: 0.02, fadeOut: 0.08, soft: 0, intensity: 7,
+      fadeIn: 0.02, fadeOut: 0.05, soft: 0, intensity: 3.2,
       rot: rand.range(0, 6.28),
     });
     q.push();
 
     w.light({
       x: point.x, y: point.y, z: point.z,
-      color: 0xffffff, intensity: 190, radius: 30, lifetime: 0.35, decay: 'flash',
+      color: 0xffffff, intensity: 55, radius: 26, lifetime: 0.22, decay: 'flash',
     });
 
     // The player's half of the event.
-    w.flash(4.2 * prox, 0xffffff, 0.85);
+    // Bright enough to blind, short enough to read the frame again quickly.
+    // A full-frame white-out that lasts a third of a second is not a
+    // flashbang, it is a missing image.
+    w.flash(1.15 * prox, 0xffffff, 3.0);
     w.concussion(1.8 * prox, 3.5);
     w.shake(0.10 * prox, 26, 0.5);
 

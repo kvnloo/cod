@@ -43,6 +43,11 @@ interface RenderLike extends System {
   setTimeOfDay(h: number): void;
   setWeather(r: number, f: number, w: number): void;
   viewModelScene: THREE.Scene;
+  viewModelCamera: THREE.PerspectiveCamera;
+  addDynamicLight(req: {
+    position: THREE.Vector3; color: number; intensity: number; radius: number;
+    lifetime: number; decay?: 'exp' | 'linear' | 'flash' | 'flicker';
+  }): void;
   /** Set false so the studio rig below is not silenced by the sky system. */
   adoptSceneLights: boolean;
 }
@@ -98,6 +103,46 @@ function settleFrames(n: number): void {
 /** The live view model the first-person shots scrub through. */
 let fpViewModel: ViewModel | null = null;
 let fpMaterials: WeaponMaterials | null = null;
+let fpRender: RenderLike | null = null;
+let fpCamera: THREE.Camera | null = null;
+
+/**
+ * Deferred work that runs *after* a shot has settled, immediately before the
+ * screenshot. Temporal effects need a long settle; a 40 ms muzzle flash does
+ * not survive one, so anything genuinely transient is staged here instead.
+ */
+let afterSettle: (() => void) | null = null;
+
+/** Pops the queued post-settle callback, if any. */
+function takeAfterSettle(): (() => void) | null {
+  const f = afterSettle;
+  afterSettle = null;
+  return f;
+}
+
+/**
+ * Fires a real muzzle flash light so a still can answer "does the flash light
+ * the weapon?".
+ *
+ * The light is queued rather than added: it has a flash's actual 90 ms life, so
+ * adding it during setup would leave it long dead by the time the frame is
+ * captured — and a long-lived stand-in would bleed into every shot after it,
+ * because the pool is global and nothing clears it between shots.
+ */
+function holdMuzzleFlash(intensity = 190): void {
+  afterSettle = () => {
+    const vm = fpViewModel;
+    const render = fpRender;
+    const camera = fpCamera;
+    if (!vm || !render || !camera) return;
+    camera.updateMatrixWorld(true);
+    const p = new THREE.Vector3();
+    vm.muzzleWorld(camera, p);
+    render.addDynamicLight({
+      position: p, color: 0xffc27a, intensity, radius: 5.0, lifetime: 0.26, decay: 'linear',
+    });
+  };
+}
 
 function equipFp(id: string, attachmentIds?: string[]): void {
   const vm = fpViewModel;
@@ -140,6 +185,52 @@ function resetFp(): void {
   scrub(1.2);
 }
 
+/**
+ * Sight-alignment probe.
+ *
+ * "Looks centred" is not a measurement. This projects the live rig's own sight
+ * point — and the reticle quad, when one is fitted — through the *actual*
+ * view-model camera and reports normalised device coordinates, so a half-degree
+ * of cant shows up as a number instead of as a feeling. Read it from the
+ * harness with `__wpnProbe()`.
+ */
+function installProbe(render: RenderLike): void {
+  const v = new THREE.Vector3();
+  (globalThis as unknown as { __wpnProbe?: () => unknown }).__wpnProbe = () => {
+    const vm = fpViewModel;
+    const cam = render.viewModelCamera;
+    if (!vm?.rig || !cam) return null;
+    render.viewModelScene.updateMatrixWorld(true);
+    cam.updateMatrixWorld(true);
+    const out: Record<string, unknown> = { weapon: vm.def?.id ?? null, ads: vm.adsBlend };
+    const sight = vm.rig.point('sight');
+    if (sight) {
+      v.copy(sight);
+      vm.rig.root.localToWorld(v);
+      v.project(cam);
+      out.sightNdc = [Number(v.x.toFixed(5)), Number(v.y.toFixed(5))];
+    }
+    const ret = vm.rig.reticle;
+    if (ret) {
+      ret.mesh.updateMatrixWorld(true);
+      v.set(0, 0, 0).applyMatrix4(ret.mesh.matrixWorld).project(cam);
+      out.reticleNdc = [Number(v.x.toFixed(5)), Number(v.y.toFixed(5))];
+      out.reticleVisible = ret.mesh.visible;
+      out.reticleFade = (ret.mesh.material as THREE.ShaderMaterial).uniforms.uFade?.value ?? null;
+      out.reticleScale = ret.mesh.scale.x;
+      out.reticleWorld = ret.mesh.getWorldPosition(new THREE.Vector3()).toArray();
+      const chain: string[] = [];
+      let p: THREE.Object3D | null = ret.mesh;
+      while (p) { chain.push(`${p.name || p.type}:${p.visible ? 'v' : 'H'}`); p = p.parent; }
+      out.chain = chain.join(' < ');
+      let inScene = false;
+      render.viewModelScene.traverse((o) => { if (o === ret.mesh) inScene = true; });
+      out.inViewModelScene = inScene;
+    }
+    return out;
+  };
+}
+
 registerDebugScene('weapons', async (ctx: EngineContext) => {
   const engine = ctx.engine;
   const scene = ctx.scene;
@@ -177,11 +268,14 @@ registerDebugScene('weapons', async (ctx: EngineContext) => {
   // silhouette. This is a product-photography rig — key, fill, rim — so the
   // form and the finish are actually legible in a still.
   render.adoptSceneLights = false;
-  const key = new THREE.DirectionalLight(0xfff1de, 1.15);
+  // Weapons are now authored at their real values — parkerised steel is around
+  // 5% reflectance — so the rig has to be a *studio* rig, several stops over
+  // the sky, or every catalogue shot is a silhouette against a bright horizon.
+  const key = new THREE.DirectionalLight(0xfff1de, 3.4);
   key.position.set(-6, 7, 9);
-  const fill = new THREE.DirectionalLight(0xc8d8f0, 0.30);
+  const fill = new THREE.DirectionalLight(0xc8d8f0, 1.05);
   fill.position.set(8, 2.5, 5);
-  const rim = new THREE.DirectionalLight(0xffe7c8, 0.85);
+  const rim = new THREE.DirectionalLight(0xffe7c8, 2.4);
   rim.position.set(3, 5, -9);
   for (const l of [key, fill, rim]) {
     l.castShadow = false;
@@ -380,6 +474,9 @@ registerDebugScene('weapons', async (ctx: EngineContext) => {
     set.add(lamp);
   }
   equipFp('ar_vkr7');
+  installProbe(render);
+  fpRender = render;
+  fpCamera = ctx.camera;
 
   const totalTris = rigs.reduce((a, r) => a + r.triangles, 0);
   console.info(`[weapons] debug scene ready — ${rigs.length} rigs, ${(totalTris / 1000).toFixed(1)}k tris total`);
@@ -507,14 +604,69 @@ if (DEBUG_SCENE === 'weapons') {
       fpViewModel?.startDraw(0.62);
       scrub(0.22);
     }),
+
+    /* --- optics: the reticle is the thing being photographed here -------- */
+    fp('wpn-fp-ads-reddot', 'Red dot aimed — 2 MOA collimated dot on the eye axis', 0, () => {
+      equipFp('ar_vkr7', ['optic_reddot']); resetFp(); scrub(1.0, { ads: 1 });
+    }, 58),
+    fp('wpn-fp-ads-holo', 'Holographic aimed — 65 MOA ring and centre dot', 0, () => {
+      equipFp('ar_vkr7', ['optic_holo']); resetFp(); scrub(1.0, { ads: 1 });
+    }, 58),
+    fp('wpn-fp-ads-acog', 'ACOG aimed — etched chevron and ranging post', 0, () => {
+      equipFp('ar_vkr7', ['optic_acog']); resetFp(); scrub(1.2, { ads: 1 });
+    }, 50),
+    fp('wpn-fp-ads-irons', 'Iron sights aimed — post in the notch, nothing illuminated', 0, () => {
+      equipFp('ar_vkr7', ['optic_irons']); resetFp(); scrub(1.0, { ads: 1 });
+    }, 58),
+    fp('wpn-fp-ads-offaxis', 'Red dot with the weapon still settling — the dot slides, as a collimated sight must', 0, () => {
+      equipFp('ar_vkr7', ['optic_reddot']); resetFp();
+      scrub(1.0, { ads: 1 });
+      scrub(0.06, { ads: 1, lookDX: 34, lookDY: -12 });
+    }, 58),
+
+    /* --- the flash has to light the weapon, not just the world ---------- */
+    fp('wpn-fp-flash', 'VKR-7 one frame into a shot, lit by a held muzzle flash at the crown', 1, () => {
+      equipFp('ar_vkr7'); resetFp();
+      fpViewModel?.onFire(0.98, 0.02);
+      scrub(0.030);
+      holdMuzzleFlash(190);
+    }),
+    fp('wpn-fp-flash-ads', 'Aimed, lit by the muzzle flash — the hood and barrel catch it', 1, () => {
+      equipFp('ar_vkr7'); resetFp(); scrub(1.0, { ads: 1 });
+      fpViewModel?.onFire(0.98, 0.02);
+      scrub(0.030, { ads: 1 });
+      holdMuzzleFlash(190);
+    }, 58),
+
+    /* --- reload: the parts have to actually move ------------------------ */
+    fp('wpn-fp-reload-magfall', 'VKR-7 empty reload, magazine clear of the well and tumbling', 1, () => {
+      equipFp('ar_vkr7'); resetFp();
+      fpViewModel?.startReload(true, 2.6);
+      scrub(0.62, { boltLocked: true, ammo: 0 });
+    }, 70),
+    fp('wpn-fp-reload-boltdrop', 'VKR-7 the instant the bolt is released and runs home', 1, () => {
+      equipFp('ar_vkr7'); resetFp();
+      fpViewModel?.startReload(true, 2.6);
+      scrub(2.02, { boltLocked: true, ammo: 0 });
+    }, 70),
+    fp('wpn-fp-charge', 'VKR-7 charging handle and bolt at full travel during the inspect', 1, () => {
+      equipFp('ar_vkr7'); resetFp();
+      fpViewModel?.startInspect(2.6);
+      scrub(1.56);
+    }, 70),
   );
 
   // Give every shot the extra settle it needs, without repeating it fifteen times.
   for (const sh of shots) {
     const inner = sh.setup;
     sh.setup = async () => {
+      afterSettle = null;
       await inner?.();
       settleFrames(56);
+      // Transient effects go in last, on a short settle that TAA can still
+      // resolve but that is far too short for them to decay away.
+      const post = takeAfterSettle();
+      if (post) { post(); settleFrames(3); }
     };
   }
 

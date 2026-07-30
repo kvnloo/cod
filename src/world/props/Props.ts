@@ -748,14 +748,17 @@ def({
       const z0 = -0.85 + t0 * 1.7, z1 = -0.85 + t1 * 1.7;
       const y0 = 2.32 - Math.pow(Math.abs(t0 - 0.5) * 2, 2) * 0.22;
       const y1 = 2.32 - Math.pow(Math.abs(t1 - 0.5) * 2, 2) * 0.22;
-      awn.quad(V3(-1.55, y0, z0), V3(1.55, y0, z0), V3(1.55, y1, z1), V3(-1.55, y1, z1), 1.0, true);
+      awn.quad(V3(-1.55, y0, z0), V3(1.55, y0, z0), V3(1.55, y1, z1), V3(-1.55, y1, z1), 1.0, false);
     }
-    // scalloped valance
+    // Valance: one continuous strip with a scalloped lower edge. Eight separate
+    // tabs with a 4 cm gap between them read as a comb of black and cream teeth
+    // from 20 m, which is what the market row looked like across the square.
     for (let i = 0; i < 8; i++) {
-      const x = -1.5 + i * 0.42;
+      const x0 = -1.55 + i * 0.3875, x1 = x0 + 0.3875;
+      const dip = 0.1 + 0.08 * Math.sin(i * 1.9);
       awn.quad(
-        V3(x, 2.1, -0.86), V3(x + 0.38, 2.1, -0.86),
-        V3(x + 0.38, 2.28, -0.86), V3(x, 2.28, -0.86), 1.0, true,
+        V3(x0, 2.28, -0.86), V3(x1, 2.28, -0.86),
+        V3(x1, 2.28 - dip, -0.855), V3(x0, 2.28 - dip, -0.855), 1.0, false,
       );
     }
     const table = c.m('plank');
@@ -960,16 +963,26 @@ def({
 });
 
 def({
-  id: 'concreteChunk', radius: 0.65, height: 0.55, collide: 'box',
+  id: 'concreteChunk', radius: 0.5, height: 0.45, collide: 'box',
   build(c, rand) {
+    // A slab out of a wall, not a clean plate: the main piece is chamfered so
+    // its broken edges catch the key, and two smaller fragments sit against it
+    // so the silhouette is never a single rectangle.
     const m = c.m('concreteDark');
-    m.pushTRS(0, 0.24, 0, rand.next() * 3, rand.range(-0.3, 0.3), rand.range(-0.3, 0.3));
-    m.box(0, 0, 0, rand.range(0.34, 0.55), rand.range(0.1, 0.2), rand.range(0.3, 0.5), 1.2);
+    m.pushTRS(0, 0.17, 0, rand.next() * 3, rand.range(-0.28, 0.28), rand.range(-0.24, 0.24));
+    m.chamferBox(0, 0, 0, rand.range(0.26, 0.4), rand.range(0.07, 0.13), rand.range(0.22, 0.34), 0.022, 0.7);
     m.pop();
+    for (let i = 0; i < 2; i++) {
+      const a = rand.range(0, Math.PI * 2), r = rand.range(0.24, 0.42);
+      const s = rand.range(0.07, 0.14);
+      m.pushTRS(Math.cos(a) * r, s * 0.7, Math.sin(a) * r, rand.next() * 3, rand.range(-0.4, 0.4), rand.range(-0.4, 0.4));
+      m.chamferBox(0, 0, 0, s, s * 0.55, s * rand.range(0.8, 1.5), 0.012, 0.5);
+      m.pop();
+    }
     const bar = c.m('rust');
     for (let i = 0; i < 3; i++) {
-      const x = -0.25 + i * 0.25;
-      bar.tube([V3(x, 0.24, -0.4), V3(x + rand.range(-0.1, 0.1), 0.3, 0.55)], 0.011, 4, false, 0.3);
+      const x = -0.18 + i * 0.18;
+      bar.tube([V3(x, 0.17, -0.3), V3(x + rand.range(-0.08, 0.08), 0.24, 0.42)], 0.009, 4, false, 0.3);
     }
   },
 });
@@ -1059,13 +1072,34 @@ def({
 });
 
 def({
-  id: 'ivy', radius: 0.9, height: 2.4, collide: 'none', noShadow: true, navIgnore: true,
+  id: 'ivy', radius: 0.8, height: 2.6, collide: 'none', noShadow: true, navIgnore: true,
   build(c, rand) {
+    // A mat, not a mobile.
+    //
+    // Twelve big cards at random heights over a 1.7 m span read as paper kites
+    // floating in front of the wall — one of the most obvious fake tells on the
+    // map. Real ivy is a dense continuous sheet with a ragged upper edge and
+    // runners reaching past it, so this is forty small overlapping cards packed
+    // against the plane, with the density falling off toward the top.
     const m = c.m('foliage');
-    for (let i = 0; i < 12; i++) {
-      m.pushTRS(rand.range(-0.7, 0.7), rand.range(0, 1.7), rand.range(-0.04, 0.04), rand.range(-0.3, 0.3), 0, rand.range(-0.4, 0.4));
-      m.card(rand.range(0.5, 0.85), rand.range(0.5, 0.85), 0, false);
+    for (let i = 0; i < 40; i++) {
+      const t = i / 40;
+      const y = Math.pow(rand.next(), 0.75) * 2.25;
+      const spread = 0.72 * (1 - 0.35 * (y / 2.25));
+      m.pushTRS(
+        rand.range(-spread, spread), y, rand.range(-0.02, 0.06),
+        rand.range(-0.22, 0.22), 0, rand.range(-0.5, 0.5),
+      );
+      m.card(rand.range(0.26, 0.44), rand.range(0.24, 0.4), 0, false);
       m.pop();
+      void t;
+    }
+    // Runners breaking the top edge so the sheet does not end on a straight line.
+    const st = c.m('foliageDry');
+    for (let i = 0; i < 5; i++) {
+      st.pushTRS(rand.range(-0.6, 0.6), rand.range(1.9, 2.5), 0.03, rand.range(-0.2, 0.2), 0, rand.range(-0.7, 0.7));
+      st.card(rand.range(0.16, 0.3), rand.range(0.3, 0.5), 0, false);
+      st.pop();
     }
   },
 });
@@ -1105,6 +1139,114 @@ def({
         V3(Math.sin(2.1) * 0.18 * 0.8, 2.5 + rand.range(-0.5, 0.6), Math.cos(1.7) * 0.12),
         V3(Math.cos(a), 0.9, Math.sin(a)).normalize(), 1.7, 0.075, 1, rand,
       );
+    }
+  },
+});
+
+/* ======================================================== facade colour == */
+
+/**
+ * Shop awning on a folding arm, faded and torn.
+ *
+ * The square was close to monochrome without these. An awning is the cheapest
+ * saturated accent a European street has: it sits at first-floor height where
+ * the low sun rakes across it, it throws a hard-edged shadow down the
+ * shopfront, and its underside catches warm bounce off the pavement. Authored
+ * facing +Z, hanging off the wall behind it.
+ */
+def({
+  id: 'awning', radius: 1.6, height: 3.1, collide: 'none', navIgnore: true,
+  build(c, rand) {
+    const key: MatKey = rand.pick(['canvasRed', 'canvasGreen', 'canvasCream'] as const);
+    const cloth = c.m(key);
+    const arm = c.m('rust');
+    const W = 1.5, drop = 1.05, out = 1.25;
+    // Two folding arms and the roller bar.
+    for (const sx of [-1, 1]) {
+      arm.tube([V3(sx * W, 3.02, 0.06), V3(sx * W * 0.96, 2.72, out)], 0.022, 5, false, 0.4);
+      arm.tube([V3(sx * W, 2.62, 0.06), V3(sx * W * 0.96, 2.72, out)], 0.018, 5, false, 0.4);
+    }
+    arm.pushTRS(0, 3.04, 0.06, 0, 0, Math.PI / 2);
+    arm.cylinder(0.045, 0.045, W * 2.1, 8, true, false, 0.4);
+    arm.pop();
+    // Canopy: one continuous sheet with a slight sag across it, and a straight
+    // valance hanging off the front bar. Splitting it into per-bay quads gave a
+    // striped, venetian-blind read at distance — the awning has to be a single
+    // plane of colour or it stops being an awning.
+    const bays = 5;
+    const sag = (k: number) => 0.05 * (1 - (k / W) * (k / W));
+    for (let i = 0; i < bays; i++) {
+      const u0 = -W + (i * 2 * W) / bays, u1 = -W + ((i + 1) * 2 * W) / bays;
+      cloth.quad(
+        V3(u0, 3.0, 0.08), V3(u1, 3.0, 0.08),
+        V3(u1, 3.0 - drop - sag(u1), out), V3(u0, 3.0 - drop - sag(u0), out),
+        1.4, false,
+      );
+    }
+    // Valance, torn away at one end so the silhouette is not a clean rectangle.
+    const tearAt = rand.range(-W * 0.4, W * 0.6);
+    cloth.quad(
+      V3(-W, 3.0 - drop - sag(-W), out), V3(tearAt, 3.0 - drop - sag(tearAt), out),
+      V3(tearAt, 3.0 - drop - 0.24, out - 0.01), V3(-W, 3.0 - drop - 0.27, out - 0.01),
+      1.2, false,
+    );
+    cloth.quad(
+      V3(tearAt + 0.24, 3.0 - drop - sag(tearAt), out), V3(W, 3.0 - drop - sag(W), out),
+      V3(W, 3.0 - drop - 0.26, out - 0.01), V3(tearAt + 0.24, 3.0 - drop - 0.12, out - 0.01),
+      1.2, false,
+    );
+  },
+});
+
+/** Painted timber shop sign over a doorway — a second accent at eye level. */
+def({
+  id: 'shopSign', radius: 1.1, height: 2.9, collide: 'none', navIgnore: true,
+  build(c, rand) {
+    const board = c.m(rand.bool() ? 'paintRed' : 'woodPaint');
+    board.chamferBox(0, 2.55, 0.12, 1.05, 0.26, 0.05, 0.015, 1.2);
+    const trim = c.m('rust');
+    for (const sx of [-1, 1]) trim.box(sx * 1.02, 2.55, 0.09, 0.02, 0.28, 0.05, 0.3);
+    // Hanging bracket sign, perpendicular to the wall so it reads in silhouette.
+    trim.tube([V3(0.9, 2.9, 0.06), V3(0.9, 2.9, 0.62), V3(0.9, 2.6, 0.62)], 0.016, 5, false, 0.3);
+    const hang = c.m(rand.bool() ? 'paintYellow' : 'paintRed');
+    hang.box(0.9, 2.34, 0.62, 0.012, 0.24, 0.3, { unit: true });
+  },
+});
+
+/** Window flower box, mostly dead. Small, but it breaks every sill line. */
+def({
+  id: 'flowerBox', radius: 0.5, height: 0.5, collide: 'none', navIgnore: true, noShadow: true,
+  build(c, rand) {
+    const m = c.m('woodPaint');
+    m.chamferBox(0, 0.11, 0, 0.45, 0.11, 0.13, 0.012, 0.4);
+    const leaf = c.m(rand.bool(0.65) ? 'foliageDry' : 'foliage');
+    for (let i = 0; i < 5; i++) {
+      leaf.pushTRS(rand.range(-0.34, 0.34), 0.2, rand.range(-0.06, 0.06), rand.next() * 3.1, 0, rand.range(-0.3, 0.3));
+      leaf.card(rand.range(0.24, 0.42), rand.range(0.2, 0.36), 0, false);
+      leaf.pop();
+    }
+  },
+});
+
+/**
+ * Fly-posted hoarding panel. Layered paper is the one place a war-torn street
+ * is allowed to be genuinely bright, and it reads at 30 m as texture rather
+ * than as a decal.
+ */
+def({
+  id: 'posterPanel', radius: 1.0, height: 2.1, collide: 'box',
+  build(c, rand) {
+    const m = c.m('plywood');
+    m.box(0, 1.0, 0, 0.95, 1.0, 0.03, 1.2);
+    const post = c.m('plank');
+    for (const sx of [-1, 1]) post.box(sx * 0.86, 1.0, -0.06, 0.05, 1.0, 0.05, 0.5);
+    const inks: MatKey[] = ['paintRed', 'paintYellow', 'signGlow', 'canvasCream'];
+    for (let i = 0; i < 7; i++) {
+      const p = c.m(inks[rand.int(0, inks.length - 1)]);
+      const w = rand.range(0.16, 0.3), h = rand.range(0.22, 0.4);
+      p.pushTRS(rand.range(-0.72, 0.72), rand.range(0.35, 1.7), 0.032, 0, 0, rand.range(-0.09, 0.09));
+      p.box(0, 0, 0, w, h, 0.004, { unit: true });
+      p.pop();
     }
   },
 });

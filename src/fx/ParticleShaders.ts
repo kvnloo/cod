@@ -15,7 +15,7 @@
  * `base + frames * 64`; `flags` is a bitfield (see FLAG_* in GpuParticles.ts).
  */
 
-import { GLSL_AERIAL, GLSL_ATMOSPHERE, GLSL_COMMON, GLSL_SH } from '../render/Glsl';
+import { GLSL_AERIAL, GLSL_ATMOSPHERE, GLSL_COMMON, GLSL_SH, GLSL_SUN } from '../render/Glsl';
 import { GBUFFER_PASSTHROUGH_DECL, GBUFFER_PASSTHROUGH_WRITE } from './Common';
 
 /* ------------------------------------------------------------------ shared -- */
@@ -341,11 +341,12 @@ void main() {
 	/* ---- colour: hot particles cool as they age */
 	vec3 tint = s0.rgb;
 	if ( ( flags & FX_HOTRAMP ) != 0 ) {
-		// A spark leaves the steel white-hot and is dull red within a third of
-		// a second; the ramp has to be quick or every spark reads as a laser.
-		float heat = pow( 1.0 - t, 2.4 );
-		tint = mix( vec3( 0.42, 0.035, 0.005 ), tint, heat );
-		tint += vec3( 0.55, 0.30, 0.10 ) * pow( heat, 4.0 );
+		// A spark leaves the steel white-hot and cools through orange to a
+		// dull red ember. Cool it too fast and the whole shower is gone in
+		// 200 ms; too slowly and every spark reads as a laser.
+		float heat = pow( 1.0 - t, 1.55 );
+		tint = mix( vec3( 0.70, 0.085, 0.014 ), tint, heat );
+		tint += vec3( 0.85, 0.46, 0.16 ) * pow( heat, 3.0 );
 	}
 	vColor = vec4( tint, alpha );
 
@@ -414,7 +415,11 @@ void main() {
 	float softDist = clamp( size * 0.35, 0.05, 1.2 );
 	float shadow = ( flags & FX_SHADOW ) != 0 ? fxParticleShadow( p, viewZ ) : 1.0;
 	vMisc = vec4( t, viewZ, softDist, shadow );
-	vExtra = vec4( blend, s3.y, clamp( s0.a, 0.0, 1.0 ), size );
+	// Fraction of the frame height this sprite covers. The render pass uses
+	// it to stop a small solid sprite that has drifted near the lens from owning a
+	// quarter of the screen.
+	float screenFrac = size * projectionMatrix[ 1 ][ 1 ] / max( viewZ * 2.0, 1e-3 );
+	vExtra = vec4( blend, s3.y, screenFrac, size );
 	vQuad = corner * 2.0;
 	vModel = model;
 	vFlags = flags;
@@ -434,6 +439,7 @@ precision highp float;
 ${GLSL_COMMON}
 ${GLSL_ATMOSPHERE}
 ${GLSL_SH}
+${GLSL_SUN}
 ${GLSL_AERIAL}
 ${FLAG_DECODE}
 
@@ -457,8 +463,9 @@ uniform sampler2D tAtlasB;
 uniform sampler2D boSceneDepth;
 uniform vec4 boCameraParams;
 uniform vec2 boResolution;
-uniform vec3 boSunDirWorld;
-uniform vec3 boSunColor;
+// boSunDirWorld / boSunDirView / boSunColor arrive with GLSL_SUN, which
+// GLSL_AERIAL pulls in above. Re-declaring them here is a GLSL redefinition
+// error that silently kills the entire particle pass.
 uniform vec3 boAmbientSH[ 9 ];
 uniform vec3 boAmbientTint;
 uniform float boAmbientIntensity;
@@ -496,6 +503,21 @@ void main() {
 	}
 	// Never let a sprite slam into the near plane.
 	alpha *= boSat( ( viewZ - boCameraParams.x * 2.0 ) / max( vExtra.w * 0.7, 0.08 ) );
+	// Small solids -- chips, splinters, wind-blown scraps -- are the one
+	// class that routinely drifts *into* the lens. At half a metre a 6 cm
+	// scrap covers a tenth of the frame and reads as dirt on the glass, so
+	// fade them out across the last couple of metres instead.
+	// Small-particle classes: solid chunks (chips, splinters, scraps, shards) and
+	// thin films (droplets, motes). Media — smoke and dust puffs — is exempt:
+	// being metres across and filling the frame is the whole point of a puff.
+	if ( vModel == 2 || vModel == 3 ) {
+		alpha *= boSat( ( viewZ - 0.8 ) * 0.72 );
+		// Hard screen-coverage ceiling. Whatever a chip's world size and however
+		// it got there, once one sprite owns more than a few per cent of the
+		// frame it has stopped being debris and started being a smudge on the
+		// lens — which is the single most recognisable particle-system tell.
+		alpha *= 1.0 - boSat( ( vExtra.z - 0.012 ) / 0.022 );
+	}
 	if ( alpha < 0.0025 ) discard;
 
 	vec3 albedo = vColor.rgb * A.rgb;
@@ -519,29 +541,45 @@ void main() {
 		float ndl = dot( N, boSunDirWorld );
 
 		// Wrapped diffuse: a particle is a lump of participating media, not a
-		// surface, so light bends well past the terminator.
-		float wrap = boSat( ( ndl + 0.72 ) / 1.72 );
+		// surface, so light bends past the terminator — but not so far that the
+		// volume loses its bright and dark side, which is the whole read.
+		float wrap = boSat( ( ndl + 0.52 ) / 1.52 );
 		float thickness = B.b;
-		vec3 amb = boShIrradiance( N, boAmbientSH ) * boAmbientTint * boAmbientIntensity;
-
-		// Self shadowing: the far side of a thick puff is in its own shadow.
-		float selfShadow = exp( - thickness * 2.9 * ( 1.0 - wrap ) );
 		float shadow = vMisc.w;
+
+		// Sky/bounce fill. A puff sees the sky from above and the ground from
+		// below, so the SH lookup already gives it a cool top and a warm floor
+		// bounce; pushing the normal toward vertical stops the fill flattening
+		// out as the billboard turns.
+		vec3 ambN = normalize( N + vec3( 0.0, 0.55, 0.0 ) );
+		vec3 amb = boShIrradiance( ambN, boAmbientSH ) * boAmbientTint * boAmbientIntensity;
+		// Deeper inside the puff, less sky reaches: ambient occlusion for media.
+		amb *= mix( 1.0, 0.42, thickness );
+
+		// Beer-Lambert through the puff along the light path. The exponent runs
+		// from "thin edge, fully lit" to "dense core on the far side, dark".
+		float depth = thickness * ( 0.55 + 2.85 * ( 1.0 - wrap ) );
+		float selfShadow = exp( - depth * 1.9 );
 
 		vec3 sun = boSunColor * ( wrap * selfShadow * shadow );
 
-		// Forward scattering — backlit smoke glows around its rim, which is the
-		// single most recognisable thing about real smoke on film.
+		// Henyey-Greenstein forward lobe. Backlit smoke glowing around its rim
+		// is the single most recognisable thing about real smoke on film, and a
+		// proper phase function keeps that glow broad instead of a hot dot.
 		float mu = boSat( dot( - V, boSunDirWorld ) );
-		float phase = pow( mu, 5.0 );
-		sun += boSunColor * phase * ( 1.0 - thickness * 0.75 ) * shadow * 1.6;
+		const float G = 0.62;
+		float hg = ( 1.0 - G * G ) / pow( 1.0 + G * G - 2.0 * G * mu, 1.5 );
+		// Transmission falls off with optical depth — a thin wisp glows, the
+		// dense core stays dark, and that contrast is what gives smoke volume.
+		float transmit = exp( - thickness * 2.35 );
+		sun += boSunColor * hg * transmit * shadow * 0.42;
 
 		// boSunColor is illuminance; a scattering lobe converts it to radiance.
-		// The extra 0.55 is a deliberate artistic hold-down: pale dust really is
-		// ~3x brighter than dark asphalt, but at the exposure the frame graph
-		// settles on that clips every bit of internal structure to flat white.
-		sun *= BO_INV_PI * 0.55;
-		amb *= 0.8;
+		// The extra hold-down is deliberate: pale dust really is ~3x brighter
+		// than dark asphalt, but at the exposure the frame graph settles on,
+		// that clips every bit of internal structure to flat white.
+		sun *= BO_INV_PI * 0.62;
+		amb *= 0.72;
 
 		if ( vModel == 2 ) {
 			// Solid chunk: a proper lambert term plus a tight sheen on the edge.
@@ -549,10 +587,21 @@ void main() {
 			sun = boSunColor * ( nl * 0.9 + 0.10 ) * shadow * BO_INV_PI;
 			float rim = pow( 1.0 - boSat( nq.z ), 3.0 );
 			sun += boSunColor * rim * 0.30 * shadow * BO_INV_PI;
+			amb = boShIrradiance( N, boAmbientSH ) * boAmbientTint * boAmbientIntensity * 0.85;
 		} else if ( vModel == 3 ) {
-			// Thin translucent film (blood mist, spray): strong transmission.
-			sun *= 1.35;
-			sun += boSunColor * pow( mu, 2.5 ) * 0.9 * shadow * BO_INV_PI;
+			// Thin translucent film (blood mist, spray, dust motes): almost all
+			// of what you see is light coming *through* it.
+			sun = boSunColor * ( wrap * 0.55 + 0.10 ) * shadow * BO_INV_PI * 0.9;
+			sun += boSunColor * hg * shadow * BO_INV_PI * 0.85;
+		} else {
+			// Volumetric break-up. Thirty overlapping billboards average out to
+			// a uniform slab no matter how good the individual sprite is; a
+			// low-frequency world-space field puts lumps of light and shadow
+			// *through* the cloud, which is what gives it interior.
+			float vol = boFbm( vWorldPos * 0.38 + vec3( 11.0, 3.0, 7.0 ), 3 );
+			float vol2 = boFbm( vWorldPos * 1.35 + vec3( 2.0, 9.0, 4.0 ), 2 );
+			sun *= 0.42 + 1.35 * vol;
+			amb *= 0.78 + 0.34 * vol2;
 		}
 
 		lit = albedo * ( sun + amb ) + albedo * vExtra.y * 1.2;

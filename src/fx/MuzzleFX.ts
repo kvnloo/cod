@@ -40,7 +40,7 @@ export interface MuzzleProfile {
 }
 
 const AR: MuzzleProfile = {
-  scale: 1.0, lightIntensity: 26, lightRadius: 9, starChance: 0.42,
+  scale: 1.0, lightIntensity: 26, lightRadius: 9, starChance: 0.6,
   coneLength: 0.55, smoke: 1, gasSpeed: 13, color: 0xffb464,
   casing: 'rifle', ejectSpeed: 2.7, tracerEvery: 4, tracerColor: 0xffd070,
   tracerSpeed: 340, heatPerShot: 0.055, shake: 0.008,
@@ -172,7 +172,7 @@ export class MuzzleFX {
       r: colour.r, g: colour.g, b: colour.b, alpha: 1,
       life: 0.042 + rand.next() * 0.018, cell: CELL.MUZZLE_CORE, frames: 1,
       mode: QUAD_MODE.BILLBOARD, blend: QUAD_BLEND.ADD,
-      fadeIn: 0.15, fadeOut: 0.28, soft: 0, intensity: 6.5 * vary, rot: roll,
+      fadeIn: 0.15, fadeOut: 0.28, soft: 0, intensity: 8.5 * vary, rot: roll,
     });
     q.push();
 
@@ -184,7 +184,7 @@ export class MuzzleFX {
         w0: 0.30 * s * vary, h0: 0.30 * s * vary,
         w1: 0.62 * s * vary, h1: 0.62 * s * vary,
         r: colour.r, g: colour.g * 0.98, b: colour.b * 0.92, alpha: 1,
-        life: 0.05, cell: CELL.MUZZLE_STAR, frames: 1,
+        life: 0.045 + rand.next() * 0.02, cell: CELL.MUZZLE_STAR, frames: 1,
         mode: QUAD_MODE.BILLBOARD, blend: QUAD_BLEND.ADD,
         fadeIn: 0.1, fadeOut: 0.2, soft: 0, intensity: 4.0,
         rot: roll + rand.range(-0.4, 0.4),
@@ -374,11 +374,13 @@ export class MuzzleFX {
       px: muzzle.x, py: muzzle.y, pz: muzzle.z,
       vx: direction.x * speed, vy: direction.y * speed, vz: direction.z * speed,
       ax: direction.x * len, ay: direction.y * len, az: direction.z * len,
-      w0: 0.42, h0: 1, w1: 0.30, h1: 1,
+      // Thin: a tracer is a 7 mm round glowing, not a beam weapon. Width is what
+      // separates "hot projectile" from "laser" more than colour does.
+      w0: 0.16, h0: 1, w1: 0.10, h1: 1,
       r: colour.r, g: colour.g, b: colour.b, alpha: 0.95,
       life, cell: CELL.RAIN, frames: 1,
       mode: QUAD_MODE.BEAM, blend: QUAD_BLEND.ADD,
-      fadeIn: 0.02, fadeOut: 0.55, soft: 0.4, intensity: 4.2,
+      fadeIn: 0.02, fadeOut: 0.55, soft: 0.4, intensity: 2.8,
     });
     q.push();
 
@@ -386,11 +388,11 @@ export class MuzzleFX {
     q.begin({
       px: muzzle.x + direction.x * len, py: muzzle.y + direction.y * len, pz: muzzle.z + direction.z * len,
       vx: direction.x * speed, vy: direction.y * speed, vz: direction.z * speed,
-      w0: 0.30, h0: 0.30, w1: 0.22, h1: 0.22,
+      w0: 0.22, h0: 0.22, w1: 0.16, h1: 0.16,
       r: colour.r, g: colour.g, b: colour.b, alpha: 0.8,
       life, cell: CELL.GLOW_SOFT, frames: 1,
       mode: QUAD_MODE.BILLBOARD, blend: QUAD_BLEND.ADD,
-      fadeIn: 0.02, fadeOut: 0.5, soft: 0.3, intensity: 2.4,
+      fadeIn: 0.02, fadeOut: 0.5, soft: 0.3, intensity: 2.0,
     });
     q.push();
   }

@@ -38,11 +38,13 @@ export const DEFAULT_GRADE: GradeSettings = {
   contrast: 0.22,
   gamma: 1.04,
   saturation: 1.06,
-  shadowTint: [0.86, 0.99, 1.14],
+  shadowTint: [0.88, 0.99, 1.10],
   highlightTint: [1.07, 1.0, 0.9],
-  shadowStrength: 0.4,
+  shadowStrength: 0.34,
   highlightStrength: 0.34,
-  lift: -0.012,
+  // A hair of toe lift. Shipped games keep shadows deep but never at zero —
+  // a true 0,0,0 shadow is the giveaway that nothing bounced into it.
+  lift: 0.0015,
   gain: 1.01,
   highlightDesat: 0.22,
   warmth: 0.05,

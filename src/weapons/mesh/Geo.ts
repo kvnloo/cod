@@ -90,6 +90,147 @@ export function projectUV(geo: THREE.BufferGeometry, metresPerRepeat: number): T
   return geo;
 }
 
+/* ------------------------------------------------------------------- wear */
+
+/**
+ * Bakes a per-vertex `aWear` attribute: `x` = convex edge exposure, `y` =
+ * concave cavity occlusion.
+ *
+ * This is the single biggest difference between a procedural weapon and a
+ * sculpted one. A tiling surface texture can only invent *statistical* wear —
+ * scratches and blotches that land wherever the noise happens to put them. On
+ * a real weapon the finish is rubbed through on the **chamfers, corners and
+ * proud edges** of the actual model, and grime collects in the **inside
+ * corners** of the actual model. Both are properties of the mesh, not of a
+ * texture, so they have to be measured off the mesh.
+ *
+ * Method, in one pass over the triangle soup:
+ *   1. Weld by quantised position so the (flat-shaded, duplicated) vertices of
+ *      every face meeting at a corner are recognised as one point.
+ *   2. At each welded point, the mean of the incident face normals gives the
+ *      local surface direction, and the maximum angle away from that mean
+ *      gives how *sharp* the point is — 0 on a flat face, high on an edge.
+ *   3. The sign comes from comparing the point against the centroid of its
+ *      graph neighbours: a point that sits on the outside of its neighbourhood
+ *      is a convex edge, one that sits inside is a crevice.
+ *
+ * Cost is a few milliseconds for a whole armoury and it happens once, at build.
+ */
+export function bakeWear(geo: THREE.BufferGeometry): THREE.BufferGeometry {
+  const pos = geo.getAttribute('position') as THREE.BufferAttribute | undefined;
+  const nrm = geo.getAttribute('normal') as THREE.BufferAttribute | undefined;
+  const count = pos?.count ?? 0;
+  const wear = new Float32Array(count * 2);
+  if (!pos || !nrm || count === 0) {
+    geo.setAttribute('aWear', new THREE.BufferAttribute(wear, 2));
+    return geo;
+  }
+
+  // 0.05 mm buckets: finer than any feature on a weapon, coarse enough that
+  // two faces authored to meet actually land in the same bucket.
+  const Q = 20000;
+  const uid = new Int32Array(count);
+  const keys = new Map<number, number>();
+  let unique = 0;
+  for (let i = 0; i < count; i++) {
+    const kx = Math.round(pos.getX(i) * Q);
+    const ky = Math.round(pos.getY(i) * Q);
+    const kz = Math.round(pos.getZ(i) * Q);
+    // Cantor-ish mix into a single number; collisions merely blur the result.
+    const key = (kx * 73856093) ^ (ky * 19349663) ^ (kz * 83492791);
+    let u = keys.get(key);
+    if (u === undefined) { u = unique++; keys.set(key, u); }
+    uid[i] = u;
+  }
+
+  const nAvg = new Float32Array(unique * 3);
+  const pAvg = new Float32Array(unique * 3);
+  const nbSum = new Float32Array(unique * 3);
+  const nbCount = new Float32Array(unique);
+  const hits = new Float32Array(unique);
+
+  for (let i = 0; i < count; i++) {
+    const u = uid[i];
+    nAvg[u * 3] += nrm.getX(i);
+    nAvg[u * 3 + 1] += nrm.getY(i);
+    nAvg[u * 3 + 2] += nrm.getZ(i);
+    pAvg[u * 3] = pos.getX(i);
+    pAvg[u * 3 + 1] = pos.getY(i);
+    pAvg[u * 3 + 2] = pos.getZ(i);
+    hits[u] += 1;
+  }
+  for (let u = 0; u < unique; u++) {
+    const x = nAvg[u * 3], y = nAvg[u * 3 + 1], z = nAvg[u * 3 + 2];
+    const l = Math.hypot(x, y, z) || 1;
+    nAvg[u * 3] = x / l; nAvg[u * 3 + 1] = y / l; nAvg[u * 3 + 2] = z / l;
+  }
+
+  // Graph neighbours from the triangle soup.
+  for (let t = 0; t + 2 < count; t += 3) {
+    for (let k = 0; k < 3; k++) {
+      const u = uid[t + k];
+      for (let j = 1; j <= 2; j++) {
+        const o = t + ((k + j) % 3);
+        nbSum[u * 3] += pos.getX(o);
+        nbSum[u * 3 + 1] += pos.getY(o);
+        nbSum[u * 3 + 2] += pos.getZ(o);
+        nbCount[u] += 1;
+      }
+    }
+  }
+
+  // Sharpness: how far the sharpest incident face turns away from the mean.
+  const sharp = new Float32Array(unique);
+  for (let i = 0; i < count; i++) {
+    const u = uid[i];
+    const d = nrm.getX(i) * nAvg[u * 3] + nrm.getY(i) * nAvg[u * 3 + 1] + nrm.getZ(i) * nAvg[u * 3 + 2];
+    const s = 1 - d;
+    if (s > sharp[u]) sharp[u] = s;
+  }
+
+  // Per welded point: how sharp, and which way it bends.
+  const strength = new Float32Array(unique);
+  const convex = new Uint8Array(unique);
+  for (let u = 0; u < unique; u++) {
+    if (hits[u] < 2 || nbCount[u] < 1) continue;
+    const inv = 1 / nbCount[u];
+    const dx = pAvg[u * 3] - nbSum[u * 3] * inv;
+    const dy = pAvg[u * 3 + 1] - nbSum[u * 3 + 1] * inv;
+    const dz = pAvg[u * 3 + 2] - nbSum[u * 3 + 2] * inv;
+    const dl = Math.hypot(dx, dy, dz);
+    if (dl < 1e-7) continue;
+    const sign = (dx * nAvg[u * 3] + dy * nAvg[u * 3 + 1] + dz * nAvg[u * 3 + 2]) / dl;
+    // 1 - cos(theta): a 90° corner reaches 1.0, a 22° chamfer break ~0.08.
+    // Chamfers are the interesting case, so the ramp starts low.
+    const s = Math.min(1, sharp[u] / 0.34);
+    if (sign > 0.10) { strength[u] = s * Math.min(1, sign * 1.8); convex[u] = 1; }
+    else if (sign < -0.10) { strength[u] = s * Math.min(1, -sign * 1.8); convex[u] = 0; }
+  }
+
+  // The per-*vertex* half. A welded corner is shared by the big faces and by
+  // the chamfer strip between them; if both got the same value, all four
+  // corners of a face would be lit and the whole face would interpolate to a
+  // uniform wash — wear everywhere, which reads as no wear at all.
+  //
+  // The discriminator is alignment: a chamfer's own normal sits almost exactly
+  // on the welded mean, while the flanking faces sit ~22° off it. Weighting by
+  // that alignment puts the wear on the chamfer strip and leaves the flats
+  // clean, which is precisely where a real finish rubs through.
+  for (let i = 0; i < count; i++) {
+    const u = uid[i];
+    const s = strength[u];
+    if (s <= 0) { wear[i * 2] = 0; wear[i * 2 + 1] = 0; continue; }
+    const d = nrm.getX(i) * nAvg[u * 3] + nrm.getY(i) * nAvg[u * 3 + 1] + nrm.getZ(i) * nAvg[u * 3 + 2];
+    const t = (d - 0.62) / 0.36;
+    const align = t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t);
+    const v = s * align;
+    wear[i * 2] = convex[u] ? v : 0;
+    wear[i * 2 + 1] = convex[u] ? 0 : v;
+  }
+  geo.setAttribute('aWear', new THREE.BufferAttribute(wear, 2));
+  return geo;
+}
+
 /* ------------------------------------------------------------- transforms */
 
 export interface Xform {

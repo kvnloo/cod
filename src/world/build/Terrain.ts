@@ -14,7 +14,7 @@ import * as THREE from 'three';
 import { Rand } from '../../core/Rand';
 import type { Chunk } from '../geom/Chunk';
 import { FOOTPRINTS, LANE, MAP, SQUARE } from '../Layout';
-import { V2 } from '../geom/Mesher';
+import { V2, V3 } from '../geom/Mesher';
 
 export interface Crater {
   x: number; z: number; radius: number; depth: number;
@@ -131,7 +131,10 @@ export function buildTerrain(chunk: Chunk): void {
   const R = MAP.half + 4;
 
   /* --- base street surface over the whole map ------------------------- */
-  chunk.m('asphalt').grid(-R, -R, R, R, Math.round(R * 2 / 1.05), Math.round(R * 2 / 1.05), groundHeightAt, 3.0);
+  // 0.75 m cells: the resolution is set by the *blend mask*, not the height
+  // field — a metre-wide wedge of silt against a wall needs three or four
+  // vertices across it to read as a wedge rather than a step.
+  chunk.m('asphalt').grid(-R, -R, R, R, Math.round(R * 2 / 0.75), Math.round(R * 2 / 0.75), groundHeightAt, 3.0);
 
   /* --- cobbled square, laid over the asphalt --------------------------
    * Overlays are raised in millimetre steps rather than sharing a plane: a
@@ -143,6 +146,25 @@ export function buildTerrain(chunk: Chunk): void {
     Math.round((SQUARE.x1 - SQUARE.x0 + 3) / 0.85), Math.round((SQUARE.z1 - SQUARE.z0 + 3) / 0.85),
     (x, z) => groundHeightAt(x, z) + 0.045, 0.8,
   );
+
+  /* --- granite edging around the square -------------------------------
+   * The cobbles used to end on a bare straight line against the tarmac: a
+   * 30 m seam running diagonally through the hero shot with nothing to explain
+   * it. Every real setted square is contained by a course of kerbstones, and a
+   * 30 cm dark band both hides the join and gives the ground plane a drawn
+   * edge to read against. */
+  const edge = chunk.m('setts');
+  const ex0 = SQUARE.x0 - 1.5, ex1 = SQUARE.x1 + 1.5;
+  const ez0 = SQUARE.z0 - 1.5, ez1 = SQUARE.z1 + 1.5;
+  const band = 0.34;
+  for (const [ax, az, bx, bz] of [
+    [ex0 - band, ez0 - band, ex1 + band, ez0], [ex0 - band, ez1, ex1 + band, ez1 + band],
+    [ex0 - band, ez0, ex0, ez1], [ex1, ez0, ex1 + band, ez1],
+  ] as const) {
+    edge.grid(ax, az, bx, bz,
+      Math.max(1, Math.round((bx - ax) / 1.4)), Math.max(1, Math.round((bz - az) / 1.4)),
+      (x, z) => groundHeightAt(x, z) + 0.05, 0.7);
+  }
 
   /* --- worn asphalt patches: break the uniform tarmac ----------------- */
   const worn = chunk.m('asphaltWorn');
@@ -160,11 +182,23 @@ export function buildTerrain(chunk: Chunk): void {
   const grav = chunk.m('gravel');
   for (const c of CRATERS) {
     if (!c.dirt) continue;
-    const n = Math.max(6, Math.round(c.radius * 3));
-    dirt.grid(c.x - c.radius, c.z - c.radius, c.x + c.radius, c.z + c.radius, n, n,
+    // Only the bowl itself, and only where the paving is actually gone.
+    //
+    // This used to run to the full crater radius with a −0.35 m drop outside
+    // 0.92, which drew a hard-edged orange disc on top of the cobbles with a
+    // visible sunburst of skirt triangles around it. The transition from paving
+    // to exposed sub-base is now the ground's own vertex blend; the mesh only
+    // covers the part that is genuinely dirt.
+    const r = c.radius * 0.86;
+    const n = Math.max(10, Math.round(c.radius * 5));
+    dirt.grid(c.x - r, c.z - r, c.x + r, c.z + r, n, n,
       (x, z) => {
-        const d = Math.hypot(x - c.x, z - c.z) / c.radius;
-        return groundHeightAt(x, z) + (d < 0.92 ? 0.062 : -0.35);
+        // Always clear of the paving until the very rim, then a fast plunge
+        // under it. A flat shelf a few millimetres *below* the cobbles let them
+        // punch back through in a scale pattern around the whole bowl.
+        const d = Math.hypot(x - c.x, z - c.z) / r;
+        const t = Math.max(0, (d - 0.78) / 0.22);
+        return groundHeightAt(x, z) + 0.075 - t * t * 1.1;
       }, 2.2);
   }
   for (let i = 0; i < 14; i++) {
@@ -172,6 +206,30 @@ export function buildTerrain(chunk: Chunk): void {
     if (insideAnyFootprint(cx, cz, 2.0)) continue;
     const rx = rand.range(1.2, 3.4), rz = rand.range(1.2, 3.4);
     grav.grid(cx - rx, cz - rz, cx + rx, cz + rz, 3, 3, (x, z) => groundHeightAt(x, z) + (inSquare(cx, cz, 2) ? 0.058 : 0.03), 1.6);
+  }
+
+  /* --- blast scorch ----------------------------------------------------
+   * Every crater gets a burnt collar and a few radial fingers of soot thrown
+   * downwind. This is the cheapest damage-storytelling there is: a shell hole
+   * with clean paving around it reads as a dent, not as a detonation. */
+  const scorch = chunk.m('scorch');
+  for (const c of CRATERS) {
+    const spread = c.radius * 1.9;
+    const n = 14;
+    for (let i = 0; i < n; i++) {
+      const a0 = (i / n) * Math.PI * 2;
+      const a1 = ((i + 1) / n) * Math.PI * 2;
+      const rIn = c.radius * 0.84;
+      // Ragged outer edge — a clean disc of soot is worse than none.
+      const kA = 0.55 + 0.45 * Math.abs(Math.sin(a0 * 2.3 + c.x));
+      const kB = 0.55 + 0.45 * Math.abs(Math.sin(a1 * 2.3 + c.x));
+      const rA = rIn + spread * kA, rB = rIn + spread * kB;
+      const p = (ax: number, r: number) => {
+        const x = c.x + Math.cos(ax) * r, z = c.z + Math.sin(ax) * r;
+        return V3(x, groundHeightAt(x, z) + 0.052, z);
+      };
+      scorch.quad(p(a0, rIn), p(a1, rIn), p(a1, rB), p(a0, rA), 3.0, false);
+    }
   }
 
   /* --- pavements and kerbs -------------------------------------------- */
@@ -188,10 +246,29 @@ export function buildTerrain(chunk: Chunk): void {
   clearFootprints(union, cell, bounds, 0.2);
   const pv = chunk.m('pavement');
   for (const r of union.rects) {
-    const nx = Math.max(1, Math.round((r.x1 - r.x0) / 2.2));
-    const nz = Math.max(1, Math.round((r.z1 - r.z0) / 2.2));
+    const nx = Math.max(1, Math.round((r.x1 - r.x0) / 1.0));
+    const nz = Math.max(1, Math.round((r.z1 - r.z0) / 1.0));
     pv.grid(r.x0, r.z0, r.x1, r.z1, nx, nz, (x, z) => groundHeightAt(x, z) + PAVEMENT_Y, 1.35);
   }
+  /* --- pavement breakup ------------------------------------------------
+   * A concrete slab material tiling across a 20 m alley reads as one
+   * featureless cream plane no matter how good the tile is — there is nothing
+   * at the metre scale for the eye to lock on to. Patches of ground-in grit and
+   * silt laid *over* the pavement (a few millimetres proud, so they never
+   * z-fight it) give it that scale, and they land where traffic and water
+   * actually put them: against the kerb line and in the service alleys. */
+  const grit = chunk.m('gravel');
+  const silt = chunk.m('dirt');
+  for (let i = 0; i < 46; i++) {
+    const cx = rand.range(-50, 50), cz = rand.range(-50, 50);
+    const d = distanceToFootprints(cx, cz);
+    if (d < 0.4 || d > 2.4) continue;               // only on the pavement ring
+    const rx = rand.range(0.9, 2.8), rz = rand.range(0.9, 2.8);
+    const m = rand.bool(0.55) ? grit : silt;
+    m.grid(cx - rx, cz - rz, cx + rx, cz + rz, 3, 3,
+      (x, z) => groundHeightAt(x, z) + PAVEMENT_Y + 0.006, 1.5);
+  }
+
   // Kerb along every outward-facing cell edge of the union.
   const kb = chunk.m('kerb');
   const { occupied, w, h } = union;
@@ -209,19 +286,49 @@ export function buildTerrain(chunk: Chunk): void {
     }
   }
 
-  /* --- tram rails down the square ------------------------------------- */
+  /* --- tram track ------------------------------------------------------
+   * Street tramway, not a railway: grooved rail set flush into a bed of dark
+   * granite setts, the way every Eastern-European town square carries its
+   * tracks. Sleepers are buried and stay buried — the earlier version laid them
+   * *on* the cobbles at one sampled height, which floated them over the camber
+   * and the crater lips and read as untextured placeholder bars.
+   *
+   * The only exposed timber is where the blast lifted the paving: one short
+   * run of ripped-up track beside the crater, which is storytelling rather
+   * than an accident. */
+  const bed = chunk.m('setts');
   const rail = chunk.m('steel');
-  const sleeper = chunk.m('wood');
-  for (const rx of [-1.55, 1.55]) {
-    for (let z = SQUARE.z0 - 2; z < SQUARE.z1 + 24; z += 4) {
-      const zEnd = Math.min(z + 4, SQUARE.z1 + 24);
-      const y = groundHeightAt(rx, (z + zEnd) * 0.5);
-      rail.boxMinMax(rx - 0.035, y + 0.008, z, rx + 0.035, y + 0.055, zEnd, 0.9);
+  const trackZ0 = SQUARE.z0 - 2, trackZ1 = SQUARE.z1 + 24;
+  const gauge = 1.55;
+  // Bed follows the ground exactly: sampled per corner, so no gaps.
+  bed.grid(-2.35, trackZ0, 2.35, trackZ1, 6, Math.round((trackZ1 - trackZ0) / 1.3),
+    (x, z) => groundHeightAt(x, z) + 0.048, 0.85);
+  for (const rx of [-gauge, gauge]) {
+    for (let z = trackZ0; z < trackZ1; z += 1.5) {
+      const zEnd = Math.min(z + 1.5, trackZ1);
+      // Bottom from the lower end, top from the higher one: the rail is welded
+      // continuous, so consecutive segments must overlap rather than step.
+      const ya = groundHeightAt(rx, z) + 0.048;
+      const yb = groundHeightAt(rx, zEnd) + 0.048;
+      const lo = Math.min(ya, yb) - 0.05;
+      const hi = Math.max(ya, yb) + 0.014;
+      // Head and groove lip: two thin ribbons either side of the flangeway.
+      for (const off of [-0.032, 0.032]) {
+        rail.boxMinMax(rx + off - 0.017, lo, z, rx + off + 0.017, hi, zEnd, 0.6);
+      }
     }
   }
-  for (let z = SQUARE.z0 - 2; z < SQUARE.z1 + 24; z += 0.78) {
-    const y = groundHeightAt(0, z);
-    sleeper.boxMinMax(-1.95, y + 0.018, z - 0.075, 1.95, y + 0.05, z + 0.075, 1.0);
+  // Ripped-up section: blast-lifted paving, exposed sleepers and bent rail.
+  const tie = chunk.m('wood');
+  const ballast = chunk.m('gravel');
+  const ripZ0 = -12.5, ripZ1 = -5.5;
+  ballast.grid(-2.5, ripZ0, 2.5, ripZ1, 4, 8, (x, z) => groundHeightAt(x, z) + 0.055, 1.4);
+  for (let z = ripZ0 + 0.4; z < ripZ1; z += 0.72) {
+    const lean = ((z * 7.3) % 1) - 0.5;
+    const lift = Math.max(0, 0.16 - Math.abs(z + 9) * 0.03);
+    tie.pushTRS(0, groundHeightAt(0, z) + 0.06 + lift, z, lean * 0.22, 0, lean * 0.14);
+    tie.box(0, 0.055, 0, 1.28, 0.055, 0.1, 1.0);
+    tie.pop();
   }
 
   /* --- faded road markings -------------------------------------------- */
@@ -303,6 +410,19 @@ function lowestIn(x: number, z: number, r: number): number {
     if (h < lo) lo = h;
   }
   return Math.min(lo, groundHeightAt(x, z));
+}
+
+/** Distance from the nearest building footprint edge (0 when inside one). */
+function distanceToFootprints(x: number, z: number): number {
+  let best = Infinity;
+  for (const k in FOOTPRINTS) {
+    const f = FOOTPRINTS[k];
+    const dx = Math.max(f.x0 - x, 0, x - f.x1);
+    const dz = Math.max(f.z0 - z, 0, z - f.z1);
+    const d = Math.hypot(dx, dz);
+    if (d < best) best = d;
+  }
+  return best;
 }
 
 function insideAnyFootprint(x: number, z: number, margin: number): boolean {

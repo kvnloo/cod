@@ -19,7 +19,7 @@ import * as THREE from 'three';
 import { Rand } from '../../core/Rand';
 import type { ChunkSet } from '../geom/Chunk';
 import { FOOTPRINTS, LANE, SQUARE, distanceToBuildings } from '../Layout';
-import { groundHeightAt, INTERIOR_FLOOR_Y, PAVEMENT_Y } from '../build/Terrain';
+import { CRATERS, groundHeightAt, INTERIOR_FLOOR_Y, PAVEMENT_Y } from '../build/Terrain';
 import type { PropScatter } from './Scatter';
 import { burntCar, emplacement, fountain, toppledTram, truckWreck } from '../build/SetPieces';
 import { cable } from '../geom/Kit';
@@ -29,6 +29,44 @@ interface Ctx {
   scatter: PropScatter;
   set: ChunkSet;
   rand: Rand;
+}
+
+/** The toppled tram: shared so nothing else gets placed inside it. */
+export const TRAM = { x: -2.0, z: -7.6, yaw: 1.28, half: 7.0, wide: 1.9 } as const;
+
+/** Distance from the tram's centre-line, in metres (negative inside). */
+function distToTram(x: number, z: number): number {
+  const ux = Math.sin(TRAM.yaw), uz = Math.cos(TRAM.yaw);
+  const dx = x - TRAM.x, dz = z - TRAM.z;
+  const along = Math.abs(dx * ux + dz * uz) - TRAM.half;
+  const across = Math.abs(-dx * uz + dz * ux) - TRAM.wide;
+  return Math.max(along, across);
+}
+
+/**
+ * Places a prop and banks a little spoil against its foot.
+ *
+ * The "pasted on" look comes from a clean line where a prop meets the ground.
+ * Anything heavy that has sat outdoors for a week has silt, grit and a couple
+ * of brick fragments piled into the angle at its base — so every large placed
+ * object gets two or three tiny pieces tucked against it, at 55–90 % scale so
+ * they read as debris rather than as more props.
+ */
+function grounded(ctx: Ctx, p: { id: string; x: number; z: number; yaw?: number; scale?: number }, spread = 0.85): void {
+  const { scatter, rand } = ctx;
+  scatter.place({ id: p.id, x: p.x, y: surfaceY(p.x, p.z), z: p.z, yaw: p.yaw, scale: p.scale });
+  const n = rand.int(2, 3);
+  for (let i = 0; i < n; i++) {
+    const a = rand.range(0, Math.PI * 2);
+    const r = spread * rand.range(0.75, 1.25);
+    const px = p.x + Math.cos(a) * r, pz = p.z + Math.sin(a) * r;
+    if (distanceToBuildings(px, pz) < 0.15) continue;
+    scatter.place({
+      id: rand.pick(['rubbleSmall', 'brickPile', 'weeds', 'rubbleSmall', 'sandPile']),
+      x: px, y: surfaceY(px, pz), z: pz,
+      yaw: rand.range(0, 6.28), scale: rand.range(0.55, 0.9),
+    });
+  }
 }
 
 /** Height of the ground, the pavement or an interior floor, as appropriate. */
@@ -44,6 +82,8 @@ export function dressWorld(scatter: PropScatter, set: ChunkSet, roofs: Record<st
   squareComposition(ctx);
   streetFurniture(ctx);
   facadeClutter(ctx);
+  facadeColour(ctx);
+  defences(ctx);
   interiors(ctx);
   roofDressing(ctx, roofs);
   debrisFields(ctx);
@@ -55,9 +95,11 @@ export function dressWorld(scatter: PropScatter, set: ChunkSet, roofs: Record<st
 
 function setPieces(ctx: Ctx): void {
   const { set } = ctx;
-  // The tram lies across the square's long axis — the single most important
-  // sightline break on the map.
-  toppledTram(set.get('tram'), -1.0, -6.0, 0.34);
+  // The tram lies *across* the square's long axis — the single most important
+  // sightline break on the map. At yaw 0.34 it lay along the axis instead,
+  // pointing its blank end cap straight down the hero sightline, which is what
+  // made it read as an abstract block floating over the cobbles.
+  toppledTram(set.get('tram'), TRAM.x, TRAM.z, TRAM.yaw);
   fountain(set.get('fountain'), 0.5, -21.0);
   burntCar(set.get('car1'), -8.6, 6.5, 1.05, 811);
   burntCar(set.get('car2'), 8.2, -25.5, -0.55, 822);
@@ -87,20 +129,26 @@ function squareComposition(ctx: Ctx): void {
     [-9.5, 16.0, 0.2], [-7.3, 16.4, 0.2],
     [11.0, -30.5, 0.9], [-12.0, -12.0, 1.3], [12.5, -8.0, 0.35],
   ];
-  for (const [x, z, yaw] of chicane) {
-    scatter.place({ id: 'jerseyBarrier', x, y: surfaceY(x, z), z, yaw: yaw + rand.range(-0.05, 0.05) });
+  // Mixed, not uniform. Sixteen identical pale barriers through the middle of
+  // the square was the strongest "level editor" read left in the hero shot;
+  // roughly a third are now sandbags or hedgehogs, which changes the value,
+  // the silhouette and the story without changing the cover layout.
+  for (let i = 0; i < chicane.length; i++) {
+    const [x, z, yaw] = chicane[i];
+    const id = i % 3 === 1 ? 'sandbagRow' : i % 5 === 3 ? 'hedgehog' : 'jerseyBarrier';
+    grounded(ctx, { id, x, z, yaw: yaw + rand.range(-0.05, 0.05) }, 1.15);
   }
 
   // Big concrete blocks anchoring the corners of the square.
   for (const [x, z] of [[-12.5, -31.5], [12.0, -31.0], [-12.0, 17.5], [12.5, 17.0], [2.5, -34.0]] as const) {
-    ctx.scatter.place({ id: 'concreteBlock', x, y: surfaceY(x, z), z, yaw: rand.range(0, 3.14) });
+    grounded(ctx, { id: 'concreteBlock', x, z, yaw: rand.range(0, 3.14) }, 1.05);
   }
 
   // Market row along the east side of the square, awnings catching the sun.
   for (let i = 0; i < 4; i++) {
     const z = -26.0 + i * 6.4;
     const x = 11.4 + rand.range(-0.3, 0.3);
-    scatter.place({ id: 'marketStall', x, y: surfaceY(x, z), z, yaw: -Math.PI / 2 + rand.range(-0.08, 0.08) });
+    grounded(ctx, { id: 'marketStall', x, z, yaw: -Math.PI / 2 + rand.range(-0.08, 0.08) }, 1.85);
     scatter.place({ id: 'crateLarge', x: x - 1.9, y: surfaceY(x - 1.9, z + 1.2), z: z + 1.2, yaw: rand.range(0, 3.14) });
     scatter.place({ id: 'crateSmall', x: x - 1.6, y: surfaceY(x - 1.6, z - 1.4) + 0.0, z: z - 1.4, yaw: rand.range(0, 3.14) });
     if (rand.bool(0.7)) {
@@ -109,8 +157,8 @@ function squareComposition(ctx: Ctx): void {
   }
 
   // Kiosk and bus shelter on the west side.
-  scatter.place({ id: 'kiosk', x: -11.6, y: surfaceY(-11.6, -18.0), z: -18.0, yaw: Math.PI / 2 });
-  scatter.place({ id: 'busShelter', x: -11.4, y: surfaceY(-11.4, 2.0), z: 2.0, yaw: Math.PI / 2 });
+  grounded(ctx, { id: 'kiosk', x: -11.6, z: -18.0, yaw: Math.PI / 2 }, 1.7);
+  grounded(ctx, { id: 'busShelter', x: -11.4, z: 2.0, yaw: Math.PI / 2 }, 2.2);
 
   // Benches and planters facing the fountain — civic furniture, and low cover.
   for (let i = 0; i < 6; i++) {
@@ -120,12 +168,18 @@ function squareComposition(ctx: Ctx): void {
     scatter.place({ id: i % 2 ? 'bench' : 'planter', x, y: surfaceY(x, z), z, yaw: -a + Math.PI / 2 });
   }
 
-  // Tram catenary masts down the centre.
+  // Tram catenary masts down the centre. The pair nearest the wreck went down
+  // with it, so they are skipped here and re-placed leaning on the shell.
   for (let z = -30; z <= 20; z += 12.5) {
     for (const x of [-4.6, 4.6]) {
+      if (distToTram(x, z) < 1.6) continue;
       scatter.place({ id: 'tramMast', x, y: surfaceY(x, z), z, yaw: x < 0 ? 0 : Math.PI });
     }
   }
+  scatter.place({
+    id: 'tramMast', x: 5.4, y: surfaceY(5.4, -4.6), z: -4.6,
+    yaw: 2.1, pitch: 0.34, roll: 0.12,
+  });
 
   // Sandbags and ammo around the emplacements.
   for (const [ex, ez] of [[-6.5, -30.0], [7.0, 15.5], [-29.5, -24.0], [30.0, -3.0]] as const) {
@@ -212,12 +266,39 @@ function streetFurniture(ctx: Ctx): void {
     });
   }
 
+  // Lane chicanes.
+  //
+  // Both flanking streets were 90 m of straight, empty tarmac with the action
+  // 40 m away — the "empty, unlayered composition" tell. Each now gets a
+  // near-foreground obstacle within 8 m of the lane's own eye-level vantage, a
+  // midground wreck or barrier bank, and something breaking the far end, so the
+  // sightline reads in three depth layers instead of one.
+  const laneBank = (x: number, z: number, yaw: number, seed: number) => {
+    const r = new Rand(seed);
+    for (let i = 0; i < 3; i++) {
+      const px = x + Math.cos(yaw) * (i - 1) * 2.15;
+      const pz = z + Math.sin(yaw) * (i - 1) * 2.15;
+      grounded(ctx, { id: 'jerseyBarrier', x: px, z: pz, yaw: yaw + r.range(-0.08, 0.08) }, 1.15);
+    }
+    grounded(ctx, {
+      id: r.bool() ? 'rubbleHeap' : 'sandPile',
+      x: x + Math.cos(yaw + 1.4) * 3.1, z: z + Math.sin(yaw + 1.4) * 3.1,
+      yaw: r.range(0, 6.28), scale: r.range(0.7, 0.95),
+    }, 1.5);
+  };
+  laneBank(LANE.aX - 2.2, 14.5, 0.18, 5511);
+  laneBank(LANE.aX + 2.6, -12.0, 0.12, 5512);
+  laneBank(LANE.cX + 2.4, 18.0, 0.16, 5513);
+  laneBank(LANE.cX - 2.6, -14.0, 0.1, 5514);
+  laneBank(-8.0, LANE.northZ + 1.4, 1.5, 5515);
+  laneBank(6.0, LANE.southZ - 1.2, 1.5, 5516);
+
   // Dumpsters and bins in the alleys behind the shop rows.
   for (const [x, z] of [
     [-27.0, -22.0], [-27.5, 8.0], [27.5, -20.0], [27.0, 12.0],
     [-33.5, -30.0], [-33.0, 3.0], [-2.0, 30.5], [17.5, 33.0],
   ] as const) {
-    ctx.scatter.place({ id: 'dumpster', x, y: surfaceY(x, z), z, yaw: ctx.rand.range(0, 6.28) });
+    grounded(ctx, { id: 'dumpster', x, z, yaw: ctx.rand.range(0, 6.28) }, 1.5);
     for (let i = 0; i < 3; i++) {
       const px = x + ctx.rand.range(-2.2, 2.2), pz = z + ctx.rand.range(-2.2, 2.2);
       ctx.scatter.place({
@@ -236,6 +317,145 @@ function streetFurniture(ctx: Ctx): void {
       const pz = z + Math.sin(yaw) * i * 2.4;
       ctx.scatter.place({ id: i % 3 === 2 ? 'fenceBoard' : 'chainlink', x: px, y: surfaceY(px, pz), z: pz, yaw });
     }
+  }
+}
+
+/* --------------------------------------------------------- facade colour -- */
+
+/**
+ * Deliberate, controlled colour.
+ *
+ * Everything above is grey-brown by construction — render, concrete, asphalt,
+ * soot. A real street carries its colour in a narrow band: awnings, painted
+ * signage and shutters at first-floor height, posters at eye level, planting in
+ * the gaps. Keeping the accents *in that band* is what stops "add colour" from
+ * turning into confetti; the palette stays the map's warm neutrals plus one
+ * saturated red-green pair.
+ */
+function facadeColour(ctx: Ctx): void {
+  const { scatter, rand } = ctx;
+
+  // Awnings and signage along both shop rows facing the square, plus the café
+  // and the south apartments' ground floor.
+  const fronts: [number, number, number, number][] = [
+    // x, z0, z1, yaw (facing out into the lane)
+    [FOOTPRINTS.shopsW.x1 + 0.28, -31, -12, Math.PI / 2],
+    [FOOTPRINTS.shopsW2.x1 + 0.28, -3, 18, Math.PI / 2],
+    [FOOTPRINTS.shopsE.x0 - 0.28, -31, -12, -Math.PI / 2],
+    [FOOTPRINTS.shopsE2.x0 - 0.28, -3, 18, -Math.PI / 2],
+    [FOOTPRINTS.cafe.x1 + 0.28, 0, 10, Math.PI / 2],
+  ];
+  for (const [x, z0, z1, yaw] of fronts) {
+    for (let z = z0 + 1.4; z < z1; z += rand.range(3.4, 5.2)) {
+      scatter.place({ id: 'awning', x, y: surfaceY(x, z), z, yaw, scale: rand.range(0.88, 1.12) });
+      if (rand.bool(0.55)) {
+        const sz = z + rand.range(-1.6, 1.6);
+        scatter.place({ id: 'shopSign', x, y: surfaceY(x, sz), z: sz, yaw });
+      }
+    }
+  }
+
+  // Window boxes on the terrace and the south apartments — the residential
+  // frontages, where a first-floor sill would actually carry one.
+  for (const [name, side] of [['terraceN', 1], ['terraceM', 1], ['terraceS', 1], ['apartmentS', -1]] as const) {
+    const f = FOOTPRINTS[name];
+    if (!f) continue;
+    if (side > 0) {
+      for (let z = f.z0 + 2; z < f.z1 - 1; z += rand.range(2.4, 3.6)) {
+        if (!rand.bool(0.6)) continue;
+        scatter.place({ id: 'flowerBox', x: f.x1 + 0.34, y: rand.pick([3.62, 6.77]), z, yaw: Math.PI / 2 });
+      }
+    } else {
+      for (let x = f.x0 + 2; x < f.x1 - 1; x += rand.range(2.4, 3.6)) {
+        if (!rand.bool(0.6)) continue;
+        scatter.place({ id: 'flowerBox', x, y: rand.pick([4.82, 7.97]), z: f.z0 - 0.34, yaw: 0 });
+      }
+    }
+  }
+
+  // Fly-posted hoardings against blank walls and around the boarded corners.
+  for (const [x, z, yaw] of [
+    [-15.6, -20.0, Math.PI / 2], [-15.6, 6.0, Math.PI / 2], [15.6, -24.0, -Math.PI / 2],
+    [15.6, 10.5, -Math.PI / 2], [-26.4, -3.0, -Math.PI / 2], [26.6, -6.0, Math.PI / 2],
+    [-11.9, 2.2, Math.PI / 2], [-33.2, 33.6, 0.0],
+  ] as const) {
+    ctx.scatter.place({ id: 'posterPanel', x, y: surfaceY(x, z), z, yaw });
+  }
+}
+
+/* --------------------------------------------------------------- defences */
+
+/**
+ * The square was fought over this morning.
+ *
+ * Sandbagged firing positions in doorways and on corners, a hasty vehicle
+ * checkpoint of hedgehogs and wire across the north approach, ammunition
+ * stacked behind whatever the defenders were standing behind. This is the layer
+ * that makes the level read as *recently* fought over rather than merely
+ * derelict, and every piece of it is also cover, so it earns its draw calls
+ * twice.
+ */
+function defences(ctx: Ctx): void {
+  const { scatter, rand } = ctx;
+
+  // Firing positions: two or three sandbag rows, angled to face the square.
+  const positions: [number, number, number][] = [
+    [-15.4, -28.0, Math.PI / 2], [-15.4, -25.4, Math.PI / 2],
+    [15.4, -19.0, -Math.PI / 2], [15.4, -16.4, -Math.PI / 2],
+    [-13.0, 12.0, 0.35], [-11.2, 12.6, 0.35],
+    [11.6, -33.2, 2.9], [9.4, -33.6, 2.9],
+    [-12.4, -35.4, 1.2], [26.2, -2.0, -Math.PI / 2],
+    [-26.4, -26.5, Math.PI / 2], [-26.4, -24.0, Math.PI / 2],
+    [-1.2, 22.0, Math.PI], [1.6, 22.2, Math.PI],
+  ];
+  for (const [x, z, yaw] of positions) {
+    scatter.place({ id: 'sandbagRow', x, y: surfaceY(x, z), z, yaw: yaw + rand.range(-0.08, 0.08) });
+    if (rand.bool(0.5)) {
+      const px = x + Math.sin(yaw + Math.PI) * 1.1, pz = z + Math.cos(yaw + Math.PI) * 1.1;
+      scatter.place({
+        id: rand.pick(['ammoCrate', 'ammoBoxMetal', 'jerryCan']),
+        x: px, y: surfaceY(px, pz), z: pz, yaw: rand.range(0, 6.28),
+      });
+    }
+  }
+
+  // Vehicle checkpoint across the north end of the square: hedgehogs staggered
+  // with wire between them so the gap is a designed one.
+  for (let i = 0; i < 7; i++) {
+    const x = -11.5 + i * 3.9;
+    const z = -33.4 + ((i % 2) ? 1.1 : 0);
+    if (Math.abs(x - 1.0) < 2.4) continue;               // the deliberate gap
+    scatter.place({ id: 'hedgehog', x, y: surfaceY(x, z), z, yaw: rand.range(0, 6.28) });
+    if (i % 2 === 0) {
+      scatter.place({ id: 'razorWire', x: x + 1.9, y: surfaceY(x + 1.9, z + 0.6), z: z + 0.6, yaw: 0.05 });
+    }
+  }
+  // A second belt of wire closing the south-west corner.
+  for (let i = 0; i < 5; i++) {
+    const x = -34.0 + i * 1.7, z = 33.5;
+    scatter.place({ id: 'razorWire', x, y: surfaceY(x, z), z, yaw: rand.range(-0.1, 0.1) });
+  }
+  for (const [x, z] of [[27.0, 33.0], [-16.0, -38.0], [37.0, -36.0]] as const) {
+    for (let i = 0; i < 3; i++) {
+      const px = x + i * 1.8;
+      ctx.scatter.place({ id: 'hedgehog', x: px, y: surfaceY(px, z), z, yaw: ctx.rand.range(0, 6.28) });
+    }
+  }
+
+  // Manholes and gullies: tiny, but a street with no drainage reads as a
+  // diorama, and they give the eye something to scale the cobbles against.
+  for (const [x, z] of [
+    [-30.0, -18.0], [-30.0, 12.0], [30.0, -22.0], [30.0, 16.0],
+    [-2.0, -28.0], [3.0, 4.0], [-8.0, 17.0], [0.0, -36.0], [-38.0, -36.0], [38.0, 34.0],
+  ] as const) {
+    ctx.scatter.place({ id: 'manhole', x, y: surfaceY(x, z) + 0.005, z, yaw: ctx.rand.range(0, 6.28) });
+  }
+  for (const [x, z] of [
+    [LANE.aX + 4.3, -22.0], [LANE.aX + 4.3, 6.0], [LANE.aX - 4.3, -8.0],
+    [LANE.cX - 4.3, -18.0], [LANE.cX - 4.3, 14.0], [LANE.cX + 4.3, 2.0],
+    [-13.2, -12.0], [13.2, 8.0], [-13.2, 14.0], [13.2, -26.0],
+  ] as const) {
+    ctx.scatter.place({ id: 'drainGrate', x, y: surfaceY(x, z) + 0.005, z, yaw: Math.PI / 2 });
   }
 }
 
@@ -384,6 +604,35 @@ function debrisFields(ctx: Ctx): void {
     }
   }
 
+  // Crater ejecta. A shell throws its spoil *radially*, so the debris field is
+  // a set of rays fanning out from the lip, thinning with distance — never the
+  // uniform sprinkle that gives away a scatter tool.
+  for (const c of CRATERS) {
+    const rays = 6;
+    for (let r = 0; r < rays; r++) {
+      const a = (r / rays) * Math.PI * 2 + rand.range(-0.32, 0.32);
+      const reach = c.radius * rand.range(1.5, 2.5);
+      const n = 3;
+      for (let i = 0; i < n; i++) {
+        const t = (i + 0.6) / n;
+        // Thins out fast: the mass lands on the lip, only fragments carry.
+        if (!rand.bool(0.9 - t * 0.6)) continue;
+        const d = c.radius * 1.05 + (reach - c.radius * 1.05) * t;
+        const spread = 0.3 + t * 0.7;
+        const px = c.x + Math.cos(a) * d + rand.range(-spread, spread);
+        const pz = c.z + Math.sin(a) * d + rand.range(-spread, spread);
+        if (distanceToBuildings(px, pz) < 0.3) continue;
+        scatter.place({
+          id: rand.pick(t < 0.4
+            ? ['concreteChunk', 'rubbleSmall', 'brickPile', 'rebarBundle']
+            : ['rubbleSmall', 'brickPile', 'glassShards', 'weeds']),
+          x: px, y: surfaceY(px, pz), z: pz,
+          yaw: a + rand.range(-0.6, 0.6), scale: rand.range(0.42, 0.72),
+        });
+      }
+    }
+  }
+
   // General ground litter across the whole play space, denser near buildings.
   for (let i = 0; i < 420; i++) {
     const x = rand.range(-52, 52), z = rand.range(-52, 52);
@@ -438,14 +687,27 @@ function vegetation(ctx: Ctx): void {
     });
   }
 
-  // Ivy climbing the shaded north facades.
-  for (const name of ['terraceN', 'townHall', 'ruinSW', 'apartmentSW']) {
+  // Ivy climbing the shaded facades.
+  //
+  // Rooted on the ground, not floating: the previous version lifted each mat by
+  // up to 1.6 m, which left columns of leaves hanging four metres up with
+  // nothing behind them — the single most obvious floating-geometry read left
+  // on the map. The town hall is skipped entirely because its south face is the
+  // arcade, where a mat would sit in mid-air over the raised terrace.
+  for (const name of ['terraceN', 'ruinSW', 'apartmentSW', 'garage']) {
     const f = FOOTPRINTS[name];
     if (!f) continue;
-    for (let i = 0; i < 8; i++) {
-      const x = rand.range(f.x0, f.x1);
-      const z = f.z1 + 0.42;
-      scatter.place({ id: 'ivy', x, y: surfaceY(x, z) + rand.range(0, 1.6), z, yaw: 0, scale: rand.range(0.8, 1.4) });
+    for (let i = 0; i < 7; i++) {
+      const x = rand.range(f.x0 + 0.5, f.x1 - 0.5);
+      const z = f.z1 + 0.4;
+      scatter.place({ id: 'ivy', x, y: surfaceY(x, z), z, yaw: 0, scale: rand.range(0.85, 1.35) });
+    }
+    // A second run down one flank, so the plant does not read as a decal strip
+    // applied to exactly one wall.
+    for (let i = 0; i < 4; i++) {
+      const z = rand.range(f.z0 + 1, f.z1 - 1);
+      const x = f.x1 + 0.4;
+      scatter.place({ id: 'ivy', x, y: surfaceY(x, z), z, yaw: -Math.PI / 2, scale: rand.range(0.8, 1.2) });
     }
   }
 }

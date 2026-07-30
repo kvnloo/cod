@@ -14,6 +14,7 @@
 import * as THREE from 'three';
 import { Rand } from '../../core/Rand';
 import { applyInstanceVariation } from '../../material/MaterialLibrary';
+import { setBlendWeights } from '../../material/MaterialShaders';
 import { tagSurface } from '../../core/Surfaces';
 import type { MatCatalog, MatKey } from '../MatCatalog';
 import { Chunk } from '../geom/Chunk';
@@ -39,7 +40,17 @@ export interface PropCluster {
   matrices: THREE.Matrix4[];
 }
 
-const DISTRICT = 38;
+const DISTRICT = 48;
+/**
+ * A bucket has to earn its draw calls.
+ *
+ * Bucketing exists so the culling system can reject a district that is behind
+ * the camera — worth it for the thousand-odd pieces of rubble, pointless for a
+ * prop with four placements on the whole map, where it just multiplies one
+ * instanced draw into four. Anything under this count is folded into a single
+ * map-wide bucket; the dense scatters keep their spatial split.
+ */
+const MERGE_BELOW = 12;
 
 export class PropScatter {
   private placements = new Map<string, Placement[]>();
@@ -60,7 +71,7 @@ export class PropScatter {
   }
 
   /** Builds (and caches) the per-material geometry for one prop id. */
-  private geometryFor(id: string): { key: MatKey; geo: THREE.BufferGeometry }[] {
+  private geometryFor(id: string, cat: MatCatalog): { key: MatKey; geo: THREE.BufferGeometry }[] {
     const cached = this.geometries.get(id);
     if (cached) return cached;
     const def = propDef(id);
@@ -71,7 +82,15 @@ export class PropScatter {
     for (const key of chunk.keys) {
       const mesher = chunk.m(key);
       if (mesher.empty) continue;
-      out.push({ key, geo: mesher.build() });
+      const geo = mesher.build();
+      // Grounding: props are authored sitting on y = 0, so the blend layer can
+      // be driven straight off local height. Dirt splashes up the bottom
+      // ~18 cm of anything that stands on the street, which is what stops a
+      // crate reading as a clean box dropped on to the pavement.
+      if (cat.blends(key)) {
+        setBlendWeights(geo, (_x, y) => 1 - THREE.MathUtils.smoothstep(y, 0.015, 0.19));
+      }
+      out.push({ key, geo });
     }
     this.geometries.set(id, out);
     return out;
@@ -92,10 +111,10 @@ export class PropScatter {
     for (const [id, list] of this.placements) {
       const def = propDef(id);
       if (!def) continue;
-      const parts = this.geometryFor(id);
+      const parts = this.geometryFor(id, cat);
       if (!parts.length) continue;
 
-      // Bucket by district.
+      // Bucket by district, then fold the sparse ones together.
       const buckets = new Map<string, Placement[]>();
       for (const p of list) {
         const key = `${Math.floor(p.x / DISTRICT)},${Math.floor(p.z / DISTRICT)}`;
@@ -103,6 +122,13 @@ export class PropScatter {
         if (!b) { b = []; buckets.set(key, b); }
         b.push(p);
       }
+      const spare: Placement[] = [];
+      for (const [key, b] of buckets) {
+        if (b.length >= MERGE_BELOW) continue;
+        for (const p of b) spare.push(p);
+        buckets.delete(key);
+      }
+      if (spare.length) buckets.set('all', spare);
 
       // obVar must cover the largest bucket; geometries are shared.
       let maxCount = 0;

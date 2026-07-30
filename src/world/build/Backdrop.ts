@@ -51,29 +51,47 @@ export function buildBackdrop(chunk: Chunk): void {
     }
   }
 
-  /* --- mountain ridge -------------------------------------------------- */
-  const ridge = chunk.m('ridge');
-  const R = 620;
-  const segments = 128;
-  const pts: THREE.Vector2[] = [];
-  for (let i = 0; i <= segments; i++) {
-    const a = (i / segments) * Math.PI * 2;
-    pts.push(V2(Math.cos(a) * R, Math.sin(a) * R));
-  }
-  // A ring of peaks: two octaves of ridged noise around the horizon.
-  for (let i = 0; i < segments; i++) {
-    const a0 = (i / segments) * Math.PI * 2;
-    const a1 = ((i + 1) / segments) * Math.PI * 2;
-    const h0 = ridgeHeight(a0);
-    const h1 = ridgeHeight(a1);
-    const x0 = Math.cos(a0) * R, z0 = Math.sin(a0) * R;
-    const x1 = Math.cos(a1) * R, z1 = Math.sin(a1) * R;
-    const inset = 0.86;
-    ridge.quad(
-      new THREE.Vector3(x0, -2, z0), new THREE.Vector3(x1, -2, z1),
-      new THREE.Vector3(x1 * inset, h1, z1 * inset), new THREE.Vector3(x0 * inset, h0, z0 * inset),
-      60, true,
-    );
+  /* --- mountain ridges --------------------------------------------------
+   * Three ranges rather than one wall.
+   *
+   * A single ridge silhouette at one distance and one value is the thing that
+   * makes a backdrop read as a painted flat: real mountains overlap, and each
+   * range further back is lighter, bluer and lower in contrast than the one in
+   * front of it. Three rings at 480/620/790 m with independent noise give both
+   * the overlap and the aerial-perspective banding, and because they are on the
+   * backdrop layer they cost nothing but a handful of triangles.
+   *
+   * The near range also has a rockier profile: sharper ridged noise plus a
+   * second harmonic, so the silhouette has real notches in it rather than the
+   * smooth grey humps it had before. */
+  const ranges: { key: 'ridgeNear' | 'ridgeMid' | 'ridge'; r: number; base: number; gain: number; sharp: number; phase: number; foot: number }[] = [
+    { key: 'ridgeNear', r: 470, base: 30, gain: 92, sharp: 3.0, phase: 0.0, foot: -2 },
+    { key: 'ridgeMid', r: 630, base: 52, gain: 138, sharp: 2.2, phase: 1.9, foot: -2 },
+    { key: 'ridge', r: 800, base: 74, gain: 176, sharp: 1.7, phase: 4.3, foot: -2 },
+  ];
+  const segments = 160;
+  for (const range of ranges) {
+    const m = chunk.m(range.key);
+    const h = (a: number) => range.base + Math.pow(ridged(a + range.phase), range.sharp) * range.gain;
+    for (let i = 0; i < segments; i++) {
+      const a0 = (i / segments) * Math.PI * 2;
+      const a1 = ((i + 1) / segments) * Math.PI * 2;
+      const h0 = h(a0), h1 = h(a1);
+      const x0 = Math.cos(a0) * range.r, z0 = Math.sin(a0) * range.r;
+      const x1 = Math.cos(a1) * range.r, z1 = Math.sin(a1) * range.r;
+      // The crest is pulled inward so the face we see is tilted toward the
+      // camera, and the amount it is pulled varies segment to segment: that
+      // varying tilt is what gives the range its facet shading. With a constant
+      // inset every triangle shares a normal and the whole ridge flattens into
+      // one silhouette of flat grey — which is precisely how it read before.
+      const i0 = 0.80 + ridged(a0 * 2.7 + 3.1) * 0.22;
+      const i1 = 0.80 + ridged(a1 * 2.7 + 3.1) * 0.22;
+      m.quad(
+        new THREE.Vector3(x0, range.foot, z0), new THREE.Vector3(x1, range.foot, z1),
+        new THREE.Vector3(x1 * i1, h1, z1 * i1), new THREE.Vector3(x0 * i0, h0, z0 * i0),
+        60, true,
+      );
+    }
   }
 
   /* --- a few taller landmarks so the skyline is not a flat band --------- */
@@ -87,8 +105,15 @@ export function buildBackdrop(chunk: Chunk): void {
   }
 }
 
-function ridgeHeight(a: number): number {
-  const n = Math.sin(a * 3.1 + 0.4) * 0.5 + Math.sin(a * 7.3 + 2.1) * 0.28 + Math.sin(a * 13.7 + 4.4) * 0.14;
-  const ridged = 1 - Math.abs(n);
-  return 55 + Math.pow(ridged, 2.2) * 150;
+/**
+ * Ridged multifractal in [0,1]. Four octaves, folded through `1 - |n|` so the
+ * maxima are creases rather than domes — the difference between a mountain
+ * profile and a sine wave.
+ */
+function ridged(a: number): number {
+  const n = Math.sin(a * 3.1 + 0.4) * 0.46
+    + Math.sin(a * 7.3 + 2.1) * 0.26
+    + Math.sin(a * 13.7 + 4.4) * 0.17
+    + Math.sin(a * 27.1 + 1.7) * 0.11;
+  return Math.max(0, 1 - Math.abs(n));
 }

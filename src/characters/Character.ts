@@ -129,6 +129,38 @@ export class Character implements CharacterAPI {
   get currentLOD(): number { return this.lod; }
   get triangles(): number { return this.levels[this.lod].triangles; }
 
+  /**
+   * Mean and minimum baked vertex tint per material group.
+   *
+   * Character albedo is a product of a generated texture and a per-vertex tint
+   * that already carries baked occlusion, so "is the plate carrier too dark?"
+   * is a numeric question. This answers it without a screenshot.
+   */
+  tintStats(): { faction: string; groups: { slot: number; mean: number[]; min: number }[] } {
+    const mesh = this.levels[this.lod].mesh;
+    const out: { slot: number; mean: number[]; min: number }[] = [];
+    const geo = mesh?.geometry;
+    const col = geo?.getAttribute('color');
+    const idx = geo?.getIndex();
+    if (!geo || !col || !idx) return { faction: this.options.faction, groups: out };
+    for (let g = 0; g < geo.groups.length; g++) {
+      const grp = geo.groups[g];
+      const seen = new Set<number>();
+      let r = 0, gg = 0, bb = 0, min = 1;
+      for (let i = grp.start; i < grp.start + grp.count; i++) {
+        const v = idx.getX(i);
+        if (seen.has(v)) continue;
+        seen.add(v);
+        const cr = col.getX(v), cg = col.getY(v), cb = col.getZ(v);
+        r += cr; gg += cg; bb += cb;
+        min = Math.min(min, 0.2126 * cr + 0.7152 * cg + 0.0722 * cb);
+      }
+      const n = Math.max(1, seen.size);
+      out.push({ slot: g, mean: [r / n, gg / n, bb / n], min });
+    }
+    return { faction: this.options.faction, groups: out };
+  }
+
   /* ------------------------------------------------------------- queries */
 
   bone(name: BoneName): THREE.Object3D | null {

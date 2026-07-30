@@ -114,54 +114,63 @@ export class DamageIndicators implements Widget {
       const ang = rel - Math.PI / 2; // canvas angles start at +X
 
       const bloom = h.bloom.value;
-      const baseR = (128 + h.strength * 14) * d.s;
-      const drift = Ease.outCubic(t) * 18 * d.s * motion();
+      // Pushed out and slimmed right down from the original: a shipped
+      // indicator is a thin chevron of arc sitting *outside* the action, not a
+      // slab of red across the midground. Radius scales with the shorter screen
+      // axis so it keeps the same relationship to the reticle at any aspect.
+      const ref = Math.min(d.w, d.h);
+      const baseR = ref * 0.225 + h.strength * 12 * d.s;
+      const drift = Ease.outCubic(t) * 16 * d.s * motion();
       const rInner = baseR + drift;
-      const thickness = (13 + h.strength * 10) * d.s * (0.72 + bloom * 0.34);
-      const half = (0.235 + h.strength * 0.075) * (0.72 + bloom * 0.36);
+      const thickness = (5 + h.strength * 4) * d.s * (0.8 + bloom * 0.3);
+      const half = (0.15 + h.strength * 0.05) * (0.78 + bloom * 0.3);
 
-      const hot = lift(p.hostile, 0.4 * clamp01(bloom - 0.55));
+      const hot = lift(p.hostile, 0.45 * clamp01(bloom - 0.4));
 
       c.save();
       c.globalAlpha = a;
 
-      // Soft outer haze so the wedge sits in the frame rather than on it.
-      const grad = c.createRadialGradient(cx, cy, rInner - thickness * 0.4, cx, cy, rInner + thickness * 2.4);
-      grad.addColorStop(0, rgba(p.hostile, 0.42));
-      grad.addColorStop(1, rgba(p.hostile, 0));
-      wedgePath(c, cx, cy, rInner - thickness * 0.4, rInner + thickness * 2.4, ang - half * 1.5, ang + half * 1.5);
-      c.fillStyle = grad;
-      c.fill();
+      // Angular taper: three nested wedges narrowing as they brighten. Cheaper
+      // and crisper than a conic gradient, and it gives the arc real points at
+      // both ends instead of a chopped-off slab.
+      const rings: Array<[number, number]> = [[1.0, 0.2], [0.74, 0.34], [0.44, 0.5]];
+      for (const [spanK, alphaK] of rings) {
+        wedgePath(c, cx, cy, rInner, rInner + thickness, ang - half * spanK, ang + half * spanK);
+        c.fillStyle = rgba(p.hostile, alphaK);
+        c.fill();
+      }
 
-      // Core wedge: brightest at the inner edge, falling away outward.
-      const core = c.createLinearGradient(
-        cx + Math.cos(ang) * rInner, cy + Math.sin(ang) * rInner,
-        cx + Math.cos(ang) * (rInner + thickness), cy + Math.sin(ang) * (rInner + thickness),
-      );
-      core.addColorStop(0, rgba(hot, 1));
-      core.addColorStop(0.45, rgba(p.hostile, 0.72));
-      core.addColorStop(1, rgba(p.hostile, 0.05));
-      wedgePath(c, cx, cy, rInner, rInner + thickness, ang - half, ang + half);
-      c.fillStyle = core;
-      c.fill();
-
-      // Hard inner arc + tapered tips: this is what makes it read as a pointer
-      // rather than a smear.
-      c.strokeStyle = rgba(lift(p.hostile, 0.62), 0.95 * fade);
-      c.lineWidth = Math.max(1.4, 2.1 * d.s);
+      // Bright inner lip — the edge nearest the player is what the eye catches.
+      c.strokeStyle = rgba(hot, 0.95 * fade);
+      c.lineWidth = Math.max(1.2, 1.7 * d.s);
       c.lineCap = 'round';
       c.beginPath();
-      c.arc(cx, cy, rInner - 1.2 * d.s, ang - half * 0.92, ang + half * 0.92);
+      c.arc(cx, cy, rInner + 0.6 * d.s, ang - half * 0.66, ang + half * 0.66);
       c.stroke();
       c.lineCap = 'butt';
 
-      // Centre tick pointing straight at the source.
-      c.strokeStyle = rgba(lift(p.hostile, 0.75), 0.9 * fade);
-      c.lineWidth = Math.max(1.2, 1.8 * d.s);
+      // Inward pip on the apex axis, between the arc and the reticle. It points
+      // *at* the source, which is what turns a curved stroke into a direction.
+      // (An outward barb was tried first and read as a hook on the arc's end.)
+      const nx = Math.cos(ang);
+      const ny = Math.sin(ang);
+      const pr = rInner - 7 * d.s;
+      const pip = 4.2 * d.s;
+      c.fillStyle = rgba(hot, 0.85 * fade);
       c.beginPath();
-      c.moveTo(cx + Math.cos(ang) * (rInner - 8 * d.s), cy + Math.sin(ang) * (rInner - 8 * d.s));
-      c.lineTo(cx + Math.cos(ang) * (rInner - 2 * d.s), cy + Math.sin(ang) * (rInner - 2 * d.s));
-      c.stroke();
+      c.moveTo(cx + nx * (pr + pip), cy + ny * (pr + pip));
+      c.lineTo(cx + nx * (pr - pip * 0.5) - ny * pip * 0.72, cy + ny * (pr - pip * 0.5) + nx * pip * 0.72);
+      c.lineTo(cx + nx * (pr - pip * 0.5) + ny * pip * 0.72, cy + ny * (pr - pip * 0.5) - nx * pip * 0.72);
+      c.closePath();
+      c.fill();
+
+      // Dark keyline behind the whole arc so it survives a bright wall.
+      c.globalCompositeOperation = 'destination-over';
+      wedgePath(c, cx, cy, rInner - 1.6 * d.s, rInner + thickness + 1.6 * d.s,
+        ang - half - 0.012, ang + half + 0.012);
+      c.fillStyle = 'rgba(2,4,8,0.5)';
+      c.fill();
+      c.globalCompositeOperation = 'source-over';
 
       c.restore();
     }

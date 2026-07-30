@@ -335,31 +335,56 @@ function strafeClip(name: string, dir: 1 | -1): ClipDef {
 
 /* --------------------------------------------------------------- reactions */
 
-/** Impact flinches. Additive over locomotion, so they only carry the delta. */
+/**
+ * Impact flinches. Additive over locomotion, so they only carry the delta.
+ *
+ * The shape matters more than the size: a round arriving is a *snap* — 70–90 ms
+ * to peak, an overshoot, then a slow recovery over half a second. Symmetric
+ * ease-in-out over a third of a second reads as an animation playing. The whip
+ * key after the peak is what makes the body look struck rather than posed.
+ */
 function hitClip(name: string, pose: PoseSpec, settle: PoseSpec = {}): ClipDef {
   return {
-    name, duration: 0.62, loop: false,
+    name, duration: 0.78, loop: false,
     keys: [
       { t: 0, pose: {}, ease: 'out' },
-      { t: 0.16, pose, ease: 'out' },
-      { t: 0.45, pose: settle, ease: 'inOut' },
+      { t: 0.11, pose, ease: 'out' },
+      { t: 0.30, pose: settle, ease: 'inOut' },
       { t: 1, pose: {}, ease: 'inOut' },
     ],
   };
 }
 
 const HIT_FRONT = hitClip('hitFront',
-  { hips: [-4, 0, 0], spine: [-9, 0, 0], chest: [-13, 0, 0], neck: [10, 0, 0], head: [8, 0, 0], shoulderL: [0, 0, -6], shoulderR: [0, 0, 6] },
-  { spine: [-3, 0, 0], chest: [-4, 0, 0], neck: [3, 0, 0] });
+  {
+    hips: [-7, 0, 0], spine: [-17, 0, 0], chest: [-26, 0, 0], neck: [20, 0, 0], head: [17, 0, 0],
+    shoulderL: [0, 0, -12], shoulderR: [0, 0, 12],
+    upperArmL: [8, 0, 10], upperArmR: [8, 0, -10],
+    upperLegL: [6, 0, 0], lowerLegL: [10, 0, 0], upperLegR: [3, 0, 0], lowerLegR: [6, 0, 0],
+  },
+  { spine: [-6, 0, 0], chest: [-9, 0, 0], neck: [6, 0, 0], upperArmL: [3, 0, 4], upperArmR: [3, 0, -4] });
 const HIT_BACK = hitClip('hitBack',
-  { hips: [5, 0, 0], spine: [8, 0, 0], chest: [12, 0, 0], neck: [-12, 0, 0], head: [-9, 0, 0] },
-  { spine: [3, 0, 0], chest: [4, 0, 0] });
+  {
+    hips: [9, 0, 0], spine: [15, 0, 0], chest: [23, 0, 0], neck: [-22, 0, 0], head: [-18, 0, 0],
+    shoulderL: [0, 0, 9], shoulderR: [0, 0, -9],
+    upperArmL: [-12, 0, 8], upperArmR: [-12, 0, -8],
+    upperLegL: [-5, 0, 0], upperLegR: [-8, 0, 0], lowerLegR: [9, 0, 0],
+  },
+  { spine: [6, 0, 0], chest: [8, 0, 0], neck: [-6, 0, 0] });
 const HIT_LEFT = hitClip('hitLeft',
-  { hips: [0, 0, -5], spine: [0, -4, -9], chest: [0, -7, -12], neck: [0, 5, 8], head: [0, 4, 6], shoulderL: [0, 0, -10] },
-  { spine: [0, -1, -3], chest: [0, -2, -4] });
+  {
+    hips: [0, 0, -9], spine: [0, -8, -17], chest: [0, -13, -23], neck: [0, 10, 15], head: [0, 8, 12],
+    shoulderL: [0, 0, -18], upperArmL: [6, 0, 16], upperArmR: [4, 0, -6],
+    upperLegL: [0, 0, -5], upperLegR: [0, 0, -3],
+  },
+  { spine: [0, -3, -6], chest: [0, -4, -8] });
 const HIT_RIGHT = hitClip('hitRight',
-  { hips: [0, 0, 5], spine: [0, 4, 9], chest: [0, 7, 12], neck: [0, -5, -8], head: [0, -4, -6], shoulderR: [0, 0, 10] },
-  { spine: [0, 1, 3], chest: [0, 2, 4] });
+  {
+    hips: [0, 0, 9], spine: [0, 8, 17], chest: [0, 13, 23], neck: [0, -10, -15], head: [0, -8, -12],
+    shoulderR: [0, 0, 18], upperArmR: [6, 0, -16], upperArmL: [4, 0, 6],
+    upperLegR: [0, 0, 5], upperLegL: [0, 0, 3],
+  },
+  { spine: [0, 3, 6], chest: [0, 4, 8] });
 
 /* ------------------------------------------------------------------ deaths */
 
@@ -396,8 +421,8 @@ const DEATH_FRONT: ClipDef = {
         hips: [6, 4, 0], spine: [10, 0, 0], chest: [8, 0, 0], neck: [-30, 0, 0], head: [-14, 6, 0],
         upperLegL: [-20, 0, 14], lowerLegL: [46, 0, 0],
         upperLegR: [-12, 0, -10], lowerLegR: [30, 0, 0],
-        upperArmL: [10, 0, 46], upperArmR: [6, 0, -40],
-        lowerArmL: [-12, 0, 0], lowerArmR: [-16, 0, 0],
+        upperArmL: [16, -10, 28], upperArmR: [2, 14, -54],
+        lowerArmL: [-48, 0, 0], lowerArmR: [-10, 0, 0],
       },
       offset: { root: [0, 0.18, -0.24] },
     },
@@ -412,7 +437,8 @@ const DEATH_BACK: ClipDef = {
       t: 0.16, ease: 'out',
       pose: {
         hips: [6, 0, 0], spine: [12, 0, 0], chest: [18, 0, 0], neck: [-18, 0, 0], head: [-12, 0, 0],
-        upperArmL: [18, 0, 26], upperArmR: [18, 0, -26],
+        upperArmL: [24, -8, 16], upperArmR: [10, 6, -30],
+        lowerArmL: [-46, 0, 0], lowerArmR: [-18, 0, 0],
         upperLegL: [8, 0, 4], upperLegR: [10, 0, -4],
       },
       offset: { hips: [0, -0.03, -0.04] },
@@ -423,8 +449,11 @@ const DEATH_BACK: ClipDef = {
         hips: [22, -4, 0], spine: [18, 0, 0], chest: [14, 0, 0], neck: [-14, 0, 0], head: [-8, 0, 0],
         upperLegL: [-30, 0, 8], lowerLegL: [40, 0, 0],
         upperLegR: [-26, 0, -6], lowerLegR: [52, 0, 0],
-        upperArmL: [30, 0, 40], upperArmR: [28, 0, -38],
-        lowerArmL: [-30, 0, 0], lowerArmR: [-30, 0, 0],
+        // Asymmetric: one arm trapped across the body, one flung out. Two arms
+        // abducted by the same angle is a starfish, and a starfish reads as a
+        // clip playing rather than as a man going down.
+        upperArmL: [34, -14, 22], upperArmR: [14, 10, -46],
+        lowerArmL: [-64, 0, 0], lowerArmR: [-22, 0, 0],
       },
       offset: { hips: [0, -0.44, -0.10] },
     },
@@ -435,8 +464,8 @@ const DEATH_BACK: ClipDef = {
         hips: [8, -6, 0], spine: [6, 0, 0], chest: [10, 0, 0], neck: [22, 0, 0], head: [18, -8, 0],
         upperLegL: [-16, 0, 12], lowerLegL: [24, 0, 0],
         upperLegR: [-10, 0, -14], lowerLegR: [36, 0, 0],
-        upperArmL: [-4, 0, 52], upperArmR: [-6, 0, -48],
-        lowerArmL: [-24, 0, 0], lowerArmR: [-20, 0, 0],
+        upperArmL: [-10, -16, 30], upperArmR: [-2, 12, -62],
+        lowerArmL: [-56, 0, 0], lowerArmR: [-14, 0, 0],
       },
       offset: { root: [0, 0.20, 0.26] },
     },

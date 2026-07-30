@@ -39,6 +39,12 @@ export interface FactionStyle {
   face: [FaceGear, number][];
   eyes: [EyeGear, number][];
   carrier: [Carrier, number][];
+  /**
+   * Target **linear albedo luminance** for the uniform, the load-bearing nylon
+   * and the hard kit. These are real reflectance numbers: faded multicam sits
+   * near 0.12, coyote cordura near 0.06, a ranger-green helmet shell near 0.05.
+   */
+  level: { uniform: number; webbing: number; hard: number };
   /** 0..1 chance of NVG mount, comms headset, backpack, knee pads. */
   pNvg: number;
   pHeadset: number;
@@ -73,6 +79,7 @@ export const FACTION_STYLES: Record<CharacterFaction, FactionStyle> = {
     face: [['none', 0.16], ['balaclava', 0.30], ['shemagh', 0.30], ['halfMask', 0.24]],
     eyes: [['none', 0.52], ['glasses', 0.20], ['goggles', 0.28]],
     carrier: [['none', 0.16], ['chestRig', 0.50], ['plate', 0.34]],
+    level: { uniform: 0.125, webbing: 0.088, hard: 0.072 },
     pNvg: 0.05, pHeadset: 0.22, pBackpack: 0.30, pKneePads: 0.20, pGloves: 0.55, pPatch: 0.15,
     skin: [0, 8], bulk: 0.96,
   },
@@ -88,6 +95,7 @@ export const FACTION_STYLES: Record<CharacterFaction, FactionStyle> = {
     face: [['none', 0.18], ['balaclava', 0.28], ['halfMask', 0.40], ['shemagh', 0.14]],
     eyes: [['goggles', 0.44], ['glasses', 0.30], ['none', 0.16], ['visor', 0.10]],
     carrier: [['plate', 0.62], ['heavy', 0.24], ['chestRig', 0.14]],
+    level: { uniform: 0.165, webbing: 0.118, hard: 0.084 },
     pNvg: 0.55, pHeadset: 0.85, pBackpack: 0.45, pKneePads: 0.70, pGloves: 0.92, pPatch: 0.75,
     skin: [0, 8], bulk: 1.04,
   },
@@ -103,6 +111,7 @@ export const FACTION_STYLES: Record<CharacterFaction, FactionStyle> = {
     face: [['balaclava', 0.48], ['respirator', 0.14], ['halfMask', 0.22], ['none', 0.16]],
     eyes: [['goggles', 0.50], ['visor', 0.16], ['none', 0.20], ['glasses', 0.14]],
     carrier: [['plate', 0.54], ['heavy', 0.30], ['chestRig', 0.16]],
+    level: { uniform: 0.108, webbing: 0.076, hard: 0.066 },
     pNvg: 0.40, pHeadset: 0.70, pBackpack: 0.35, pKneePads: 0.60, pGloves: 0.88, pPatch: 0.30,
     skin: [0, 4], bulk: 1.06,
   },
@@ -116,6 +125,7 @@ export const FACTION_STYLES: Record<CharacterFaction, FactionStyle> = {
     face: [['balaclava', 0.6], ['halfMask', 0.4]],
     eyes: [['goggles', 0.6], ['none', 0.4]],
     carrier: [['plate', 1]],
+    level: { uniform: 0.096, webbing: 0.070, hard: 0.060 },
     pNvg: 0.8, pHeadset: 1, pBackpack: 0.3, pKneePads: 0.9, pGloves: 1, pPatch: 0.6,
     skin: [0, 8], bulk: 1.02,
   },
@@ -163,6 +173,8 @@ export interface Appearance {
   uniformTint: THREE.Color;
   webbingTint: THREE.Color;
   hardTint: THREE.Color;
+  /** Same family as `hardTint` but calibrated against the metal texture set. */
+  metalTint: THREE.Color;
   gloveTint: THREE.Color;
   bootTint: THREE.Color;
   skinTint: THREE.Color;
@@ -171,8 +183,28 @@ export interface Appearance {
   wear: number;
 }
 
+/**
+ * Mean **linear** albedo luminance of each slot's generated texture set, in
+ * `SLOT` order (skin, cloth, gear, hard, metal).
+ *
+ * A tint is a modulation of that texture, so hitting a real reflectance means
+ * solving `tint = target / mean`. The old code used hand-picked "levels" in
+ * sRGB, which is how a ranger-green helmet ended up at 3 % reflectance — a
+ * black hole with no readable form at any time of day.
+ */
+const MEAN_ALBEDO = [0.44, 0.225, 0.215, 0.200, 0.100];
+
+function srgbToLinear(c: number): number {
+  return c < 0.04045 ? c * 0.0773993808 : ((c + 0.055) / 1.055) ** 2.4;
+}
+
 function lumOf(c: number[]): number {
   return c[0] * 0.2126 + c[1] * 0.7152 + c[2] * 0.0722;
+}
+
+/** Linear luminance of an sRGB triple. */
+function linLumOf(c: number[]): number {
+  return lumOf([srgbToLinear(c[0]), srgbToLinear(c[1]), srgbToLinear(c[2])]);
 }
 
 function weighted<T extends string>(rand: Rand, table: [T, number][]): T {
@@ -184,22 +216,37 @@ function weighted<T extends string>(rand: Rand, table: [T, number][]): T {
 }
 
 /**
- * Turns a palette colour into a *modulation* tint.
+ * Turns a palette colour into a **linear** modulation tint that lands the part
+ * on a chosen albedo.
  *
- * The camo atlas already carries the colour of the cloth; a tint whose average
- * is 0.4 would multiply that down to mud. So each palette entry is normalised
- * to unit luminance — it contributes hue and nothing else — and `level` sets how
- * light or dark the part should be relative to the texture as authored.
+ * `base` is authored in sRGB because that is how anyone thinks about "coyote
+ * brown"; it is converted to linear, normalised to unit luminance so it carries
+ * hue and saturation only, then scaled so `texture × tint` has luminance
+ * `target`. `slot` picks which texture family it will be multiplied into.
+ *
+ * The saturation of kit is also pulled down here: real dyed nylon and ripstop
+ * in daylight are far less colourful than a paint chip, and over-saturated
+ * tints are what make procedural characters read as toys.
  */
-function tint(base: number[], rand: Rand, spread: number, level = 1): THREE.Color {
-  const lum = Math.max(1e-3, base[0] * 0.2126 + base[1] * 0.7152 + base[2] * 0.0722);
-  const j = level * (1 + rand.signed() * spread);
-  const h = rand.signed() * spread * 0.4;
-  return new THREE.Color(
-    Math.max(0.02, (base[0] / lum) * (j + h)),
-    Math.max(0.02, (base[1] / lum) * j),
-    Math.max(0.02, (base[2] / lum) * (j - h)),
+function tint(
+  base: number[], rand: Rand, spread: number, target: number, slot: number, sat = 0.72,
+): THREE.Color {
+  const lin = [srgbToLinear(base[0]), srgbToLinear(base[1]), srgbToLinear(base[2])];
+  const lum = Math.max(1e-4, lumOf(lin));
+  const k = (target / MEAN_ALBEDO[slot]) * (1 + rand.signed() * spread);
+  const h = rand.signed() * spread * 0.5;
+  const c = new THREE.Color(
+    (lin[0] / lum) * (1 + h),
+    lin[1] / lum,
+    (lin[2] / lum) * (1 - h),
   );
+  // Desaturate toward the neutral of the same luminance, then apply the scale.
+  c.setRGB(
+    Math.max(0.02, THREE.MathUtils.lerp(1, c.r, sat) * k),
+    Math.max(0.02, THREE.MathUtils.lerp(1, c.g, sat) * k),
+    Math.max(0.02, THREE.MathUtils.lerp(1, c.b, sat) * k),
+  );
+  return c;
 }
 
 export function makeAppearance(opts: CharacterOptions): Appearance {
@@ -263,16 +310,20 @@ export function makeAppearance(opts: CharacterOptions): Appearance {
     shoulderPatchSide: rand.bool(0.5) ? 1 : -1,
     kneePadSide: rand.bool(0.75) ? 0 : (rand.bool(0.5) ? 1 : -1),
 
-    uniformTint: tint(uniformBase, rand, 0.10, 1.02),
-    webbingTint: tint(style.webbing, rand, 0.09, 0.88),
-    hardTint: tint(style.hard, rand, 0.08, 0.62),
-    gloveTint: tint(style.glove, rand, 0.08, 0.50),
-    bootTint: tint([0.19, 0.16, 0.14], rand, 0.12, 0.46),
-    // The skin recipe is authored at a light-mid tone; the tint carries the
-    // character's own tone as a ratio against it, so the spread survives
-    // normalisation.
-    skinTint: tint(SKIN_TONES[skinIdx], rand, 0.035, (lumOf(SKIN_TONES[skinIdx]) / 0.709) * 0.80),
-    accentTint: tint([0.45, 0.32, 0.16], rand, 0.18, 0.85),
+    uniformTint: tint(uniformBase, rand, 0.13, style.level.uniform, 1, 0.68),
+    webbingTint: tint(style.webbing, rand, 0.11, style.level.webbing, 2, 0.62),
+    hardTint: tint(style.hard, rand, 0.10, style.level.hard, 3, 0.70),
+    metalTint: tint(style.hard, rand, 0.10, 0.048, 4, 0.45),
+    gloveTint: tint(style.glove, rand, 0.10, 0.040, 3, 0.55),
+    bootTint: tint([0.24, 0.20, 0.17], rand, 0.14, 0.036, 3, 0.60),
+    // The skin recipe is authored near-neutral at a light-mid value; the tint
+    // carries this character's own reflectance, so the tonal spread across a
+    // squad survives normalisation instead of collapsing to one brown.
+    skinTint: tint(
+      SKIN_TONES[skinIdx], rand, 0.05,
+      THREE.MathUtils.clamp(linLumOf(SKIN_TONES[skinIdx]) * 0.78, 0.045, 0.34), 0, 0.95,
+    ),
+    accentTint: tint([0.52, 0.40, 0.24], rand, 0.18, 0.115, 2, 0.70),
     wear,
   };
 

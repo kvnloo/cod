@@ -33,9 +33,15 @@ const SPECS: Record<PropKind, Spec> = {
   shotgun: { barrel: 0.34, handguard: 0.28, stock: 0.20, mag: 0.10, optic: 'irons', drum: false },
 };
 
-const DARK = new THREE.Color(0.20, 0.20, 0.21);
-const POLY = new THREE.Color(0.26, 0.26, 0.25);
-const STEEL = new THREE.Color(0.55, 0.56, 0.58);
+/**
+ * Linear modulation tints, calibrated against the mean albedo of the slot
+ * texture they multiply (metal ≈ 0.10, hard polymer ≈ 0.20) so that a black
+ * anodised receiver lands near 0.025 reflectance rather than 0.003 — which is
+ * how the prop used to read as a silhouette cut out of the frame.
+ */
+const DARK = new THREE.Color(0.28, 0.28, 0.30);
+const POLY = new THREE.Color(0.15, 0.15, 0.145);
+const STEEL = new THREE.Color(0.85, 0.86, 0.90);
 
 /**
  * Builds the prop geometry. It reuses the character mesh builder purely for its
@@ -133,7 +139,7 @@ export function buildWeaponProp(
   b.slot(SLOT.METAL).color(STEEL, 0.4);
   b.cylinder(new THREE.Vector3(-0.024, 0.062, -0.040), new THREE.Vector3(0.024, 0.062, -0.040), 0.005, 0.005, 6, true);
 
-  const { geometry, slots } = b.build();
+  const { geometry, slots } = b.build('cheap');
   geometry.deleteAttribute('skinIndex');
   geometry.deleteAttribute('skinWeight');
   const mats = slots.map((slot) => materials.get(slot as 0 | 1 | 2 | 3 | 4, faction));

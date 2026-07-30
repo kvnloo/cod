@@ -154,6 +154,14 @@ export class WeaponSystem implements System {
     bus.on('player:land', (e) => this.viewModel.land(e.force));
     bus.on('player:mantle', () => this.viewModel.mantle());
     bus.on('player:spawn', () => this.onSpawn());
+    // `weapon:ads` was write-only: this system announced it and nobody could
+    // ask for it. Scripted sequences — capture shots, cinematics, the HUD's own
+    // sight-picture stills — need to pose the view model down its sights
+    // without synthesising input, so the event now works in both directions.
+    bus.on('weapon:ads', (e) => {
+      if (this.adsEmitting) return;
+      this.adsScripted = e.active;
+    });
   }
 
   /* --------------------------------------------------------------- loadout */
@@ -320,14 +328,26 @@ export class WeaponSystem implements System {
 
   /* ------------------------------------------------------------------ ADS */
 
+  /** Externally requested aim, from a scripted `weapon:ads`. */
+  private adsScripted: boolean | null = null;
+  /** Guards the round trip through the bus while this system announces its own. */
+  private adsEmitting = false;
+
   private updateAds(): void {
     const w = this.slots[this.index].runtime;
     const busy = this.state === 'melee' || this.state === 'holstering';
-    const wantAds = input.held('ads') && !this.stanceSprinting && !busy && !this.grenades.cooking;
+    const held = input.held('ads');
+    // A real trigger finger always outranks a script, and taking hold of the
+    // aim button drops the override for good.
+    if (held) this.adsScripted = null;
+    const wantAds = (held || this.adsScripted === true)
+      && !this.stanceSprinting && !busy && !this.grenades.cooking;
     if (wantAds !== this.adsActive) {
       this.adsActive = wantAds;
       w.ads = wantAds;
+      this.adsEmitting = true;
       bus.emit('weapon:ads', { active: wantAds });
+      this.adsEmitting = false;
     }
   }
 

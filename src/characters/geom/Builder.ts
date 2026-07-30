@@ -25,6 +25,16 @@ import * as THREE from 'three';
 import type { BoneName } from '../types';
 import { BONE_INDEX, type RigInstance } from '../Rig';
 
+/**
+ * How dark baked occlusion is allowed to go.
+ *
+ * Vertex colour multiplies the *direct* term as well as the ambient in a
+ * standard material, so this is a contact-shadow budget, not a real AO term:
+ * deep enough to seat a pouch on a plate, shallow enough that a sunlit chest
+ * does not turn to mud. Anything below ~0.5 here and the carrier reads black.
+ */
+const AO_FLOOR = 0.55;
+
 /* --------------------------------------------------------------- material slots */
 
 export const SLOT = {
@@ -178,19 +188,28 @@ export class SkinMeshBuilder {
   }
 
   /**
-   * Sets the vertex tint. Tints are authored in sRGB (that is how anyone thinks
-   * about "coyote brown") and converted to linear here, because three multiplies
-   * `vColor` into the already-linear albedo without any conversion of its own.
+   * Sets the vertex tint from a **linear** modulation colour.
+   *
+   * `Appearance` hands out tints already calibrated in linear space against the
+   * mean albedo of the slot's texture (see `MEAN_ALBEDO` there), so what arrives
+   * here is a straight multiplier on an already-linear albedo — exactly what
+   * three does with `vColor`. Converting again is what used to crush every dark
+   * piece of kit to black: a 0.62 "level" became 0.34 in linear and then met a
+   * 0.2-linear texture.
+   *
+   * `mul` is a relative shade for one part of a kit family (a flap 0.8× the
+   * pouch it sits on) and is applied in linear too.
    */
   color(c: THREE.Color, mul = 1): this {
     this.curColor.setRGB(
-      srgbToLinear(THREE.MathUtils.clamp(c.r * mul, 0, 1)),
-      srgbToLinear(THREE.MathUtils.clamp(c.g * mul, 0, 1)),
-      srgbToLinear(THREE.MathUtils.clamp(c.b * mul, 0, 1)),
+      THREE.MathUtils.clamp(c.r * mul, 0.0015, 1),
+      THREE.MathUtils.clamp(c.g * mul, 0.0015, 1),
+      THREE.MathUtils.clamp(c.b * mul, 0.0015, 1),
     );
     return this;
   }
 
+  /** Sets the vertex tint from an sRGB triple (authoring convenience). */
   colorRGB(r: number, g: number, b: number): this {
     this.curColor.setRGB(srgbToLinear(r), srgbToLinear(g), srgbToLinear(b));
     return this;
@@ -672,14 +691,155 @@ export class SkinMeshBuilder {
     this.end();
   }
 
+  /* ------------------------------------------------------------------- ao */
+
+  /**
+   * Bakes ambient occlusion into the vertex tints.
+   *
+   * This is the single thing that stops layered kit looking like decals: a
+   * plate carrier standing 16 mm off the chest, a pouch strapped to that
+   * carrier, a helmet rim over a brow and a sleeve cuff over a wrist all have to
+   * darken what they sit on, and no screen-space AO at a soldier's scale is
+   * going to find a 16 mm gap.
+   *
+   * Method: every triangle in the mesh is collapsed into an area-weighted disc
+   * in a voxel grid, then each vertex integrates the form factor of the discs in
+   * its hemisphere. Two radii run — a tight one for contact darkening under
+   * gear, a wide one for the broad shading of armpits, the crotch, under the
+   * chin and inside the shoulder line.
+   *
+   * Cost is ~15 ms for an LOD-0 soldier, paid once when the geometry is built.
+   */
+  private bakeAO(passes: { radius: number; voxel: number; strength: number }[]): Float32Array {
+    const count = this.vertexCount;
+    const ao = new Float32Array(count).fill(1);
+    if (count === 0) return ao;
+
+    for (const pass of passes) {
+      const { radius, voxel, strength } = pass;
+      const r2 = radius * radius;
+      const inv = 1 / voxel;
+
+      /* 1. area-weighted occluder discs, one per occupied voxel */
+      const bucket = new Map<number, number>();
+      let n = 0;
+      // One voxel per triangle is the worst case, so this never has to grow.
+      const cap = Math.max(1, this.triangleCount);
+      const px = new Float64Array(cap), py = new Float64Array(cap), pz = new Float64Array(cap);
+      const qx = new Float64Array(cap), qy = new Float64Array(cap), qz = new Float64Array(cap);
+      const area = new Float64Array(cap);
+
+      for (let s = 0; s < SLOT_COUNT; s++) {
+        const list = this.slotIndex[s];
+        for (let i = 0; i < list.length; i += 3) {
+          const a = list[i] * 3, b = list[i + 1] * 3, c = list[i + 2] * 3;
+          const ax = this.pos[a], ay = this.pos[a + 1], az = this.pos[a + 2];
+          const e1x = this.pos[b] - ax, e1y = this.pos[b + 1] - ay, e1z = this.pos[b + 2] - az;
+          const e2x = this.pos[c] - ax, e2y = this.pos[c + 1] - ay, e2z = this.pos[c + 2] - az;
+          const cx = e1y * e2z - e1z * e2y;
+          const cy = e1z * e2x - e1x * e2z;
+          const cz = e1x * e2y - e1y * e2x;
+          const len = Math.hypot(cx, cy, cz);
+          if (len < 1e-12) continue;
+          const ar = len * 0.5;
+          const gx = ax + (e1x + e2x) / 3, gy = ay + (e1y + e2y) / 3, gz = az + (e1z + e2z) / 3;
+          const key = (Math.round(gx * inv) + 512)
+            + (Math.round(gy * inv) + 512) * 1024
+            + (Math.round(gz * inv) + 512) * 1048576;
+          let idx = bucket.get(key) ?? -1;
+          if (idx < 0) {
+            idx = n++;
+            bucket.set(key, idx);
+          }
+          px[idx] += gx * ar; py[idx] += gy * ar; pz[idx] += gz * ar;
+          qx[idx] += (cx / len) * ar; qy[idx] += (cy / len) * ar; qz[idx] += (cz / len) * ar;
+          area[idx] += ar;
+        }
+      }
+      if (n === 0) continue;
+      for (let i = 0; i < n; i++) {
+        const w = area[i] || 1;
+        px[i] /= w; py[i] /= w; pz[i] /= w;
+        const l = Math.hypot(qx[i], qy[i], qz[i]) || 1;
+        qx[i] /= l; qy[i] /= l; qz[i] /= l;
+      }
+
+      /* 2. lookup grid at the search radius */
+      const ginv = 1 / radius;
+      const cells = new Map<number, number[]>();
+      for (let i = 0; i < n; i++) {
+        const key = (Math.round(px[i] * ginv) + 512)
+          + (Math.round(py[i] * ginv) + 512) * 1024
+          + (Math.round(pz[i] * ginv) + 512) * 1048576;
+        const c = cells.get(key);
+        if (c) c.push(i); else cells.set(key, [i]);
+      }
+
+      /* 3. hemisphere gather */
+      for (let v = 0; v < count; v++) {
+        const vx = this.pos[v * 3], vy = this.pos[v * 3 + 1], vz = this.pos[v * 3 + 2];
+        const vnx = this.nrm[v * 3], vny = this.nrm[v * 3 + 1], vnz = this.nrm[v * 3 + 2];
+        const bx = Math.round(vx * ginv), by = Math.round(vy * ginv), bz = Math.round(vz * ginv);
+        let occ = 0;
+        for (let dz = -1; dz <= 1; dz++) {
+          for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+              const c = cells.get((bx + dx + 512) + (by + dy + 512) * 1024 + (bz + dz + 512) * 1048576);
+              if (!c) continue;
+              for (let k = 0; k < c.length; k++) {
+                const j = c[k];
+                const ex = px[j] - vx, ey = py[j] - vy, ez = pz[j] - vz;
+                const d2 = ex * ex + ey * ey + ez * ez;
+                if (d2 > r2 || d2 < 1e-9) continue;
+                const d = Math.sqrt(d2);
+                const cosI = (ex * vnx + ey * vny + ez * vnz) / d;
+                if (cosI <= 0.03) continue;
+                const cosJ = -(ex * qx[j] + ey * qy[j] + ez * qz[j]) / d;
+                if (cosJ <= 0.0) continue;
+                // Form factor of a small disc, with a smooth cut at the radius
+                // so occluders do not pop as the search sphere sweeps them.
+                const fade = 1 - d2 / r2;
+                occ += (area[j] * cosI * cosJ * fade * fade) / (Math.PI * d2 + area[j]);
+              }
+            }
+          }
+        }
+        // A saturating response, not an exponential one. Vertex AO multiplies
+        // the *direct* term as well as the ambient in a standard material, so a
+        // sunlit chest plate that happens to sit between four pouches must not
+        // go to mud — the darkening has to read as contact, not as paint.
+        ao[v] *= 1 / (1 + strength * occ);
+      }
+    }
+
+    for (let i = 0; i < count; i++) ao[i] = AO_FLOOR + (1 - AO_FLOOR) * ao[i];
+    return ao;
+  }
+
   /* --------------------------------------------------------------- output */
 
   /**
    * Computes skin weights and packs everything into a `BufferGeometry` with one
    * group per non-empty material slot.
+   *
+   * `ao` selects the baked-occlusion budget: `full` for hero LODs, `cheap` for
+   * mid, `none` for the distant level where nothing would be visible anyway.
    */
-  build(): { geometry: THREE.BufferGeometry; slots: number[] } {
+  build(ao: 'full' | 'cheap' | 'none' = 'full'): { geometry: THREE.BufferGeometry; slots: number[] } {
     const count = this.vertexCount;
+
+    if (ao !== 'none') {
+      const occl = this.bakeAO(ao === 'full'
+        ? [
+          { radius: 0.050, voxel: 0.012, strength: 0.90 },
+          { radius: 0.200, voxel: 0.045, strength: 0.30 },
+        ]
+        : [{ radius: 0.090, voxel: 0.026, strength: 0.70 }]);
+      for (let i = 0; i < count; i++) {
+        const a = occl[i];
+        this.col[i * 3] *= a; this.col[i * 3 + 1] *= a; this.col[i * 3 + 2] *= a;
+      }
+    }
     const skinIndex = new Uint16Array(count * 4);
     const skinWeight = new Float32Array(count * 4);
     const p = new THREE.Vector3();

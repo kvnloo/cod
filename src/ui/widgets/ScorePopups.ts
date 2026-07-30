@@ -10,7 +10,7 @@
 
 import { bus } from '../../core/EventBus';
 import { clamp01, Ease, lerp, motion, motionTime, Spring, SPRING } from '../Anim';
-import { hairWidth, measureText, text } from '../Draw';
+import { hairWidth, measureText, plate, text, wash } from '../Draw';
 import type { DrawCtx } from '../Draw';
 import type { HudModel } from '../Model';
 import { lift, rgba, type Palette, type RGB } from '../Theme';
@@ -106,13 +106,32 @@ export class ScorePopups implements Widget {
     const c = d.c;
     const s = d.s;
     const cx = d.w / 2;
-    const stackY = d.h * 0.712;
-    const rowH = 19 * s;
+    // The centre column below the reticle belongs to the interaction prompt.
+    // XP lands in its own column right of centre and stacks downward — the same
+    // separation shipped titles use so a capture prompt and a kill reward can
+    // coexist in one frame without piling up on each other.
+    const stackX = cx + 172 * s;
+    const stackY = d.h * 0.565;
+    // Rows must clear the 22px type with room to breathe; at 19 they collided
+    // whenever two events landed inside the spring's settle time.
+    const rowH = 27 * s;
 
     const tallyX = cx;
     const tallyY = d.h - MARGIN * s - 6 * s;
 
     /* ------------------------------------------------------- popups --- */
+    // One shared wash under the whole stack rather than one per row, so the
+    // darkening does not double up where rows overlap mid-animation.
+    let liveRows = 0;
+    for (let i = 0; i < CAPACITY; i++) if (this.pool[i].active && this.pool[i].age <= this.pool[i].hold) liveRows++;
+    if (liveRows > 0 && !d.cheap) {
+      c.save();
+      c.globalAlpha = d.alpha * 0.9;
+      wash(c, stackX, stackY + (liveRows - 1) * rowH * 0.5 - 4 * s,
+        170 * s, (24 + liveRows * rowH / s * 0.5) * s, 0.42);
+      c.restore();
+    }
+
     c.save();
     for (let i = 0; i < CAPACITY; i++) {
       const q = this.pool[i];
@@ -122,10 +141,10 @@ export class ScorePopups implements Widget {
       const ft = flying ? clamp01((q.age - q.hold) / q.flight) : 0;
       const ease = Ease.inOutCubic(ft);
 
-      const sx = cx;
+      const sx = stackX;
       const sy = stackY + q.slot.value * rowH;
       // Quadratic path bowing outward before converging on the tally.
-      const midX = lerp(sx, tallyX, 0.5) + 128 * s * motion();
+      const midX = lerp(sx, tallyX, 0.5) + 110 * s * motion();
       const midY = lerp(sy, tallyY, 0.5) - 10 * s;
       const x = flying
         ? (1 - ease) * (1 - ease) * sx + 2 * (1 - ease) * ease * midX + ease * ease * tallyX
@@ -145,21 +164,24 @@ export class ScorePopups implements Widget {
       c.translate(x, y);
       c.scale(scale, scale);
 
+      // Two fixed columns hinged on the centre line: the amount is right-aligned
+      // into the left column and the reason left-aligned into the right one, so
+      // a stack of "+25 HIT / +150 HEADSHOT" lines up on the digits the way a
+      // shipped feed does instead of centring each row independently.
       const amountStr = `+${q.amount}`;
-      const aOpts = { size: 21 * s, weight: 700, family: 'cond' as const, tracking: 0.8 * s };
-      const lOpts = { size: 11.5 * s, weight: 600, family: 'cond' as const, tracking: 3 * s };
-      const aw = measureText(c, amountStr, aOpts);
-      const lw = q.label ? measureText(c, q.label, lOpts) : 0;
-      const gap = q.label ? 9 * s : 0;
-      const total = aw + gap + lw;
+      const aOpts = { size: 22 * s, weight: 700, family: 'cond' as const, tracking: 0.4 * s };
+      const lOpts = { size: 12 * s, weight: 600, family: 'cond' as const, tracking: 2.6 * s };
+      const hinge = 6 * s;
 
-      text(c, amountStr, -total / 2, 0, {
-        ...aOpts, color: rgba(tint, 1), shadow: Math.max(1, 1.4 * s),
-        glow: q.reward ? 12 * s : 0, glowColor: rgba(tint, 0.5),
+      text(c, amountStr, -hinge, 0, {
+        ...aOpts, align: 'right', color: rgba(tint, 1),
+        shadow: Math.max(1, 1.3 * s), outline: 2.6 * s,
+        glow: q.reward ? 14 * s : 0, glowColor: rgba(tint, 0.5),
       });
       if (q.label) {
-        text(c, q.label, -total / 2 + aw + gap, -1 * s, {
-          ...lOpts, color: rgba(p.inkDim, 0.92), shadow: Math.max(1, 1.1 * s),
+        text(c, q.label, hinge, -1.5 * s, {
+          ...lOpts, color: rgba(p.ink, 0.9),
+          shadow: Math.max(1, 1 * s), outline: 2.2 * s,
         });
       }
       c.restore();
@@ -177,13 +199,14 @@ export class ScorePopups implements Widget {
     const sOpts = { size: 22 * s, weight: 700, family: 'cond' as const, tracking: 1.6 * s };
     const w = measureText(c, scoreStr, sOpts);
     text(c, scoreStr, w / 2, 0, {
-      ...sOpts, align: 'right', color: rgba(p.ink, 0.95), shadow: Math.max(1, 1.4 * s),
+      ...sOpts, align: 'right', color: rgba(p.ink, 0.95),
+      shadow: Math.max(1, 1.3 * s), outline: 2.6 * s,
     });
     text(c, 'SCORE', -w / 2 - 8 * s, -1 * s, {
       size: 10.5 * s, weight: 600, family: 'cond', tracking: 3.4 * s, align: 'right',
-      color: rgba(p.inkFaint, 0.85), shadow: Math.max(1, 1 * s),
+      color: rgba(p.inkDim, 0.8), shadow: Math.max(1, 1 * s), outline: 2 * s,
     });
-    c.strokeStyle = rgba(p.hair, 0.22);
+    c.strokeStyle = rgba(p.hair, 0.26);
     c.lineWidth = hairWidth(d.dpr);
     c.beginPath();
     c.moveTo(-w / 2 - 78 * s, 5 * s);

@@ -69,6 +69,17 @@ export interface TextOptions {
   color?: string;
   /** Dark contact shadow offset in px; 0 disables. */
   shadow?: number;
+  /**
+   * Dark halo stroked *around* the glyphs, in px of total width.
+   *
+   * This is the single thing that lets thin near-white type survive a
+   * blown-out sky or a sunlit cobble street. Left undefined it is derived from
+   * the type size, so every string in the HUD gets one for free; pass 0 to opt
+   * out (menus over their own dark plate do not need it).
+   */
+  outline?: number;
+  /** Colour of the halo. Defaults to the house near-black. */
+  outlineColor?: string;
   /** Outer glow radius in px. */
   glow?: number;
   glowColor?: string;
@@ -78,6 +89,20 @@ export interface TextOptions {
   /** Horizontal squeeze applied when the condensed webfont is unavailable. */
   condense?: number;
 }
+
+/**
+ * Default halo width for a given type size, in px.
+ *
+ * Sub-linear and hard-capped: small labels need proportionally more halo to
+ * survive, while a 60 px ammo numeral with a 4 px black edge stops looking like
+ * type and starts looking like a sticker.
+ */
+export function autoOutline(size: number): number {
+  const w = 1.1 + size * 0.075;
+  return w < 1.7 ? 1.7 : w > 3.1 ? 3.1 : w;
+}
+
+const OUTLINE_INK = 'rgba(1,3,6,0.86)';
 
 export function setFont(
   c: CanvasRenderingContext2D, size: number, weight = 600, family: FontFamily = 'cond',
@@ -154,13 +179,43 @@ export function text(
     if (blur > 0) { c.shadowBlur = 0; c.shadowColor = 'transparent'; }
   };
 
-  const color = o.color ?? '#dce6f4';
+  /** Halo: one stroke pass around the glyph outlines. */
+  const strokePass = (style: string, lw: number): void => {
+    c.strokeStyle = style;
+    c.lineWidth = lw;
+    c.lineJoin = 'round';
+    c.miterLimit = 2;
+    if (native) {
+      c.strokeText(str, ox, y);
+    } else {
+      let px = ox;
+      for (let i = 0; i < str.length; i++) {
+        const ch = str[i];
+        c.strokeText(ch, px, y);
+        px += c.measureText(ch).width + track;
+      }
+    }
+  };
 
+  const color = o.color ?? '#e4e8ed';
+
+  // Order matters: soft offset contact shadow, then the tight halo, then the
+  // chroma ghosts, then the glow, then the glyph itself on top.
   if (o.shadow) {
     const prev = c.globalAlpha;
-    c.globalAlpha = prev * 0.62;
-    paint('rgba(0,2,5,0.95)', o.shadow, o.shadow, 0);
+    c.globalAlpha = prev * 0.5;
+    paint('rgba(0,2,5,0.95)', o.shadow, o.shadow * 1.15, 0);
     c.globalAlpha = prev;
+  }
+  const outline = o.outline ?? autoOutline(o.size);
+  if (outline > 0) {
+    const prev = c.globalAlpha;
+    // Two passes — a wide soft one and a tight opaque one — reads as a genuine
+    // halo rather than a sticker edge.
+    c.globalAlpha = prev * 0.55;
+    strokePass(o.outlineColor ?? OUTLINE_INK, outline * 1.85);
+    c.globalAlpha = prev;
+    strokePass(o.outlineColor ?? OUTLINE_INK, outline);
   }
   if (o.chroma && !cheapMode) {
     const prev = c.globalAlpha;
@@ -325,6 +380,60 @@ export function panel(
     c.lineWidth = Math.max(1, (o.dpr ?? 1) > 1 ? 1.2 : 1);
     c.strokeStyle = o.bracketColor ?? rgba(o.hair ?? fill, 0.55);
     corners(c, x, y, w, h, o.bracket);
+  }
+}
+
+/**
+ * Soft elliptical darkening centred on (cx,cy).
+ *
+ * Used behind free-floating centre-screen type (banners, prompts, popups) so it
+ * survives a bright wall without a hard-edged box appearing over the frame.
+ */
+export function wash(
+  c: CanvasRenderingContext2D, cx: number, cy: number, rx: number, ry: number, strength: number,
+): void {
+  if (strength <= 0.002 || rx <= 0 || ry <= 0) return;
+  c.save();
+  c.translate(cx, cy);
+  c.scale(rx, ry);
+  // A gentle four-stop falloff. Two stops leave a visible ellipse edge — over a
+  // pale sky the banner backing read as a dark smudge pasted on the frame.
+  const g = c.createRadialGradient(0, 0, 0, 0, 0, 1);
+  g.addColorStop(0, `rgba(2,4,8,${strength.toFixed(3)})`);
+  g.addColorStop(0.32, `rgba(2,4,8,${(strength * 0.78).toFixed(3)})`);
+  g.addColorStop(0.62, `rgba(2,4,8,${(strength * 0.34).toFixed(3)})`);
+  g.addColorStop(0.84, `rgba(2,4,8,${(strength * 0.09).toFixed(3)})`);
+  g.addColorStop(1, 'rgba(2,4,8,0)');
+  c.fillStyle = g;
+  c.beginPath();
+  c.arc(0, 0, 1, 0, Math.PI * 2);
+  c.fill();
+  c.restore();
+}
+
+/**
+ * Tight dark plate behind a run of type: a chamfered fill that fades out to the
+ * right (or left) so it never reads as a UI box, plus an optional accent edge.
+ */
+export function plate(
+  c: CanvasRenderingContext2D, x: number, y: number, w: number, h: number,
+  o: { strength?: number; from?: 'left' | 'right'; edge?: string; edgeW?: number; cut?: number } = {},
+): void {
+  const strength = o.strength ?? 0.55;
+  const g = o.from === 'right'
+    ? c.createLinearGradient(x + w, y, x, y)
+    : c.createLinearGradient(x, y, x + w, y);
+  g.addColorStop(0, `rgba(3,6,11,${strength.toFixed(3)})`);
+  g.addColorStop(0.62, `rgba(3,6,11,${(strength * 0.5).toFixed(3)})`);
+  g.addColorStop(1, 'rgba(3,6,11,0)');
+  if (o.cut) chamferPath(c, x, y, w, h, o.cut); else { c.beginPath(); c.rect(x, y, w, h); }
+  c.fillStyle = g;
+  c.fill();
+  if (o.edge) {
+    c.fillStyle = o.edge;
+    const ew = o.edgeW ?? 2;
+    if (o.from === 'right') c.fillRect(x + w - ew, y, ew, h);
+    else c.fillRect(x, y, ew, h);
   }
 }
 

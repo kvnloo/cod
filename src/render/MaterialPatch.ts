@@ -24,7 +24,7 @@ import type { RenderUniforms } from './RenderUniforms';
 
 export type MaterialKind = 'standard' | 'lit' | 'unlit' | 'raw';
 
-const PATCH_VERSION = 7;
+const PATCH_VERSION = 8;
 
 interface PatchState {
   version: number;
@@ -138,6 +138,31 @@ uniform float boAmbientIntensity;
 uniform mat4 projectionMatrix;
 `,
 ].join('\n');
+
+/**
+ * Geometric specular anti-aliasing (Kaplanyan et al. / Frostbite's variant).
+ *
+ * A high-frequency normal map under a tight NDF produces single-pixel highlight
+ * sparkle: the sub-pixel normal distribution is far wider than the material's
+ * own roughness, so each pixel randomly lands on or off a mirror lobe. TAA
+ * cannot settle it because the jitter keeps re-rolling which pixels win, and the
+ * result is the crawling glitter you see on cobbles, roof tiles and brick.
+ *
+ * Widening the NDF by the pixel-footprint normal variance converts that variance
+ * into roughness, which is exactly what a correctly filtered material would have
+ * had. Injected after the normal is final and before `lights_physical_fragment`
+ * builds `material`, so it also reaches the G-buffer roughness that SSR reads.
+ */
+const SPEC_AA_INJECT = /* glsl */ `
+{
+	vec3 boDnDx = dFdx( normal );
+	vec3 boDnDy = dFdy( normal );
+	float boVariance = 0.25 * ( dot( boDnDx, boDnDx ) + dot( boDnDy, boDnDy ) );
+	float boKernel = min( 2.0 * boVariance, 0.18 );
+	float boAlpha = roughnessFactor * roughnessFactor;
+	roughnessFactor = sqrt( clamp( boAlpha + boKernel, 0.0, 1.0 ) );
+}
+`;
 
 /** Analytic sun evaluated through three's own BRDF so every material feature works. */
 const SUN_INJECT = /* glsl */ `
@@ -337,6 +362,13 @@ export class MaterialPatcher {
         : '';
 
       let frag = `${MRT_DECL}\n${varyings}\n${pars}\n${shader.fragmentShader}`;
+
+      if (kind === 'standard' && frag.includes('#include <normal_fragment_maps>')) {
+        frag = frag.replace(
+          '#include <normal_fragment_maps>',
+          `#include <normal_fragment_maps>\n${SPEC_AA_INJECT}`,
+        );
+      }
 
       if (wantSun) {
         frag = frag.replace(

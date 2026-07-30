@@ -44,16 +44,18 @@ export interface Palette {
 }
 
 const BASE: Palette = {
-  ink: [0xdc, 0xe6, 0xf4],
-  inkDim: [0x92, 0xa2, 0xb8],
-  inkFaint: [0x5c, 0x6a, 0x7d],
-  accent: [0xff, 0xc2, 0x4b],
-  hostile: [0xff, 0x4a, 0x3a],
-  friendly: [0x55, 0xc8, 0xff],
-  good: [0x63, 0xe6, 0xa8],
+  // Warm-neutral off-white. Pure #fff is banned; this sits ~86% luma so it
+  // still reads as "white" next to the amber accent without clipping.
+  ink: [0xe4, 0xe8, 0xed],
+  inkDim: [0xa6, 0xaf, 0xba],
+  inkFaint: [0x6d, 0x77, 0x84],
+  accent: [0xff, 0xb4, 0x33],
+  hostile: [0xff, 0x3d, 0x33],
+  friendly: [0x4f, 0xc3, 0xff],
+  good: [0x5c, 0xdd, 0x9e],
   warn: [0xff, 0x8a, 0x2b],
   panel: [0x08, 0x0c, 0x12],
-  hair: [0x9d, 0xb2, 0xcc],
+  hair: [0xa8, 0xb8, 0xc8],
   shade: [0x00, 0x02, 0x05],
 };
 
@@ -125,16 +127,23 @@ export function lift(c: RGB, t: number): RGB {
 /* -------------------------------------------------------------- fonts ---- */
 
 /**
- * Barlow Condensed is loaded by index.html. The fallbacks are ordered so a
- * headless/offline run still gets a condensed grotesque rather than a default
- * browser face.
+ * Barlow Condensed is requested by index.html from Google Fonts. That request
+ * fails in an offline container (and on any machine behind a firewall), so the
+ * fallback chain is the *real* type system, not a safety net: it is ordered so
+ * the next face down is always another condensed grotesque with a full weight
+ * range. `Liberation Sans` / `Arial` are deliberately last — landing on them is
+ * exactly the "default browser look" the visual bar forbids.
  */
 export const FONT_COND =
-  "'Barlow Condensed','Fira Sans Condensed','Open Sans Condensed','DejaVu Sans Condensed','Roboto Condensed','Arial Narrow',sans-serif";
+  "'Barlow Condensed','Oswald','Archivo Narrow','Saira Condensed',"
+  + "'Fira Sans Condensed','Roboto Condensed','Open Sans Condensed',"
+  + "'Noto Sans Display Condensed','DejaVu Sans Condensed','Arial Narrow',sans-serif";
+/** Body copy — briefs, subtitles, help text. Never a Helvetica/Arial clone. */
 export const FONT_SANS =
-  "'Barlow','Inter','Liberation Sans','DejaVu Sans',system-ui,sans-serif";
+  "'Barlow','Inter','Fira Sans','Source Sans 3','Noto Sans','Adwaita Sans',"
+  + "'DejaVu Sans',system-ui,sans-serif";
 export const FONT_MONO =
-  "'JetBrains Mono','DejaVu Sans Mono','Liberation Mono',ui-monospace,monospace";
+  "'JetBrains Mono','Fira Code','DejaVu Sans Mono','Liberation Mono',ui-monospace,monospace";
 
 /* ------------------------------------------------------------- metrics ---- */
 

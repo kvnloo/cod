@@ -159,6 +159,21 @@ function makeMaterial(
   });
 }
 
+/**
+ * Per-mesh material instance.
+ *
+ * The renderer's velocity buffer keeps the previous-frame model matrix in a
+ * uniform on the *material*, and three only re-uploads a material's uniforms
+ * when it switches material between draws. Two meshes at different transforms
+ * sharing one material therefore both render with whichever prev matrix was
+ * uploaded first, and every mesh but that one gets a huge bogus screen-space
+ * velocity — which the motion-blur pass smears across the whole stage. Giving
+ * each static mesh its own (texture-sharing) clone keeps the test bed sharp.
+ */
+function own(mat: THREE.Material): THREE.Material {
+  return mat.clone();
+}
+
 /* --------------------------------------------------------------- staging -- */
 
 let engineRef: EngineContext['engine'] | null = null;
@@ -166,6 +181,10 @@ let fxRef: FXSystem | null = null;
 
 /** Frames the capture harness settles after `setup()` returns. */
 const SETTLE = 24 / 60;
+
+/** Ambient defaults the stage returns to before every shot. */
+const STAGE_DUST = 0.7;
+const STAGE_LITTER = 0.35;
 
 /**
  * Returns a shot `setup` that clears every effect, fires `spawn`, and arranges
@@ -176,6 +195,13 @@ function stage(age: number, spawn: () => void, prepare?: () => void): () => void
     const fx = fxRef;
     if (!fx) return;
     fx.reset();
+    // Ambient state is *not* part of reset(), so without this a shot that turns
+    // the dust up leaks that setting into every shot captured after it.
+    fx.environment.dust = STAGE_DUST;
+    fx.environment.litter = STAGE_LITTER;
+    fx.environment.fog = 0;
+    fx.environment.rain = 0;
+    fx.setWeather(0, 0, 0.3);
     prepare?.();
     if (age >= SETTLE) {
       spawn();
@@ -271,14 +297,14 @@ export function registerFxDebugScene(fx: FXSystem): void {
     }, [4, 3.2]);
 
     // --- ground ---------------------------------------------------------
-    const floor = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), ground);
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), own(ground));
     floor.rotation.x = -Math.PI / 2;
     floor.receiveShadow = true;
     tagSurface(floor, 'concrete');
     root.add(floor);
 
     // --- back wall ------------------------------------------------------
-    const wall = new THREE.Mesh(new THREE.BoxGeometry(34, 6.5, 0.6), concrete);
+    const wall = new THREE.Mesh(new THREE.BoxGeometry(34, 6.5, 0.6), own(concrete));
     wall.position.set(-2, 3.25, -7.3);
     wall.castShadow = true;
     wall.receiveShadow = true;
@@ -286,7 +312,7 @@ export function registerFxDebugScene(fx: FXSystem): void {
     root.add(wall);
 
     // A lip along the top so the wall throws a shadow onto itself.
-    const lip = new THREE.Mesh(new THREE.BoxGeometry(34.5, 0.35, 1.1), concrete);
+    const lip = new THREE.Mesh(new THREE.BoxGeometry(34.5, 0.35, 1.1), own(concrete));
     lip.position.set(-2, 6.6, -7.3);
     lip.castShadow = true;
     lip.receiveShadow = true;
@@ -294,14 +320,14 @@ export function registerFxDebugScene(fx: FXSystem): void {
 
     // --- surface panels -------------------------------------------------
     const panel = (x: number, mat: THREE.Material, s: SurfaceType, w = 3.2, h = 2.6): void => {
-      const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, 0.16), mat);
+      const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, 0.16), own(mat));
       m.position.set(x, 1.7, -6.92);
       m.castShadow = true;
       m.receiveShadow = true;
       tagSurface(m, s);
       root.add(m);
       // A simple frame gives the panel an edge that catches the light.
-      const frame = new THREE.Mesh(new THREE.BoxGeometry(w + 0.18, h + 0.18, 0.10), steel);
+      const frame = new THREE.Mesh(new THREE.BoxGeometry(w + 0.18, h + 0.18, 0.10), own(steel));
       frame.position.set(x, 1.7, -6.99);
       frame.castShadow = true;
       frame.receiveShadow = true;
@@ -324,13 +350,13 @@ export function registerFxDebugScene(fx: FXSystem): void {
     tagSurface(glass, 'glass');
     glass.layers.set(4);
     root.add(glass);
-    const glassFrame = new THREE.Mesh(new THREE.BoxGeometry(3.4, 2.8, 0.10), steel);
+    const glassFrame = new THREE.Mesh(new THREE.BoxGeometry(3.4, 2.8, 0.10), own(steel));
     glassFrame.position.set(4, 1.7, -6.99);
     glassFrame.castShadow = true;
     root.add(glassFrame);
 
     // --- dirt patch -----------------------------------------------------
-    const dirt = new THREE.Mesh(new THREE.CylinderGeometry(2.1, 2.3, 0.20, 26), soil);
+    const dirt = new THREE.Mesh(new THREE.CylinderGeometry(2.1, 2.3, 0.20, 26), own(soil));
     dirt.position.set(-14, 0.11, 0);
     dirt.receiveShadow = true;
     dirt.castShadow = true;
@@ -353,7 +379,7 @@ export function registerFxDebugScene(fx: FXSystem): void {
     for (let i = 0; i < 4; i++) {
       const horiz = i < 2;
       const kerb = new THREE.Mesh(
-        new THREE.BoxGeometry(horiz ? 9.6 : 0.3, 0.22, horiz ? 0.3 : 9.6), concrete,
+        new THREE.BoxGeometry(horiz ? 9.6 : 0.3, 0.22, horiz ? 0.3 : 9.6), own(concrete),
       );
       kerb.position.set(
         12 + (horiz ? 0 : (i === 2 ? -4.65 : 4.65)),
@@ -368,7 +394,7 @@ export function registerFxDebugScene(fx: FXSystem): void {
     // --- crates, barrels, pipes: foreground silhouette ------------------
     for (let i = 0; i < 12; i++) {
       const s = rand.range(0.55, 1.05);
-      const crate = new THREE.Mesh(new THREE.BoxGeometry(s, s * rand.range(0.7, 1.1), s), timber);
+      const crate = new THREE.Mesh(new THREE.BoxGeometry(s, s * rand.range(0.7, 1.1), s), own(timber));
       const a = rand.range(-2.4, 2.4);
       crate.position.set(
         -6 + a * 3.6 + rand.range(-2, 2),
@@ -382,7 +408,7 @@ export function registerFxDebugScene(fx: FXSystem): void {
       root.add(crate);
     }
     for (let i = 0; i < 5; i++) {
-      const pipe = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 3.4, 14), steel);
+      const pipe = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 3.4, 14), own(steel));
       pipe.position.set(-13 + i * 1.1, 1.7, -6.4);
       pipe.castShadow = true;
       pipe.receiveShadow = true;
@@ -404,13 +430,13 @@ export function registerFxDebugScene(fx: FXSystem): void {
     // --- colonnade with window slots for the light shafts ---------------
     const colonnadeX = -22;
     for (let i = 0; i < 5; i++) {
-      const pier = new THREE.Mesh(new THREE.BoxGeometry(0.9, 7, 1.2), concrete);
+      const pier = new THREE.Mesh(new THREE.BoxGeometry(0.9, 7, 1.2), own(concrete));
       pier.position.set(colonnadeX, 3.5, -8 + i * 5);
       pier.castShadow = true;
       pier.receiveShadow = true;
       root.add(pier);
     }
-    const lintel = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.9, 22), concrete);
+    const lintel = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.9, 22), own(concrete));
     lintel.position.set(colonnadeX, 7.4, 2);
     lintel.castShadow = true;
     lintel.receiveShadow = true;
@@ -425,7 +451,7 @@ export function registerFxDebugScene(fx: FXSystem): void {
       const t = rand.next();
       const h = 5 + rand.range(0, 10) + t * 20;
       const wdt = 5 + rand.range(0, 10);
-      const b = new THREE.Mesh(new THREE.BoxGeometry(wdt, h, wdt * rand.range(0.7, 1.4)), distant);
+      const b = new THREE.Mesh(new THREE.BoxGeometry(wdt, h, wdt * rand.range(0.7, 1.4)), own(distant));
       const a = rand.range(0, Math.PI * 2);
       const dd = 60 + t * 240 + rand.range(0, 40);
       b.position.set(Math.cos(a) * dd, h / 2, Math.sin(a) * dd);
@@ -438,8 +464,8 @@ export function registerFxDebugScene(fx: FXSystem): void {
 
     // --- environment defaults -------------------------------------------
     fx.defaultGroundY = 0;
-    fx.environment.dust = 0.7;
-    fx.environment.litter = 0.2;
+    fx.environment.dust = STAGE_DUST;
+    fx.environment.litter = STAGE_LITTER;
     fx.environment.fog = 0;
     fx.environment.rain = 0;
 
@@ -464,7 +490,7 @@ export function registerFxDebugScene(fx: FXSystem): void {
         V(0, 1, 0),
         {
           width: 3.4, height: 2.4, length: 20,
-          color: 0xffeccc, intensity: 0.055, falloff: 1.5, dust: 0.9,
+          color: 0xffeccc, intensity: 0.9, falloff: 1.1, dust: 0.95,
         },
       );
     }
@@ -486,6 +512,17 @@ export function registerFxDebugScene(fx: FXSystem): void {
       description: 'Steel impact: shower of cooling sparks with hot glow ribbons and a ricochet arc',
       position: [-4.2, 2.3, -2.0], yaw: 38, pitch: -5, fov: 50, hour: HOUR, viewModel: false,
       setup: stage(0.13, () => impact(V(-8, 1.8, -6.83), V(0, 0, 1), 'metal')),
+    },
+    {
+      name: 'fx-sparks',
+      description: 'Steel hits at 450 ms: sparks arcing under gravity, skipping off the deck and cooling to red',
+      position: [-4.6, 1.15, -2.6], yaw: 26, pitch: -8, fov: 46, hour: HOUR, viewModel: false,
+      setup: stage(0.45, () => {
+        const r = new Rand('fx:sparks');
+        for (let i = 0; i < 3; i++) {
+          impact(V(-8, 1.15 + r.range(-0.3, 0.5), -6.83), V(0, 0, 1), 'metal', 1800);
+        }
+      }),
     },
     {
       name: 'fx-impact-wood',
@@ -531,13 +568,19 @@ export function registerFxDebugScene(fx: FXSystem): void {
     },
     {
       name: 'fx-tracers',
-      description: 'Tracer rounds receding down the firing line with velocity-correct length and glowing heads',
-      position: [17.0, 1.76, 2.7], yaw: 88, pitch: -1, fov: 52, hour: HOUR, viewModel: false,
-      setup: stage(0.02, () => {
-        // Every round is a tracer and they are 30 ms apart, so four of them sit
-        // evenly down the firing line at capture instead of one blur.
+      description: 'Tracer rounds crossing the frame with velocity-correct length and glowing heads',
+      // Broadside to the firing line. A tracer is a camera-facing beam, so a
+      // camera looking *down* the line sees it edge-on and it vanishes.
+      position: [8.0, 1.78, 9.2], yaw: 6, pitch: -1, fov: 58, hour: HOUR, viewModel: false,
+      // Age must be >= SETTLE so `burst` runs during setup: it anchors its own
+      // per-round delays to the settle window, and scheduling the burst itself
+      // pushes every round past the captured frame.
+      setup: stage(0.42, () => {
+        // A profile that tracers every round, 12 ms apart, so four of them sit
+        // evenly down the firing line at capture instead of one blur. (An AR
+        // tracers one round in four, which would put a single round off-frame.)
         const dir = V(-1, 0.003, -0.028).normalize();
-        burst(V(15.5, 1.62, 2.1), dir, 4, false, 'ar_test', 0.03, 0);
+        burst(V(15.5, 1.62, 2.1), dir, 4, false, 'sniper_test', 0.012, 0);
       }),
     },
     {
@@ -546,11 +589,32 @@ export function registerFxDebugScene(fx: FXSystem): void {
       position: [2.90, 1.15, 0.15], yaw: 57, pitch: -4, fov: 40, hour: HOUR, viewModel: false,
       setup: stage(0.42, () => burst(V(0, 1.45, -1.0), V(0, 0.02, -1).normalize(), 6)),
     },
+    // --- the detonation, sampled five times across its life. An explosion is
+    //     judged on the progression, never on one frame, so the same event is
+    //     staged from the same camera at 40 ms / 170 ms / 500 ms / 1.0 s / 1.7 s.
+    {
+      name: 'fx-explosion-flash',
+      description: 'Grenade at 40 ms: the flash and shock front, before the fireball has bloomed',
+      position: [2.5, 2.4, 14.0], yaw: 12, pitch: -2, fov: 55, hour: HOUR, viewModel: false,
+      setup: stage(0.04, () => bus.emit('explosion', { point: V(0, 0.6, 2.0), radius: 6, power: 100, kind: 'frag' })),
+    },
     {
       name: 'fx-explosion-fireball',
       description: 'Grenade at 170 ms: displaced fireball, shockwave ring, embers and thrown debris',
       position: [2.5, 2.4, 14.0], yaw: 12, pitch: -2, fov: 55, hour: HOUR, viewModel: false,
       setup: stage(0.17, () => bus.emit('explosion', { point: V(0, 0.6, 2.0), radius: 6, power: 100, kind: 'frag' })),
+    },
+    {
+      name: 'fx-explosion-wave',
+      description: 'Grenade at 500 ms: fireball collapsing to soot, ground dust wave running out flat',
+      position: [2.5, 2.4, 14.0], yaw: 12, pitch: -2, fov: 55, hour: HOUR, viewModel: false,
+      setup: stage(0.5, () => bus.emit('explosion', { point: V(0, 0.6, 2.0), radius: 6, power: 100, kind: 'frag' })),
+    },
+    {
+      name: 'fx-explosion-rise',
+      description: 'Grenade at 1.0 s: the column starting to lift, embers still arcing out of the dust',
+      position: [2.5, 2.4, 14.0], yaw: 12, pitch: -2, fov: 55, hour: HOUR, viewModel: false,
+      setup: stage(1.0, () => bus.emit('explosion', { point: V(0, 0.6, 2.0), radius: 6, power: 100, kind: 'frag' })),
     },
     {
       name: 'fx-explosion-smoke',

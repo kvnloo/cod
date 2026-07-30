@@ -16,7 +16,7 @@ import { settings } from '../../core/Settings';
 import { clamp01, damp, Ease, Envelope, Spring, SPRING } from '../Anim';
 import type { DrawCtx } from '../Draw';
 import type { HudModel } from '../Model';
-import { rgba, type Palette, type RGB } from '../Theme';
+import { lift, rgba, type Palette, type RGB } from '../Theme';
 import { ui } from '../UiSettings';
 import type { Widget } from './Widget';
 
@@ -88,18 +88,23 @@ export class Crosshair implements Widget {
       ? 0.1
       : clamp01(m.spread.value + Math.max(0, this.kick.value) * 0.05 + this.shock_.level * 0.5);
 
-    const gap = (4.6 + spreadAmount * 24) * s;
-    const len = (10.5 + spreadAmount * 4.2 + hot * 2.2) * s;
-    const thick = Math.max(1.2, 2.05 * s);
+    // Bigger travel between rest and full bloom than the original 4.6→28: the
+    // brief says the reticle must *visibly* open with movement, and a 3 px
+    // difference at 1080p is not visible.
+    const gap = (4.2 + spreadAmount * 42) * s;
+    const len = (11 + spreadAmount * 9 + hot * 2.2) * s;
+    const thick = Math.max(1.4, 2.35 * s);
 
     const c = d.c;
     c.save();
     c.globalAlpha = vis;
     c.lineCap = 'butt';
 
-    // Dark under-stroke for legibility.
-    c.strokeStyle = 'rgba(0,3,7,0.62)';
-    c.lineWidth = thick + Math.max(1.2, 1.4 * s);
+    // Dark under-stroke, wide and opaque enough to survive a sunlit stone
+    // street — this is the whole reason the reticle stays readable without a
+    // shader.
+    c.strokeStyle = 'rgba(1,3,7,0.78)';
+    c.lineWidth = thick + Math.max(2, 2.4 * s);
     strokeArms(c, cx, cy, gap, len);
 
     c.strokeStyle = color;
@@ -109,7 +114,9 @@ export class Crosshair implements Widget {
     // A hot inner nub on each arm sells the "energy" of the reticle when firing.
     if (hot > 0.01) {
       c.globalAlpha = vis * hot * 0.85;
-      c.strokeStyle = rgba([255, 255, 255], 1);
+      // Lifted toward white, never *to* it — the visual bar bans a pure #fff
+      // pixel anywhere in the interface, hot states included.
+      c.strokeStyle = rgba(lift(tint, 0.55), 1);
       c.lineWidth = thick;
       strokeArms(c, cx, cy, gap, len * 0.5);
       c.globalAlpha = vis;

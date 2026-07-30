@@ -19,7 +19,7 @@
 
 import * as THREE from 'three';
 import { PASS_ORDER, type PassContext } from '../Pass';
-import { BasePass, makeCopyMaterial } from './PassBase';
+import { BasePass } from './PassBase';
 import type { PostResources } from './Shared';
 
 const RESOLVE_FRAG = /* glsl */ `
@@ -37,7 +37,6 @@ uniform float uNear;
 uniform float uFar;
 uniform float uFeedbackMin;
 uniform float uFeedbackMax;
-uniform float uSharpen;
 uniform float uClipGamma;
 uniform float uReset;
 layout(location = 0) out vec4 fragColor;
@@ -164,15 +163,59 @@ void main() {
 
   vec3 resolved = mix(current, clipped, feedback);
 
-  /* --- bounded unsharp mask to give back the micro-contrast ------------- */
-  vec3 blur = (taps[1] + taps[3] + taps[5] + taps[7]) * 0.25;
-  vec3 sharpened = resolved + (resolved - blur) * uSharpen;
-  resolved = clamp(sharpened, min(nmin, resolved), max(nmax, resolved));
-
+  // NB: the micro-contrast unsharp deliberately does *not* happen here. Feeding
+  // a sharpened value back into the history is a positive feedback loop at the
+  // Nyquist frequency: every frame multiplies the 1px checkerboard by
+  // (1 + 4 * amount) until the neighbourhood clamp pins it to the local min/max.
+  // On any detailed surface — cobbles, brick, roof tiles — that reads as a dense
+  // checkerboard, and because the loop ran on all three YCoCg channels it turned
+  // into magenta/green chroma speckle. The sharpen now runs once, on the way
+  // out, in SHARPEN_FRAG, and never touches the history.
   vec3 rgb = untonemapForResolve(yCoCgToRgb(resolved));
   rgb = max(rgb, vec3(0.0));
   float z = depth >= 1.0 ? uFar : linearizeDepth(depth, uNear, uFar);
   fragColor = vec4(rgb, z);
+}
+`;
+
+/**
+ * Post-resolve micro-contrast recovery.
+ *
+ * Runs on the resolved image on its way to the next pass, never on the history,
+ * and only on luminance — sharpening chroma is what produced the magenta/green
+ * speckle. The correction is bounded by the local luma range so it can add
+ * definition to a real edge but cannot manufacture a 1px checkerboard.
+ */
+const SHARPEN_FRAG = /* glsl */ `
+in vec2 vUv;
+uniform sampler2D tInput;
+uniform vec2 uTexel;
+uniform float uAmount;
+layout(location = 0) out vec4 fragColor;
+
+float lumaC(vec3 c) { return luma(tonemapForResolve(max(c, vec3(0.0)))); }
+
+void main() {
+  vec4 c = texture(tInput, vUv);
+  if (uAmount <= 0.001) { fragColor = c; return; }
+
+  float l0 = lumaC(c.rgb);
+  float lr = lumaC(texture(tInput, vUv + vec2(uTexel.x, 0.0)).rgb);
+  float ll = lumaC(texture(tInput, vUv - vec2(uTexel.x, 0.0)).rgb);
+  float lu = lumaC(texture(tInput, vUv + vec2(0.0, uTexel.y)).rgb);
+  float ld = lumaC(texture(tInput, vUv - vec2(0.0, uTexel.y)).rgb);
+
+  float blur = 0.25 * (lr + ll + lu + ld);
+  float lmin = min(min(lr, ll), min(lu, ld));
+  float lmax = max(max(lr, ll), max(lu, ld));
+
+  // Only sharpen where the centre sits *inside* the neighbourhood range: a pixel
+  // that is already an extreme (a lone bright speckle, or a checkerboard phase)
+  // gets nothing, which is what stops high-frequency noise being amplified.
+  float inside = 1.0 - sat((max(l0 - lmax, lmin - l0)) * 24.0);
+  float target = clamp(l0 + (l0 - blur) * uAmount * inside,
+                       min(lmin, l0), max(lmax, l0));
+  fragColor = vec4(c.rgb * (target / max(l0, 1e-4)), c.a);
 }
 `;
 
@@ -222,8 +265,8 @@ export class TaaPass extends BasePass {
   readonly order = PASS_ORDER.TAA;
 
   private resolve!: THREE.ShaderMaterial;
+  private sharpen!: THREE.ShaderMaterial;
   private fxaa!: THREE.ShaderMaterial;
-  private copy!: THREE.ShaderMaterial;
   private flip = 0;
   private lastFrame = -1;
   private readonly projVec = new THREE.Vector4(1, 1, 0, 0);
@@ -251,9 +294,18 @@ export class TaaPass extends BasePass {
         uFar: { value: 1000 },
         uFeedbackMin: { value: 0.86 },
         uFeedbackMax: { value: 0.97 },
-        uSharpen: { value: 0.32 },
         uClipGamma: { value: 1.15 },
         uReset: { value: 1 },
+      },
+    });
+
+    this.sharpen = this.makeMaterial({
+      name: 'taa/sharpen',
+      fragment: SHARPEN_FRAG,
+      uniforms: {
+        tInput: { value: null },
+        uTexel: { value: new THREE.Vector2() },
+        uAmount: { value: 0.14 },
       },
     });
 
@@ -263,7 +315,6 @@ export class TaaPass extends BasePass {
       uniforms: { tInput: { value: null }, uTexel: { value: new THREE.Vector2() } },
     });
 
-    this.copy = this.own(makeCopyMaterial());
   }
 
   render(ctx: PassContext, input: THREE.Texture, output: THREE.WebGLRenderTarget | null): boolean {
@@ -305,14 +356,17 @@ export class TaaPass extends BasePass {
     u.uFeedbackMax.value = Math.min(0.975, 1 - 1 / samples);
     u.uFeedbackMin.value = Math.min(0.9, u.uFeedbackMax.value - 0.11);
     u.uClipGamma.value = samples >= 16 ? 1.25 : 1.05;
-    u.uSharpen.value = 0.34;
     u.uReset.value = ctx.frame < 2 ? 1 : 0;
 
     ctx.blit(this.resolve, cur);
 
-    this.copy.uniforms.tInput.value = cur.texture;
-    this.copy.uniforms.uScale.value = 1;
-    ctx.blit(this.copy, output);
+    // Sharpen on the way out only — see SHARPEN_FRAG. CAS runs later on the
+    // display-referred image, so this stays deliberately gentle.
+    const su = this.sharpen.uniforms;
+    su.tInput.value = cur.texture;
+    (su.uTexel.value as THREE.Vector2).set(1 / ctx.width, 1 / ctx.height);
+    su.uAmount.value = 0.14;
+    ctx.blit(this.sharpen, output);
     return true;
   }
 }

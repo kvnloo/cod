@@ -163,7 +163,10 @@ Sprite smokeCell( vec2 p, float f, float wispy ) {
 
 	float r = length( pw );
 	// The puff dissipates and spreads across the flipbook.
-	float edge = mix( 0.66, 0.98, t ) * ( 1.0 - 0.18 * wispy );
+	// Capped well inside the cell: a puff whose coverage reaches the border
+	// gets cut by the atlas feather and the sprite's *square* silhouette shows
+	// up as a straight edge across the sky.
+	float edge = mix( 0.62, 0.88, t ) * ( 1.0 - 0.18 * wispy );
 	float body = smoothstep( edge, edge * 0.12, r );
 
 	float dens = ridged( vec3( p * 2.6, z ) + 11.0, 5 );
@@ -194,7 +197,7 @@ Sprite dustCell( vec2 p, float f ) {
 	float w2 = fbm( vec3( p * 1.9, z ) + 71.0, 5 ) - 0.5;
 	vec2 pw = p + vec2( w1, w2 ) * 1.15;
 	float r = length( pw );
-	float edge = mix( 0.58, 1.02, t );
+	float edge = mix( 0.55, 0.86, t );
 	float body = smoothstep( edge, edge * 0.05, r );
 	float dens = fbm( vec3( p * 4.2, z ) + 17.0, 5 );
 	float fine = fbm( vec3( p * 11.0, z ) + 91.0, 4 );
@@ -481,7 +484,7 @@ Sprite cloudCell( vec2 p ) {
 	float w2 = fbm( vec3( p * 0.9, 91.0 ), 5 ) - 0.5;
 	vec2 pw = p + vec2( w1, w2 ) * 0.85;
 	float r = length( pw );
-	float body = smoothstep( 0.98, 0.05, r );
+	float body = smoothstep( 0.90, 0.05, r );
 	float dens = ridged( vec3( p * 1.9, 55.0 ), 5 );
 	float fine = fbm( vec3( p * 5.5, 55.0 ), 4 );
 	float d = body * ( 0.35 + 0.85 * dens ) * ( 0.7 + 0.4 * fine );
@@ -537,7 +540,7 @@ void main() {
 
 	// Feather the cell border so bilinear taps and mip chains never bleed
 	// between neighbouring sprites.
-	float e = 1.0 - smoothstep( 0.88, 0.995, max( abs( local.x ), abs( local.y ) ) );
+	float e = 1.0 - smoothstep( 0.74, 0.99, max( abs( local.x ), abs( local.y ) ) );
 	s.alpha *= e;
 	s.thickness *= e;
 

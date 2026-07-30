@@ -101,13 +101,17 @@ void main() {
 	float soot = boSat( ( uT - 0.10 ) * 1.7 + ( 0.62 - vDisp ) * 1.5 ) * ( 1.0 - heat * 0.85 );
 	c = mix( c, vec3( 0.045, 0.040, 0.038 ), soot );
 
-	float gain = mix( 1.15, 0.25, boSat( uT * 1.5 ) ) * uPower;
+	float gain = mix( 0.85, 0.22, boSat( uT * 1.5 ) ) * uPower;
 	c *= 0.35 + gain * heat + soot * 0.15;
 
 	// Opaque core, ragged edge: the silhouette must be broken up or the whole
 	// thing reads as a ball.
-	float edge = smoothstep( 0.02, 0.42, facing );
-	float alpha = boSat( ( 0.30 + vDisp * 1.15 ) * edge );
+	// A wide limb ramp: the alpha has to be near zero *before* the geometric
+	// silhouette, or the tessellation shows up as a straight cut against the sky.
+	float edge = smoothstep( 0.0, 0.62, facing );
+	// Break the silhouette per pixel. The displacement arrives interpolated
+	// across the mesh triangles, so on its own the outline shows facets.
+	float alpha = boSat( ( 0.24 + vDisp * 1.15 + ( fine - 0.5 ) * 0.85 ) * edge );
 	alpha *= 1.0 - smoothstep( 0.55, 1.0, uT );
 
 	if ( uSoft > 0.5 ) {
@@ -142,7 +146,7 @@ export class Explosions {
   objects: THREE.Object3D[] = [];
 
   init(shared: Record<string, THREE.IUniform>, count = 3, soft = true): void {
-    this.geometry = new THREE.IcosahedronGeometry(1, 4);
+    this.geometry = new THREE.IcosahedronGeometry(1, 5);
     for (let i = 0; i < count; i++) {
       const uniforms: Record<string, THREE.IUniform> = {
         uT: { value: 0 }, uRadius: { value: 1 }, uSeed: { value: i * 7.3 },
@@ -246,22 +250,25 @@ export class Explosions {
       r: 1.0, g: 0.93, b: 0.80, alpha: 1,
       life: 0.10, cell: CELL.FLASH_DISC, frames: 1,
       mode: QUAD_MODE.BILLBOARD, blend: QUAD_BLEND.ADD,
-      fadeIn: 0.06, fadeOut: 0.18, soft: 0, intensity: 1.3 * power,
+      fadeIn: 0.06, fadeOut: 0.18, soft: 0, intensity: 0.85 * power,
       rot: rand.range(0, 6.28),
     });
     q.push();
 
     w.light({
       x: point.x, y: point.y + radius * 0.2, z: point.z,
-      color: 0xffb060, intensity: 22 * power * scale,
+      color: 0xffb060, intensity: 9 * power * scale,
       radius: radius * 5, lifetime: 0.8, decay: 'flash',
     });
 
     const proximity = clamp(1 - dist / (radius * 3.2), 0, 1);
     if (proximity > 0.01) {
-      w.flash(0.85 * proximity * proximity * power, 0xffd8a8, 6.5);
+      w.flash(0.55 * proximity * proximity * power, 0xffd8a8, 7.5);
       w.concussion(1.15 * proximity, 1.6);
-      w.shake(0.20 * proximity * power, 16, 1.1);
+      // A blast you are 12 m from moves the camera by about a degree, not
+      // five. Anything more and the motion-blur pass smears the whole frame
+      // into porridge for the second the explosion is worth watching.
+      w.shake(0.022 * proximity * power, 10, 0.5);
     }
 
     /* --- fireball ------------------------------------------------------- */
@@ -309,10 +316,10 @@ export class Explosions {
     g.begin({
       cell: CELL.FLAME, frames: CELL.FLAME_FRAMES, model: MODEL.HOT,
       flags: FLAG.ADD | FLAG.ANIM | FLAG.FADEIN,
-      r: 1.0, g: 0.55, b: 0.20, opacity: 0.9, emissive: 1.1,
+      r: 1.0, g: 0.52, b: 0.19, opacity: 0.55, emissive: 0.55,
       drag: 2.2, gravity: -0.55, turbulence: 2.2,
     });
-    g.pushMany(26 * scale, (d) => {
+    g.pushMany(30 * scale, (d) => {
       const a = rand.range(0, Math.PI * 2);
       const z = rand.signed();
       const s = Math.sqrt(Math.max(0, 1 - z * z));
@@ -364,7 +371,7 @@ export class Explosions {
       d.vx = Math.cos(a) * s * sp;
       d.vy = z * sp + 4;
       d.vz = Math.sin(a) * s * sp;
-      const sz = 0.03 + rand.next() * 0.10 * scale;
+      const sz = 0.022 + rand.next() * 0.038 * scale;
       d.sizeBegin = sz; d.sizeEnd = sz;
       d.lifetime = 1.6 + rand.next() * 2.2;
       d.rot = rand.range(0, 6.28);
@@ -453,7 +460,7 @@ export class Explosions {
       });
       w.light({
         x: point.x, y: floorY + radius * 0.2, z: point.z,
-        color: 0xff7a30, intensity: 70 * power, radius: radius * 3,
+        color: 0xff7a30, intensity: 16 * power, radius: radius * 3,
         lifetime: 0.6, decay: 'flicker',
       });
     });

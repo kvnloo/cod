@@ -16,21 +16,31 @@ import type { TextureForge } from './TextureForge';
 import type { DetailKind } from './types';
 
 const HEIGHT_FN: Record<Exclude<DetailKind, 'none'>, string> = {
+  // Painted render / plaster at arm's length: the sand fraction of the float
+  // coat, the orange peel of the paint over it, and the odd pinhole pore. The
+  // high-frequency terms have to carry real amplitude — a smooth detail map is
+  // exactly what makes a wall go plasticky when the player walks up to it.
+  // Painted render at arm's length. Deliberately *directional*: the fine
+  // structure of a floated wall is drag from the trowel, not a field of
+  // isotropic domes. Domes here are what produce the gravel-rash speckle when
+  // a low sun rakes across a wall, because every one of them catches the light
+  // at the same angle at the same time.
   micro: /* glsl */ `
 float obDetailH(vec2 uv) {
-  float a = obFbm(uv * 24.0, vec2(24.0), 4, 0.55, 3.0);
-  float b = obWorleyFbm(uv * 60.0, vec2(60.0), 2, 1.0, 7.0);
-  float c = obValueP(uv * 180.0, vec2(180.0), 11.0);
-  return a * 0.45 + (1.0 - b) * 0.35 + c * 0.20;
+  float g1    = obValueP(uv * 70.0, vec2(70.0), 3.0);
+  float g2    = obValueP(uv * 150.0, vec2(150.0), 9.0);
+  float drag  = obValueP(vec2(uv.x * 30.0, uv.y * 110.0), vec2(30.0, 110.0), 5.0);
+  float pore  = smoothstep(0.93, 0.999, obValueP(uv * 110.0, vec2(110.0), 11.0));
+  return g1 * 0.36 + g2 * 0.30 + drag * 0.26 - pore * 0.14;
 }`,
   grit: /* glsl */ `
 float obDetailH(vec2 uv) {
-  vec3 w = obWorleyP(uv * 40.0, vec2(40.0), 1.0, 3.0);
-  float grain = smoothstep(0.44, 0.05, w.x) * mix(0.5, 1.0, w.z);
-  vec3 w2 = obWorleyP(uv * 96.0, vec2(96.0), 1.0, 7.0);
-  float fine = smoothstep(0.36, 0.04, w2.x) * 0.6;
+  vec3 w = obWorleyP(uv * 34.0, vec2(34.0), 1.0, 3.0);
+  float grain = smoothstep(0.58, 0.12, w.x) * mix(0.5, 1.0, w.z);
+  vec3 w2 = obWorleyP(uv * 78.0, vec2(78.0), 1.0, 7.0);
+  float fine = smoothstep(0.50, 0.12, w2.x) * 0.6;
   float base = obFbm(uv * 18.0, vec2(18.0), 3, 0.55, 11.0);
-  return base * 0.35 + grain * 0.45 + fine * 0.25;
+  return base * 0.40 + grain * 0.42 + fine * 0.22;
 }`,
   fibre: /* glsl */ `
 float obDetailH(vec2 uv) {
@@ -56,14 +66,18 @@ float obDetailH(vec2 uv) {
 }`,
 };
 
+/* Close-range interest has to come mostly from *roughness*, not from normals.
+ * A detail normal map strong enough to see as geometry at 1 m turns into a
+ * boiling cottage-cheese rash under a low sun; a roughness break-up of the
+ * same amplitude reads as a real surface and never aliases. */
 const ALBEDO_GAIN: Record<Exclude<DetailKind, 'none'>, number> = {
-  micro: 0.10, grit: 0.22, fibre: 0.18, metal: 0.10, organic: 0.20,
+  micro: 0.11, grit: 0.16, fibre: 0.18, metal: 0.10, organic: 0.20,
 };
 const ROUGH_GAIN: Record<Exclude<DetailKind, 'none'>, number> = {
-  micro: 0.10, grit: 0.18, fibre: 0.16, metal: 0.22, organic: 0.14,
+  micro: 0.28, grit: 0.30, fibre: 0.20, metal: 0.24, organic: 0.16,
 };
 const SLOPE: Record<Exclude<DetailKind, 'none'>, number> = {
-  micro: 2.2, grit: 3.4, fibre: 2.6, metal: 1.6, organic: 3.0,
+  micro: 1.0, grit: 1.5, fibre: 1.6, metal: 1.2, organic: 2.0,
 };
 
 export class DetailMaps {

@@ -223,7 +223,7 @@ export class HUDSystem implements System {
     window.addEventListener('keydown', onKey);
     this.disposers.push(() => window.removeEventListener('keydown', onKey));
 
-    registerUiDebugScene(this);
+    registerUiDebugScene(this, ctx);
     this.resize(
       this.root.clientWidth || window.innerWidth,
       this.root.clientHeight || window.innerHeight,
@@ -234,7 +234,14 @@ export class HUDSystem implements System {
   /* ------------------------------------------------------------ frame -- */
 
   update(dt: number, ctx: EngineContext): void {
-    this.elapsed += dt;
+    // `dt` is the *scaled* simulation delta: pause drives the time scale to 0 and
+    // a kill can drop it to a fraction for slow-mo. Neither should touch the
+    // interface — a paused menu still has to run its entrance and its count-up,
+    // and a hit marker must punch at the same speed in slow-mo. Presentation
+    // therefore runs on the unscaled clock; only the model (which owns the match
+    // timer) keeps the scaled one.
+    const udt = ctx.time.deltaReal > 0 ? ctx.time.deltaReal : dt;
+    this.elapsed += udt;
     this.model.update(dt, ctx);
 
     // Deferred callbacks (used by capture setups to stage animation states).
@@ -270,16 +277,20 @@ export class HUDSystem implements System {
     if (!menuOpen && input.pressed('pause')) this.menus.push('pause');
 
     this.subtitles.setSuppressed(menuOpen);
-    this.subtitles.update(dt);
-    this.menus.tick(dt);
+    this.subtitles.update(udt);
+    this.menus.tick(udt);
 
-    for (const w of this.widgets) w.update(dt, this.model);
+    for (const w of this.widgets) w.update(udt, this.model);
 
-    const targetAlpha = menuOpen ? 0 : clamp01(ui.prefs.hudOpacity);
-    this.hudAlpha = damp(this.hudAlpha, targetAlpha, 12, dt);
+    // The scoreboard is a full-frame read; the combat HUD steps back behind it
+    // rather than competing with the table for the same pixels.
+    const targetAlpha = menuOpen
+      ? 0
+      : clamp01(ui.prefs.hudOpacity) * (this.scoreboard.isOpen ? 0.34 : 1);
+    this.hudAlpha = damp(this.hudAlpha, targetAlpha, 12, udt);
 
     this.syncCssVariables();
-    this.draw(dt, ctx);
+    this.draw(udt, ctx);
   }
 
   private draw(dt: number, ctx: EngineContext): void {

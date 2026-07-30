@@ -118,39 +118,120 @@ export function burntCar(chunk: Chunk, x: number, z: number, yaw: number, seed: 
  * two short ones and gives both approaches a vaulting point.
  */
 export function toppledTram(chunk: Chunk, x: number, z: number, yaw: number): void {
-  const body = chunk.m('steelPaint');
-  const roof = chunk.m('sheet');
+  const body = chunk.m('paintRed');
   const glass = chunk.m('glassDirty');
   const rustM = chunk.m('rust');
+  const cream = chunk.m('canvasCream');
   const y = groundHeightAt(x, z);
 
-  // Derailed and leaning, not flat on its side: at ~55° the window band and the
-  // roof ribs both stay readable, which is what makes it legible as a tram from
-  // the far end of the square.
-  body.pushTRS(x, y + 0.55, z, yaw, 0, Math.PI * 0.31);
-  roof.push(body.matrix);
+  const L = 6.6, H = 1.6, W = 1.25;
+  // Rolled −50°, and the sign matters.
+  //
+  // Flat on its side a tram shows the player either its roof or its underframe,
+  // and both read as an anonymous corrugated wall. Standing on one corner — the
+  // original +56° — it read as an abstract monolith floating over the cobbles,
+  // because the face aimed down the hero sightline was the blank end cap and
+  // the contact edge was hidden behind its own overhang.
+  //
+  // Half-toppled and rolled *toward* the southern approach, the flank the
+  // player sees is the one carrying the window band, the door recesses and the
+  // livery, with the bogies and the buckled underframe exposed along the bottom
+  // edge. It reads as a tram from 40 m.
+  //
+  // The pivot is the underside of the floor pan, so the roll is paid back in
+  // height: +0.85 buries the leading edge 9 cm in the cobbles — no gap to see
+  // under — and puts the top of the shell at 3.8 m, which is what makes it the
+  // sightline break the square is built around.
+  const roll = -Math.PI * 0.28;
+  body.pushTRS(x, y + 0.85, z, yaw, 0, roll);
   glass.push(body.matrix);
   rustM.push(body.matrix);
+  cream.push(body.matrix);
 
-  const L = 6.6, H = 1.6, W = 1.25;
   for (const seg of [-1, 1]) {
     const cz = seg * (L * 0.52);
     body.chamferBox(0, H, cz, W, H * 0.98, L * 0.5, 0.05, 2.0);
-    // window band
-    for (let i = 0; i < 6; i++) {
-      const wz = cz - L * 0.42 + (i * L * 0.84) / 5;
+    // Cream livery band along the waist — the single strongest read at
+    // distance, and the reason the shell stops looking like a shipping
+    // container.
+    for (const sx of [-1, 1]) {
+      cream.box(sx * (W + 0.006), H + 0.86, cz, 0.006, 0.26, L * 0.49, 1.6);
+      cream.box(sx * (W + 0.006), H - 0.62, cz, 0.006, 0.09, L * 0.49, 1.6);
+    }
+    // Window band.
+    //
+    // The pillars used to sit at the *same* z as the glass and be both longer
+    // and taller than it, so every pane was buried inside its own mullion and
+    // the flank rendered as one unbroken sheet of paint. They belong on the
+    // midpoints *between* the bays. This is the difference between the shell
+    // reading as a tram and reading as a shipping container.
+    const bays = 6;
+    const step = (L * 0.84) / (bays - 1);
+    for (let i = 0; i < bays; i++) {
+      const wz = cz - L * 0.42 + i * step;
       for (const sx of [-1, 1]) {
-        glass.box(sx * (W + 0.008), H + 0.35, wz, 0.006, 0.42, L * 0.06, { unit: true });
-        body.box(sx * (W + 0.01), H + 0.35, wz, 0.02, 0.5, L * 0.075, 1.0, FACE.SIDES);
+        glass.box(sx * (W + 0.006), H + 0.35, wz, 0.008, 0.4, step * 0.4, { unit: true });
       }
     }
-    // roof ribs and skirt
-    roof.box(0, H * 2 - 0.02, cz, W * 0.99, 0.05, L * 0.49, 1.4);
-    for (let i = 0; i < 5; i++) {
-      roof.box(0, H * 2 + 0.03, cz - L * 0.4 + (i * L * 0.8) / 4, W * 0.9, 0.04, 0.06, 0.6);
+    for (let i = 0; i < bays - 1; i++) {
+      const pz = cz - L * 0.42 + (i + 0.5) * step;
+      for (const sx of [-1, 1]) {
+        body.box(sx * (W + 0.012), H + 0.35, pz, 0.018, 0.42, step * 0.12, 1.0);
+      }
     }
+    for (const sx of [-1, 1]) {
+      rustM.box(sx * (W + 0.012), H + 0.79, cz, 0.014, 0.045, L * 0.48, 1.2);
+      rustM.box(sx * (W + 0.012), H - 0.08, cz, 0.014, 0.045, L * 0.48, 1.2);
+    }
+    // Passenger doors: a recessed leaf pair per segment, with the rubbing strip.
+    for (const sx of [-1, 1]) {
+      const dz = cz - seg * L * 0.22;
+      body.box(sx * (W - 0.035), H - 0.05, dz, 0.045, H * 0.86, 0.62, 1.2);
+      rustM.box(sx * (W + 0.006), H - 0.05, dz, 0.01, H * 0.86, 0.02, 0.6);
+    }
+    // Roof: a dark, sooted deck carrying real equipment, not a clean corrugated
+    // sheet. From the north half of the square this is the face the player sees
+    // most of, and a bright evenly-ribbed plate read as a farm building.
+    const deck = chunk.m('steelPaint');
+    deck.push(body.matrix);
+    deck.box(0, H * 2 - 0.02, cz, W * 0.99, 0.05, L * 0.49, 1.4);
+    // Cant rail along both eaves so the roof edge catches a highlight.
+    for (const sx of [-1, 1]) deck.box(sx * W * 0.97, H * 2 + 0.03, cz, 0.05, 0.05, L * 0.49, 0.8);
+    deck.pop();
+    // Ribs in the same dark paint as the deck. In bare sheet metal they caught
+    // the key as ten evenly-spaced bright panels and the roof read as the
+    // glazing of a greenhouse from the north half of the square.
+    for (let i = 0; i < 5; i++) {
+      const rz = cz - L * 0.4 + (i * L * 0.8) / 4;
+      rustM.box(0, H * 2 + 0.02, rz, W * 0.88, 0.03, 0.05, 0.6);
+    }
+    // Resistor bank and a vent hood — the silhouette that says "traction".
+    const kit = chunk.m('steel');
+    kit.push(body.matrix);
+    kit.box(seg * L * 0.16, H * 2 + 0.1, cz + seg * 0.5, W * 0.38, 0.08, 0.6, 0.5);
+    kit.pop();
+    rustM.box(seg * L * 0.3, H * 2 + 0.13, cz - seg * 1.5, 0.26, 0.11, 0.26, 0.4);
     rustM.box(0, 0.18, cz, W * 1.02, 0.18, L * 0.49, 1.4);
   }
+
+  // End caps. Blank ends were what made this read as a crate: a tram has a
+  // raked windscreen, a destination box, twin headlamps and a coupler, and at
+  // 13 m the end is what half the map sees first.
+  for (const seg of [-1, 1]) {
+    const ez = seg * (L * 1.02);
+    body.box(0, H + 0.15, ez, W * 0.98, H * 0.72, 0.06, 1.4);
+    glass.box(0, H + 0.62, ez + seg * 0.035, W * 0.82, 0.44, 0.008, { unit: true });
+    // destination box
+    cream.box(0, H + 1.16, ez + seg * 0.03, W * 0.5, 0.13, 0.02, { unit: true });
+    // headlamps and coupler
+    for (const sx of [-1, 1]) {
+      rustM.pushTRS(sx * W * 0.62, H - 0.42, ez + seg * 0.04, 0, 0, Math.PI / 2);
+      rustM.cylinder(0.085, 0.085, 0.05, 8, true, false, 0.2);
+      rustM.pop();
+    }
+    rustM.box(0, 0.28, ez + seg * 0.12, 0.09, 0.09, 0.22, 0.4);
+  }
+
   // articulation bellows
   const bel = chunk.m('rubber');
   bel.push(body.matrix);
@@ -180,21 +261,39 @@ export function toppledTram(chunk: Chunk, x: number, z: number, yaw: number): vo
   pan.pop();
 
   glass.pop();
-  roof.pop();
   rustM.pop();
+  cream.pop();
   body.pop();
 
-  // Debris skirt where it hit the cobbles.
+  /* --- contact ---------------------------------------------------------
+   * Nothing sells weight like the ground giving way under it. A berm of dirt
+   * and ripped setts is banked along the underside for the full length, so
+   * there is no gap to see under and no clean line where shell meets paving. */
   const rand = new Rand(6601);
+  const dirt = chunk.m('dirt');
+  const ux = Math.cos(yaw), uz = Math.sin(yaw);      // along the car
+  const nx = -uz, nz = ux;                            // across it
+  for (let i = 0; i <= 24; i++) {
+    const t = (i / 24 - 0.5) * L * 2.15;
+    const side = Math.sin(i * 2.7) * 0.35;
+    const bx = x + ux * t + nx * (0.35 + side);
+    const bz = z + uz * t + nz * (0.35 + side);
+    const s = 0.5 + 0.28 * Math.abs(Math.sin(i * 1.7));
+    dirt.pushTRS(bx, groundHeightAt(bx, bz) + 0.02, bz, yaw + rand.range(-0.3, 0.3));
+    dirt.lump(s, 7, 4, (k) => 0.4 + 0.3 * frac(Math.sin((k + i * 5) * 12.9898) * 43758.5), 1.2);
+    dirt.pop();
+  }
+
+  // Debris and glass thrown out from the impact.
   const deb = chunk.m('concreteDark');
   const shard = chunk.m('glassDirty');
-  for (let i = 0; i < 40; i++) {
+  for (let i = 0; i < 44; i++) {
     const a = rand.range(0, Math.PI * 2);
     const r = rand.range(1.2, 5.5);
-    const px = x + Math.cos(yaw) * rand.range(-6, 6) + Math.cos(a) * r * 0.4;
-    const pz = z + Math.sin(yaw) * rand.range(-6, 6) + Math.sin(a) * r * 0.4;
+    const px = x + ux * rand.range(-7, 7) + Math.cos(a) * r * 0.55;
+    const pz = z + uz * rand.range(-7, 7) + Math.sin(a) * r * 0.55;
     const s = rand.range(0.06, 0.2);
-    const t = rand.bool(0.35) ? shard : deb;
+    const t = rand.bool(0.42) ? shard : deb;
     t.pushTRS(px, groundHeightAt(px, pz) + s * 0.4, pz, rand.next() * 3, rand.range(-0.3, 0.3), rand.range(-0.3, 0.3));
     t.box(0, 0, 0, s, s * 0.35, s * 1.3, 0.5);
     t.pop();
@@ -280,55 +379,116 @@ export function truckWreck(chunk: Chunk, x: number, z: number, yaw: number): voi
 
 /* -------------------------------------------------------------- fountain -- */
 
-/** Dry municipal fountain: octagonal basin, shattered centre column. */
+/**
+ * Dry municipal fountain: octagonal basin, shattered centre column.
+ *
+ * Rebuilt low and wide. The first version stood 0.72 m tall with a 0.4 m thick
+ * parapet and a stack of drums in the middle, which from eye level read as
+ * eight disconnected pale walls around a chimney rather than as a fountain. A
+ * real civic basin is knee height with a moulded rim you can sit on, so the eye
+ * reads *over* it to the pedestal — and the pedestal has to be a shape, not a
+ * cylinder stack: plinth, moulded base, fluted shaft, a bowl, and a clean
+ * shear where the shell took the top off.
+ */
 export function fountain(chunk: Chunk, x: number, z: number): void {
   const y = groundHeightAt(x, z);
   const m = chunk.m('stone');
   const trim = chunk.m('stoneTrim');
+  const rand = new Rand(7701);
   const sides = 8;
-  const outer = 3.3, inner = 2.95;
+  const outer = 3.4, inner = 3.06;
+  const rimY = 0.46;
 
   for (let i = 0; i < sides; i++) {
     const a0 = (i / sides) * Math.PI * 2;
     const a1 = ((i + 1) / sides) * Math.PI * 2;
     const mid = (a0 + a1) * 0.5;
     const len = 2 * outer * Math.tan(Math.PI / sides) * 0.5;
-    m.pushTRS(x + Math.cos(mid) * (outer + inner) * 0.5, y + 0.34, z + Math.sin(mid) * (outer + inner) * 0.5, -mid);
-    m.box(0, 0, 0, len + 0.06, 0.34, (outer - inner) * 0.5 + 0.05, 1.4);
-    m.pop();
-    trim.pushTRS(x + Math.cos(mid) * (outer + inner) * 0.5, y + 0.72, z + Math.sin(mid) * (outer + inner) * 0.5, -mid);
-    trim.box(0, 0, 0, len + 0.12, 0.05, (outer - inner) * 0.5 + 0.11, 1.0);
-    trim.pop();
+    const cx = x + Math.cos(mid) * (outer + inner) * 0.5;
+    const cz = z + Math.sin(mid) * (outer + inner) * 0.5;
+    // One panel is broken out and lying in the basin — the reason the water
+    // stopped, and the way in for anything using it as cover.
+    // Tangential, not radial.
+    //
+    // `Ry(-mid)` sends local +X *outward* along the radius, so every panel was
+    // built pointing away from the centre: eight 2.9 m walls arranged like the
+    // spokes of a wheel, which is exactly what the square's centre looked like.
+    // A quarter turn puts the long axis on the chord, where it belongs, and the
+    // basin closes into an octagon.
+    const face = Math.PI / 2 - mid;
+    const smashed = i === 5;
+    if (!smashed) {
+      m.pushTRS(cx, y + rimY * 0.5, cz, face);
+      m.box(0, 0, 0, len + 0.06, rimY * 0.5, (outer - inner) * 0.5 + 0.04, 1.6);
+      m.pop();
+      // Moulded coping, wider than the panel so it throws a shadow line.
+      trim.pushTRS(cx, y + rimY + 0.045, cz, face);
+      trim.chamferBox(0, 0, 0, len + 0.14, 0.045, (outer - inner) * 0.5 + 0.13, 0.02, 1.0);
+      trim.pop();
+    } else {
+      m.pushTRS(cx, y + 0.1, cz, face);
+      m.box(0, 0, 0, len + 0.06, 0.1, (outer - inner) * 0.5 + 0.04, 1.6);
+      m.pop();
+      trim.pushTRS(cx - 0.5, y + 0.12, cz - 0.4, face + 0.6, 0, 0.22);
+      trim.box(0, 0, 0, len * 0.7, 0.07, 0.16, 1.0);
+      trim.pop();
+    }
   }
-  // basin floor, silted
-  const floor = chunk.m('dirt');
-  floor.pushTRS(x, y + 0.06, z);
-  floor.cylinder(inner, inner, 0.1, 16, true, false, 1.4);
-  floor.pop();
 
-  // broken central column
+  // Silted basin floor: dry, cracked, colonised.
+  const floor = chunk.m('dirt');
+  floor.pushTRS(x, y + 0.08, z);
+  floor.cylinder(inner, inner, 0.14, 16, true, false, 1.4);
+  floor.pop();
+  const weed = chunk.m('foliageDry');
+  for (let i = 0; i < 12; i++) {
+    const a = rand.next() * Math.PI * 2, r = rand.range(0.9, 2.7);
+    weed.pushTRS(x + Math.cos(a) * r, y + 0.14, z + Math.sin(a) * r, rand.next() * 3.1);
+    weed.card(rand.range(0.3, 0.6), rand.range(0.25, 0.5), 0, false);
+    weed.pop();
+  }
+
+  // Pedestal: plinth, torus base, fluted shaft, bowl, sheared stump.
   const col = chunk.m('stoneTrim');
-  col.pushTRS(x, y + 0.45, z);
-  col.cylinder(0.62, 0.5, 0.8, 10, true, false, 1.0);
+  col.pushTRS(x, y + 0.22, z);
+  col.cylinder(0.66, 0.6, 0.44, 12, true, false, 1.0);
   col.pop();
-  col.pushTRS(x, y + 1.25, z);
-  col.cylinder(0.3, 0.26, 0.9, 10, false, false, 0.8);
+  col.pushTRS(x, y + 0.47, z, 0, Math.PI / 2, 0);
+  col.torus(0.5, 0.08, 12, 6, 0.4);
   col.pop();
-  const rand = new Rand(7701);
-  col.pushTRS(x, y + 1.85, z, 0, 0.5, 0.35);
-  col.cylinder(0.26, 0.22, 0.55, 10, true, false, 0.8);
+  col.pushTRS(x, y + 0.95, z);
+  col.cylinder(0.28, 0.24, 0.92, 12, false, false, 0.8);
   col.pop();
-  // fallen upper section
-  col.pushTRS(x + 1.6, y + 0.28, z - 1.1, 0.9, Math.PI / 2 - 0.2, 0);
-  col.cylinder(0.24, 0.2, 1.3, 10, true, true, 0.8);
+  // Flutes: eight shallow ribs so the shaft is not a smooth tube.
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2;
+    col.pushTRS(x + Math.cos(a) * 0.265, y + 0.95, z + Math.sin(a) * 0.265, -a);
+    col.box(0, 0, 0, 0.028, 0.44, 0.028, 0.4);
+    col.pop();
+  }
+  // Basin bowl, cracked through and tipped.
+  col.pushTRS(x + 0.06, y + 1.46, z - 0.04, 0, 0, 0.09);
+  col.cylinder(0.34, 0.62, 0.2, 14, true, false, 0.8);
   col.pop();
-  for (let i = 0; i < 16; i++) {
+  col.pushTRS(x, y + 1.62, z, 0, 0.5, 0.4);
+  col.cylinder(0.2, 0.15, 0.42, 10, true, false, 0.8);
+  col.pop();
+
+  // The sheared-off upper section, lying where it fell.
+  col.pushTRS(x + 1.9, y + 0.32, z - 1.25, 0.9, Math.PI / 2 - 0.2, 0);
+  col.cylinder(0.22, 0.17, 1.35, 10, true, true, 0.8);
+  col.pop();
+  col.pushTRS(x + 2.6, y + 0.25, z - 1.9, 1.4, Math.PI / 2 + 0.4, 0);
+  col.cylinder(0.5, 0.34, 0.18, 12, true, true, 0.8);
+  col.pop();
+
+  for (let i = 0; i < 20; i++) {
     const a = rand.next() * Math.PI * 2;
-    const r = rand.range(0.6, 2.6);
-    const s = rand.range(0.08, 0.24);
-    col.pushTRS(x + Math.cos(a) * r, y + 0.14 + s * 0.4, z + Math.sin(a) * r,
+    const r = rand.range(0.7, 3.4);
+    const s = rand.range(0.07, 0.22);
+    col.pushTRS(x + Math.cos(a) * r, y + 0.12 + s * 0.4, z + Math.sin(a) * r,
       rand.next() * 3, rand.range(-0.3, 0.3), rand.range(-0.3, 0.3));
-    col.box(0, 0, 0, s, s * 0.6, s * 1.2, 0.8);
+    col.box(0, 0, 0, s, s * 0.55, s * 1.2, 0.8);
     col.pop();
   }
 }

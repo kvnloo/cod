@@ -41,6 +41,7 @@ import { FOOTPRINTS, MAP, SPAWN_POINTS } from './Layout';
 import { buildTerrain, groundHeightAt } from './build/Terrain';
 import { buildAllBuildings, buildBoundary } from './build/Buildings';
 import { buildBackdrop } from './build/Backdrop';
+import { facadeDamage, fbm3, groundGrime } from './build/Grounding';
 import { PropScatter, type PropCluster } from './props/Scatter';
 import { dressWorld } from './props/Dressing';
 import { ClothSystem, levelCloth } from './Cloth';
@@ -133,7 +134,13 @@ export class WorldSystem implements System {
     buildTerrain(terrain);
     const terrainGroup = new THREE.Group();
     terrainGroup.name = 'terrain';
-    terrain.emit(terrainGroup, this.cat, { name: 'terrain', castShadow: false, receiveShadow: true });
+    terrain.emit(terrainGroup, this.cat, {
+      name: 'terrain', castShadow: false, receiveShadow: true,
+      // Silt banked against every wall, spoil around every crater. This is what
+      // grounds the whole map: without it the street is one uniform plane and
+      // every building looks like it was dropped on to it.
+      blend: (x, _y, z) => groundGrime(x, z),
+    });
     this.root.add(terrainGroup);
     this.buildStats.terrainMs = performance.now() - t0;
 
@@ -160,7 +167,20 @@ export class WorldSystem implements System {
     dressWorld(scatter, structures, this.roofY);
     // One group per structure: the draw count stays low but every group has a
     // bounding sphere the culling system can actually reject.
-    const structureGroups = structures.emitAll(this.buildings, this.cat);
+    const structureGroups = structures.emitAll(this.buildings, this.cat, {
+      // Blown render showing the masonry behind it, concentrated at the base
+      // and around damage. Ground surfaces inside the same chunks (interior
+      // slabs, the set pieces' debris) take the silt mask instead.
+      blend: (x, y, z, key) => {
+        if (key === 'asphalt' || key === 'asphaltWorn' || key === 'pavement'
+          || key === 'cobble' || key === 'setts') return groundGrime(x, z);
+        // Roof ballast: grit blown into drifts against the parapets, laid on a
+        // wavelength of a couple of metres so a flat roof stops reading as one
+        // uniform sheet from the rooftop route.
+        if (key === 'roofFelt') return Math.min(1, fbm3(x * 0.42, y * 0.1, z * 0.42) * 1.5 - 0.25);
+        return facadeDamage(x, y, z);
+      },
+    });
     this.clusters = scatter.build(this.propsRoot, this.cat);
     this.buildStats.props = scatter.count;
     this.buildStats.propsMs = performance.now() - t2;
@@ -245,13 +265,21 @@ export class WorldSystem implements System {
     render.setTimeOfDay(TIME_OF_DAY);
     // Just enough haze to separate the depth layers. The volumetric density
     // scales steeply off this value, so anything above ~0.06 turns a 60 m
-    // sightline into a white wall at eye level.
-    render.setWeather(0, 0.05, 0.4);
+    // sightline into a white wall at eye level — at 0.05 a 30 m sightline into
+    // the sun was already losing its midground, hence 0.038.
+    render.setWeather(0, 0.038, 0.4);
     // Golden hour needs the sun to dominate. A full-strength sky probe lights
     // horizontal surfaces from the whole hemisphere and drowns both the warm key
     // and its shadows — the road ends up brighter than the sunlit facades.
+    //
+    // 0.55, not 0.78: the point of a low warm key is the *ratio* between a
+    // sunlit facade and a shaded one. At 0.78 the sky fill was carrying enough
+    // of the shaded side that the two faces of a corner were within half a stop
+    // of each other and the whole map read flat. Dropping the fill and pushing
+    // its tint further into the blue widens both the value split and the colour
+    // split, which is the entire golden-hour read.
     const api = render as unknown as { setAmbient?: (tint: THREE.ColorRepresentation, i: number) => void };
-    api.setAmbient?.(0xa9c3e8, 0.78);
+    api.setAmbient?.(0x8fb4e6, 0.55);
     this.cloth.setWind(0.75);
   }
 
@@ -295,6 +323,16 @@ export class WorldSystem implements System {
       { x: -1, y: 4.0, z: 45, kind: 'bulb', c: 0xffd0a0, i: 7, r: 9, box: 'apartmentS' },
       { x: -44, y: 2.9, z: 5, kind: 'bulb', c: 0xffc890, i: 7, r: 8, box: 'cafe' },
       { x: 36, y: 3.0, z: -47, kind: 'fluoro', c: 0xdff0ff, i: 6, r: 9, box: 'clinic' },
+      // Upper floors of the shop rows. Every blown-out opening on those two
+      // facades was a hole cut into pure black from outside; a single weak
+      // practical two metres behind it turns the void into a readable room and
+      // gives the opening an edge to catch light on.
+      { x: -20.5, y: 6.4, z: -26, kind: 'bulb', c: 0xffcf95, i: 5, r: 7, box: 'shopsW' },
+      { x: -20.5, y: 6.4, z: 8, kind: 'bulb', c: 0xffcf95, i: 5, r: 7, box: 'shopsW2' },
+      { x: 20.5, y: 6.4, z: -24, kind: 'bulb', c: 0xffc98c, i: 5, r: 7, box: 'shopsE' },
+      { x: 20.5, y: 6.4, z: 10, kind: 'bulb', c: 0xffc98c, i: 5, r: 7, box: 'shopsE2' },
+      { x: -43, y: 6.2, z: -30, kind: 'bulb', c: 0xffd0a0, i: 5, r: 7, box: 'terraceM' },
+      { x: 0, y: 7.4, z: -50, kind: 'bulb', c: 0xffcf90, i: 6, r: 9, box: 'townHall' },
     ];
     for (const p of interior) {
       const f = FOOTPRINTS[p.box];

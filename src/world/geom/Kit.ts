@@ -131,7 +131,18 @@ export function wall(chunk: Chunk, frame: WallFrame, opt: WallOptions): void {
   const t = opt.thickness ?? 0.35;
   const half = t * 0.5;
   const skin = opt.innerKey ? 0.025 : 0;
-  const uv = opt.uvScale ?? 2.2;
+  /**
+   * 4.2 m per texture repeat, not 2.2.
+   *
+   * The plaster and brick tiles carry metre-scale features — blown render
+   * patches, water staining, aggregate. At 2.2 m a twelve-metre facade shows
+   * the same tile five and a half times, and the eye reads the repetition as
+   * one big mottled camouflage pattern rather than as a wall. Doubling the
+   * repeat halves the count, doubles the feature size into something that reads
+   * as real render damage, and still leaves ~5 mm texels at 1K — the shared
+   * runtime detail layer covers everything finer than that.
+   */
+  const uv = opt.uvScale ?? 4.2;
   const rects = wallRects(frame.length, opt.y0, opt.y1, opt.openings ?? []);
 
   const main = chunk.m(opt.key);
@@ -191,11 +202,40 @@ export function raggedTop(
   const step = 0.42;
   const n = Math.max(2, Math.floor(frame.length / step));
   const half = thickness * 0.5;
+
+  /**
+   * Damage is *localised*.
+   *
+   * Running the amplitude evenly along the whole eave turned a 25 m facade into
+   * a regular sawtooth crest — a decorative motif, not blast damage, and at
+   * distance it read as a repeating dentil course. Real shelling takes two or
+   * three bites out of a parapet and leaves the rest standing. Each wall now
+   * gets a small number of authored bite centres; between them the parapet is
+   * intact and only lightly chipped.
+   */
+  const bites = 1 + Math.floor(frame.length / 11);
+  const centres: number[] = [];
+  const widths: number[] = [];
+  for (let b = 0; b < bites; b++) {
+    centres.push(((b + rand.range(0.25, 0.75)) / bites) * frame.length);
+    widths.push(rand.range(1.6, 3.6));
+  }
+  const biteAt = (u: number): number => {
+    let m = 0;
+    for (let b = 0; b < centres.length; b++) {
+      const t = Math.abs(u - centres[b]) / widths[b];
+      if (t < 1) m = Math.max(m, 1 - t * t);
+    }
+    return m;
+  };
+
   for (let i = 0; i < n; i++) {
     const u = (i + 0.5) * (frame.length / n);
-    const h = Math.max(0, o.amplitude * (0.15 + 0.85 * Math.pow(rand.next(), 1.6)));
+    // 0.1 baseline of chipping everywhere, the rest concentrated in the bites.
+    const local = 0.1 + 0.9 * biteAt(u);
+    const h = Math.max(0, o.amplitude * local * (0.2 + 0.8 * Math.pow(rand.next(), 1.4)));
     if (h < 0.03) continue;
-    const w = (frame.length / n) * 0.5 * rand.range(0.85, 1.0);
+    const w = (frame.length / n) * 0.5 * rand.range(0.9, 1.0);
     const d = half * rand.range(0.55, 1.0);
     mesher.box(u, y + h * 0.5, rand.range(-0.05, 0.05), w, h * 0.5, d, 1.6);
   }
@@ -207,6 +247,7 @@ export function raggedTop(
     const count = Math.max(1, Math.floor(frame.length / 2.6));
     for (let i = 0; i < count; i++) {
       const u = ((i + 0.5) / count) * frame.length + rand.range(-0.3, 0.3);
+      if (biteAt(u) < 0.35) continue;      // rebar only where the wall is gone
       const len = rand.range(0.35, 0.95);
       const pts = [
         V3(u, y - 0.1, 0),

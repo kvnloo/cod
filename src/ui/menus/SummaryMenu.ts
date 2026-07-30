@@ -9,8 +9,15 @@
 
 import { Rand } from '../../core/Rand';
 import { clamp01, Ease, motion } from '../Anim';
+import type { ScoreRow } from '../widgets/Scoreboard';
 import { el, stagger } from './Dom';
 import { keyHint, menuFrame, Screen, type ScreenHost } from './MenuStack';
+
+const CALLSIGNS = [
+  'REAPER', 'VULTURE', 'HAVOC', 'SABLE', 'IRONHIDE', 'NOMAD', 'ZEALOT', 'KESTREL',
+  'BADGER', 'CINDER', 'WRAITH', 'TALON', 'ONYX', 'MAVERICK', 'HALYARD', 'GRIT',
+];
+const STREAK_TAGS = ['—', 'UAV', 'CUAV', 'UAV·CLST', 'CLST', 'UAV·CUAV'];
 
 export interface ScoreLine {
   name: string;
@@ -36,13 +43,35 @@ export interface MatchSummary {
   xpEnd: number;
   xpPerLevel: number;
   level: number;
+  /** Final rosters. Optional so game modes can omit them and still get a screen. */
+  friendly?: ScoreRow[];
+  hostile?: ScoreRow[];
 }
 
 export function demoSummary(win: boolean, seed = 'ob-summary'): MatchSummary {
   const r = new Rand(seed);
   const kills = r.int(18, 34);
   const deaths = r.int(6, 17);
+  const names = r.shuffle([...CALLSIGNS]);
+  const roster = (n: number, offset: number, isPlayerAt = -1): ScoreRow[] => {
+    const out: ScoreRow[] = [];
+    for (let i = 0; i < n; i++) {
+      const k = i === isPlayerAt ? kills : r.int(3, 26);
+      out.push({
+        name: i === isPlayerAt ? 'GHOST-ACTUAL' : names[offset + i],
+        kills: k,
+        deaths: i === isPlayerAt ? deaths : r.int(3, 22),
+        assists: r.int(0, 9),
+        score: k * 100 + r.int(0, 12) * 50,
+        streak: r.pick(STREAK_TAGS),
+        isPlayer: i === isPlayerAt,
+      });
+    }
+    return out.sort((a, b) => b.score - a.score);
+  };
   return {
+    friendly: roster(6, 0, 0),
+    hostile: roster(6, 8),
     win,
     mode: 'DOMINATION',
     map: 'BLACKOUT · UPLINK',
@@ -84,6 +113,15 @@ export class SummaryMenu extends Screen {
   private breakHost: HTMLElement | null = null;
   private medalHost: HTMLElement | null = null;
   private statHost: HTMLElement | null = null;
+  private friendlyBody: HTMLElement | null = null;
+  private hostileBody: HTMLElement | null = null;
+  /** Objective-control strip along the bottom of the standings panel. */
+  private readonly flowNode = el('div', {
+    style: {
+      display: 'flex', alignItems: 'flex-end', gap: '1px',
+      height: 'calc(var(--ob-u)*54)', marginTop: 'calc(var(--ob-u)*10)',
+    },
+  });
 
   constructor(host: ScreenHost, private onContinue: () => void) {
     super('summary', host);
@@ -97,7 +135,9 @@ export class SummaryMenu extends Screen {
   protected build(): void {
     const parts = menuFrame(this, 'MATCH SUMMARY', 'After Action Report', 'cols-2');
     parts.body.style.gridTemplateColumns = 'minmax(0,1.05fr) minmax(0,1fr)';
-    parts.body.style.alignItems = 'start';
+    // Row 1 hugs its content; row 2 (final standings) stretches to the bottom
+    // of the frame. `alignItems: start` on the whole grid would stop that.
+    parts.body.style.alignItems = 'stretch';
 
     const result = el('div', { class: 'ob-result' });
     const sub = el('div', { class: 'ob-result-sub' });
@@ -134,6 +174,7 @@ export class SummaryMenu extends Screen {
         xp,
       ),
     );
+    left.style.alignSelf = 'start';
     stagger(left, 0);
 
     const medals = el('div', { class: 'ob-medals' });
@@ -148,9 +189,35 @@ export class SummaryMenu extends Screen {
         el('span', { text: 'Medals' })),
       medals,
     );
+    right.style.alignSelf = 'start';
     stagger(right, 1);
 
-    parts.body.append(left, right);
+    // Final standings fill the bottom half. Without them a 16:9 summary is two
+    // panels floating in a large void, which is the layout tell that separates a
+    // mock-up from a shipped after-action report.
+    this.friendlyBody = el('tbody');
+    this.hostileBody = el('tbody');
+    const standings = el('div', { class: 'ob-panel ob-stagger', style: { gridColumn: '1 / -1' } },
+      el('div', { class: 'ob-panel-title' },
+        el('span', { text: 'Final Standings' }),
+        el('span', { text: `${this.data.mode}  ·  ${this.data.map}` }),
+      ),
+      el('div', { class: 'ob-sb-teams' },
+        rosterTable('Task Force', 'var(--ob-friendly)', this.friendlyBody),
+        rosterTable('Hostiles', 'var(--ob-hostile)', this.hostileBody),
+      ),
+      el('div', { class: 'ob-panel-title', style: { marginTop: 'calc(var(--ob-u)*20)' } },
+        el('span', { text: 'Match Flow' }),
+        el('span', { text: 'OBJECTIVE CONTROL OVER TIME' }),
+      ),
+      this.flowNode,
+    );
+    standings.style.display = 'grid';
+    standings.style.gridTemplateRows = 'auto auto auto minmax(0,1fr)';
+    stagger(standings, 2);
+
+    parts.body.append(left, right, standings);
+    parts.body.style.gridTemplateRows = 'auto minmax(0,1fr)';
     parts.footerLeft.append(keyHint('ENTER', 'Continue'));
     parts.footerRight.textContent = '';
     parts.footerRight.appendChild(el('button', {
@@ -242,5 +309,79 @@ export class SummaryMenu extends Screen {
       while (host.firstChild) host.removeChild(host.firstChild);
       for (const m of d.medals) host.appendChild(el('div', { class: 'ob-medal', text: m }));
     }
+
+    fillRoster(this.friendlyBody, d.friendly ?? []);
+    fillRoster(this.hostileBody, d.hostile ?? []);
+    this.renderFlow();
+  }
+
+  /**
+   * Objective-control strip: one column per ~12 s of match time, its height and
+   * colour showing which side held the majority of the objectives. Derived from
+   * the same seeded RNG as the rest of the summary, so a capture is stable.
+   */
+  private renderFlow(): void {
+    const host = this.flowNode;
+    while (host.firstChild) host.removeChild(host.firstChild);
+    const d = this.data;
+    const r = new Rand(`flow-${d.mode}-${d.scoreFriendly}-${d.scoreHostile}`);
+    const columns = 48;
+    // Random walk biased toward the eventual winner so the strip tells the same
+    // story as the score line above it.
+    const bias = (d.scoreFriendly - d.scoreHostile) / 200;
+    // Start on the losing side and drift across, so a 200–173 finish reads as a
+    // match that was genuinely contested rather than a wall of one colour.
+    let hold = -Math.sign(bias || 1) * 0.55;
+    for (let i = 0; i < columns; i++) {
+      hold = Math.max(-1, Math.min(1, hold + r.range(-0.5, 0.5) + bias * 0.14));
+      const mag = Math.abs(hold);
+      const friendly = hold >= 0;
+      const bar = el('div', {
+        style: {
+          flex: '1 1 0',
+          height: `${(18 + mag * 82).toFixed(1)}%`,
+          background: friendly
+            ? `rgba(79,195,255,${(0.22 + mag * 0.62).toFixed(2)})`
+            : `rgba(255,61,51,${(0.22 + mag * 0.62).toFixed(2)})`,
+        },
+      });
+      host.appendChild(bar);
+    }
+  }
+}
+
+/* ------------------------------------------------------------- standings -- */
+
+function rosterTable(label: string, tint: string, body: HTMLElement): HTMLElement {
+  return el('div', {},
+    el('div', { class: 'ob-sb-team-name', style: { color: tint }, text: label.toUpperCase() }),
+    el('table', { class: 'ob-sb' },
+      el('thead', {},
+        el('tr', {},
+          el('th', { text: 'Operator' }),
+          el('th', { text: 'Score' }),
+          el('th', { text: 'K' }),
+          el('th', { text: 'D' }),
+          el('th', { text: 'A' }),
+          el('th', { text: 'Streak' }),
+        ),
+      ),
+      body,
+    ),
+  );
+}
+
+function fillRoster(body: HTMLElement | null, rows: ScoreRow[]): void {
+  if (!body) return;
+  while (body.firstChild) body.removeChild(body.firstChild);
+  for (const r of rows) {
+    body.appendChild(el('tr', { class: r.isPlayer ? 'is-me' : '' },
+      el('td', { text: r.name }),
+      el('td', { text: String(r.score) }),
+      el('td', { text: String(r.kills) }),
+      el('td', { text: String(r.deaths) }),
+      el('td', { text: String(r.assists) }),
+      el('td', { text: r.streak }),
+    ));
   }
 }

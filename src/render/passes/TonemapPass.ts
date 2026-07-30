@@ -96,6 +96,7 @@ uniform float uMaxExposure;
 uniform vec3 uWhiteBalance;
 uniform float uLutSize;
 uniform float uLutStrength;
+uniform vec3 uAgxLook;    // x power, y saturation, z (unused)
 layout(location = 0) out vec4 fragColor;
 
 const mat3 LIN_2_LMS = mat3(
@@ -139,6 +140,18 @@ vec3 tonemapAgX(vec3 color) {
   color = log2(max(color, 1e-10));
   color = clamp((color - minEv) / (maxEv - minEv), 0.0, 1.0);
   color = agxContrast(color);
+  // AgX "look" stage. Base AgX alone is deliberately flat and desaturated — it
+  // is a working space, not a delivery grade, and shipping it raw is what makes
+  // an image read as milky no matter how good the lighting is. The power/
+  // saturation pair here is the same shape as Blender's Punchy look, applied in
+  // the log-encoded domain where it cannot clip.
+  {
+    float agxLuma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    color = pow(max(color, vec3(0.0)), vec3(uAgxLook.x));
+    agxLuma = pow(max(agxLuma, 0.0), uAgxLook.x);
+    color = agxLuma + (color - agxLuma) * uAgxLook.y;
+    color = clamp(color, 0.0, 1.0);
+  }
   color = outset * color;
   color = pow(max(color, vec3(0.0)), vec3(2.2));
   color = REC2020_TO_LINEAR_SRGB * color;
@@ -254,6 +267,8 @@ export class TonemapPass extends BasePass {
   temperature = 4;
   tint = 0;
   lutStrength = 1;
+  /** AgX look: x = contrast power about the log midpoint, y = saturation. */
+  readonly agxLook = new THREE.Vector3(1.15, 1.14, 0);
   grade: GradeSettings = { ...DEFAULT_GRADE };
   /** True when this pass encodes sRGB itself (it always does — see the header). */
   readonly outputsSrgb = true;
@@ -306,6 +321,7 @@ export class TonemapPass extends BasePass {
         uWhiteBalance: { value: new THREE.Vector3(1, 1, 1) },
         uLutSize: { value: LUT_SIZE },
         uLutStrength: { value: 1 },
+        uAgxLook: { value: new THREE.Vector3(1.15, 1.14, 0) },
       },
     });
     this.refreshLut();
@@ -398,6 +414,7 @@ export class TonemapPass extends BasePass {
     (u.uWhiteBalance.value as THREE.Vector3).copy(this.wb);
     u.uLutSize.value = LUT_SIZE;
     u.uLutStrength.value = this.lutStrength;
+    (u.uAgxLook.value as THREE.Vector3).copy(this.agxLook);
     ctx.blit(this.tonemap, output);
     return true;
   }

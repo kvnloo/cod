@@ -127,8 +127,8 @@ function drawTicks(
   c: CanvasRenderingContext2D, s: number, r0: number, r1: number, thick: number, color: string,
 ): void {
   c.lineCap = 'butt';
-  c.strokeStyle = 'rgba(0,3,7,0.55)';
-  c.lineWidth = thick * s + 1.6;
+  c.strokeStyle = 'rgba(1,3,7,0.8)';
+  c.lineWidth = thick * s + 2.6;
   tickPath(c, s, r0, r1);
   c.stroke();
   c.strokeStyle = color;
@@ -165,19 +165,34 @@ function drawArmor(c: CanvasRenderingContext2D, s: number, p: Palette, a: number
 
 function drawCrit(c: CanvasRenderingContext2D, s: number, p: Palette, t: number): void {
   const hot = lift(p.accent, 0.42);
-  drawTicks(c, s, 5.0, 12.5, 2.4, rgba(hot, 1));
-  const ringR = (13.5 + Ease.outCubic(t) * 5.5) * s;
-  c.strokeStyle = rgba(p.accent, (1 - t) * 0.9);
-  c.lineWidth = Math.max(1, 1.5 * s);
+  drawTicks(c, s, 5.0, 13.5, 2.7, rgba(hot, 1));
+  // Four short axis ticks distinguish a crit from a body shot at a glance —
+  // these carry the read, not a ring. The full circle the original drew sat
+  // right on top of the reticle and looked like a stray HUD element.
+  c.strokeStyle = 'rgba(1,3,7,0.75)';
+  c.lineWidth = 3.4 * s;
+  axisTicks(c, s);
+  c.strokeStyle = rgba(hot, 0.95);
+  c.lineWidth = 1.9 * s;
+  axisTicks(c, s);
+  // A brief arc pair rather than a closed ring: it reads as a flourish that
+  // leaves, and it is gone inside 250 ms.
+  if (t < 0.45) {
+    const k = 1 - t / 0.45;
+    const ringR = (14 + Ease.outCubic(t) * 7) * s;
+    c.strokeStyle = rgba(p.accent, k * 0.8);
+    c.lineWidth = Math.max(1, 1.4 * s);
+    c.beginPath();
+    c.arc(0, 0, ringR, -Math.PI * 0.42, -Math.PI * 0.08);
+    c.arc(0, 0, ringR, Math.PI * 0.58, Math.PI * 0.92);
+    c.stroke();
+  }
+}
+
+function axisTicks(c: CanvasRenderingContext2D, s: number): void {
   c.beginPath();
-  c.arc(0, 0, ringR, 0, Math.PI * 2);
-  c.stroke();
-  // Four short axis ticks distinguish a crit from a body shot at a glance.
-  c.strokeStyle = rgba(hot, 0.85);
-  c.lineWidth = 1.6 * s;
-  c.beginPath();
-  c.moveTo(0, -16 * s); c.lineTo(0, -20.5 * s);
-  c.moveTo(0, 16 * s); c.lineTo(0, 20.5 * s);
+  c.moveTo(0, -16.5 * s); c.lineTo(0, -21 * s);
+  c.moveTo(0, 16.5 * s); c.lineTo(0, 21 * s);
   c.stroke();
 }
 

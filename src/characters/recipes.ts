@@ -138,22 +138,33 @@ export interface CamoPalette {
   scale: number;
 }
 
+/**
+ * Camo is a *value* pattern, and the mistake that makes procedural uniforms
+ * read as tie-dye is authoring it with too much of it. A real multicam plate
+ * spans roughly one stop between its lightest and darkest patch; the earlier
+ * palettes here spanned nearly three, which at any distance dissolves the
+ * soldier into blotches instead of breaking his outline up.
+ *
+ * The tint carries the actual reflectance (see `Appearance.tint`), so these are
+ * ratios about a mean of ~0.55 sRGB, not absolute colours.
+ */
 export const CAMO: Record<string, CamoPalette> = {
-  // Faded multicam-ish: the tint does the colour work, this does the structure.
+  // Faded multicam-ish: warm tan base, brown and olive shapes over it.
   arid: {
-    colors: [[0.80, 0.74, 0.60], [0.62, 0.56, 0.42], [0.44, 0.40, 0.30], [0.30, 0.28, 0.22]],
-    hardness: 0.15, scale: 3.6,
+    colors: [[0.66, 0.61, 0.49], [0.56, 0.50, 0.38], [0.46, 0.43, 0.33], [0.38, 0.34, 0.27]],
+    hardness: 0.12, scale: 4.4,
   },
   woodland: {
-    colors: [[0.56, 0.58, 0.44], [0.42, 0.46, 0.34], [0.28, 0.32, 0.24], [0.20, 0.22, 0.18]],
-    hardness: 0.25, scale: 3.4,
+    colors: [[0.55, 0.55, 0.44], [0.46, 0.48, 0.36], [0.37, 0.40, 0.30], [0.29, 0.31, 0.25]],
+    hardness: 0.22, scale: 4.2,
   },
+  // Pixellated grey-green: the digital edge does the work, not the contrast.
   urban: {
-    colors: [[0.62, 0.63, 0.62], [0.46, 0.47, 0.47], [0.30, 0.31, 0.32], [0.19, 0.20, 0.21]],
-    hardness: 0.75, scale: 4.6,
+    colors: [[0.58, 0.59, 0.57], [0.49, 0.50, 0.49], [0.40, 0.41, 0.42], [0.32, 0.33, 0.34]],
+    hardness: 0.72, scale: 5.4,
   },
   plain: {
-    colors: [[0.60, 0.58, 0.52], [0.54, 0.52, 0.47], [0.48, 0.46, 0.42], [0.42, 0.41, 0.38]],
+    colors: [[0.57, 0.56, 0.51], [0.53, 0.52, 0.47], [0.49, 0.48, 0.44], [0.45, 0.44, 0.41]],
     hardness: 0.0, scale: 2.6,
   },
 };
@@ -183,7 +194,9 @@ uniform float uScale;
 void obHeightFn(vec2 uv, out vec4 h0, out vec4 h1) {
   vec3 w = chWeave(uv, 240.0, 0.26, uSeed);
   float rip = chRipstop(uv, 60.0);
-  float h = 0.44 + w.x * 0.24 + rip * 0.10;
+  // The ripstop grid is a real feature of the cloth but it is a *whisper*: at
+  // 0.10 of the height range it resolved as corduroy banding down every leg.
+  float h = 0.44 + w.x * 0.24 + rip * 0.045;
 
   // Folds: big soft drape plus tight creases where fabric bunches.
   float drape = obFbm(uv * 4.0, vec2(4.0), 4, 0.55, uSeed + 3.0) - 0.5;
@@ -196,7 +209,7 @@ void obHeightFn(vec2 uv, out vec4 h0, out vec4 h1) {
   vec2 sh = chStitch(fract(uv.x * 3.0) - 0.5, 120.0, uv.y);
   float seam = max(sv.x, sh.x);
   float stitch = max(sv.y, sh.y);
-  h += seam * 0.075 + stitch * 0.055;
+  h += seam * 0.055 + stitch * 0.040;
 
   // Wear: thin threadbare patches.
   float bare = obSat((obFbm(uv * 6.0, vec2(6.0), 4, 0.5, uSeed + 33.0) - 0.66) * 3.0);
@@ -256,7 +269,7 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
   col *= mix(0.95, 1.06, par);
   col *= mix(0.90, 1.08, rnd);
   // Ripstop threads are a shade lighter — they are a different denier.
-  col *= 1.0 + rip * 0.06;
+  col *= 1.0 + rip * 0.025;
 
   // Sun bleaching on the high points, dirt in the folds.
   col *= mix(0.86, 1.10, obSat(d.curv * 0.5 + 0.5));
@@ -271,9 +284,11 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
   col = mix(col, col * 0.62 + obRGB(40, 36, 30) * 0.5, stitch * 0.7);
 
   o.albedo = col;
-  o.rough = clamp(0.90 - crease * 0.05 + bare * 0.06 - seam * 0.04 + sweat * 0.05, 0.55, 1.0);
+  // Cotton ripstop has no sheen at all. Anything below ~0.7 here puts a broad
+  // specular lobe on a soldier's back and instantly reads as latex.
+  o.rough = clamp(0.94 - crease * 0.04 + bare * 0.05 - seam * 0.03 + sweat * 0.04, 0.74, 1.0);
   o.metal = 0.0;
-  o.ao = mix(1.0, 0.9, crease);
+  o.ao = mix(1.0, 0.84, crease) * mix(1.0, 0.9, seam);
 }`,
   };
 }
@@ -343,9 +358,11 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
   col *= 1.0 - scuff * 0.18;
 
   o.albedo = col;
-  o.rough = clamp(0.92 - scuff * 0.20 - row * 0.03, 0.5, 1.0);
+  // Cordura is slightly shinier than ripstop where it has been polished by wear,
+  // but never glossy.
+  o.rough = clamp(0.93 - scuff * 0.16 - row * 0.03, 0.66, 1.0);
   o.metal = 0.0;
-  o.ao = mix(1.0, 0.86, row);
+  o.ao = mix(1.0, 0.80, row) * mix(1.0, 0.86, tack);
 }`,
   };
 }
@@ -398,10 +415,13 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
   col = mix(col, base * 0.62, obSat(d.cavity * 1.2) * 0.7);
   col = mix(col, base * 0.72, grain * 0.35);
 
-  // Edge wear: paint rubbed off the convex edges down to a lighter substrate.
-  float edge = obSat(d.curv * 1.6);
-  vec3 substrate = obRGB(178, 172, 160);
-  col = mix(col, substrate, edge * 0.35 + scratch * 0.30);
+  // Edge wear: paint rubbed off the convex edges down to a lighter substrate,
+  // and rubbed *smooth* as well as lighter — a helmet's worn rim catches a
+  // highlight the rest of the shell never does, which is most of what sells a
+  // painted composite at close range.
+  float edge = obSat(d.curv * 1.9);
+  vec3 substrate = obRGB(186, 180, 168);
+  col = mix(col, substrate, edge * 0.32 + scratch * 0.26);
 
   // Dust settled in the texture.
   float dust = obFbm(uv * 4.0, vec2(4.0), 4, 0.6, uSeed + 37.0);
@@ -409,9 +429,9 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
 
   o.albedo = col;
   // Matte shell, glossier where it has been rubbed smooth, grippy on tread.
-  o.rough = clamp(0.74 - edge * 0.22 - scratch * 0.10 + tread * 0.14 + bump * 0.06, 0.22, 0.98);
+  o.rough = clamp(0.82 - edge * 0.30 - scratch * 0.12 + tread * 0.12 + bump * 0.05, 0.34, 0.98);
   o.metal = 0.0;
-  o.ao = mix(1.0, 0.9, bump);
+  o.ao = mix(1.0, 0.88, bump);
 }`,
 };
 
@@ -441,17 +461,19 @@ void obHeightFn(vec2 uv, out vec4 h0, out vec4 h1) {
   shade: /* glsl */ `
 void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
   float brush = h0.y, dent = h0.z, scratch = h0.w;
-  vec3 base = obRGB(148, 148, 152);
+  vec3 base = obRGB(172, 172, 176);
   vec3 col = base * mix(0.80, 1.12, brush);
-  // Anodised black finish worn through to bright metal on the edges.
-  vec3 anod = obRGB(52, 52, 55);
+  // Anodised / parkerised finish worn through to bright metal on the edges.
+  // A near-black F0 makes every rail and buckle a black mirror in an open sky,
+  // which is what turned the helmet furniture into floating holes.
+  vec3 anod = obRGB(86, 86, 90);
   float worn = obSat(d.curv * 1.8) * 0.6 + scratch * 0.8;
   col = mix(anod, col, clamp(worn, 0.0, 1.0));
-  col = mix(col, anod * 0.7, obSat(d.cavity) * 0.6);
+  col = mix(col, anod * 0.72, obSat(d.cavity) * 0.6);
 
   o.albedo = col;
-  o.rough = clamp(0.44 - worn * 0.16 + dent * 0.10 + (1.0 - brush) * 0.08, 0.12, 0.8);
-  o.metal = clamp(0.55 + worn * 0.45 - dent * 0.2, 0.2, 1.0);
+  o.rough = clamp(0.62 - worn * 0.20 + dent * 0.10 + (1.0 - brush) * 0.08, 0.22, 0.90);
+  o.metal = clamp(0.50 + worn * 0.45 - dent * 0.2, 0.15, 1.0);
   o.ao = 1.0;
 }`,
 };

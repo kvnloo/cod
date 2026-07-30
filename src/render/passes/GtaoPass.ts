@@ -104,8 +104,10 @@ void main() {
   vec3 viewVec = normalize(-viewPos);
 
   // Screen-space radius of the effect sphere, clamped so grazing pixels do not
-  // explode the sampling footprint.
-  float screenRadius = clamp(uRadius * uPixelsPerMeter / z, 3.0, 96.0);
+  // explode the sampling footprint. The floor matters: below ~4px the whole
+  // kernel lands inside one texel neighbourhood and distant geometry silently
+  // loses its ambient occlusion entirely.
+  float screenRadius = clamp(uRadius * uPixelsPerMeter / z, 4.0, 110.0);
 
   float falloffRange = 0.615 * uRadius;
   float falloffFrom = uRadius - falloffRange;
@@ -140,7 +142,11 @@ void main() {
 
     for (int st = 0; st < AO_STEPS; st++) {
       float s = (float(st) + stepNoise) / float(AO_STEPS);
-      s = s * s;                                   // bias samples toward the centre
+      // Bias toward the centre — but only mildly. A pure square law puts five of
+      // six samples inside the first third of the radius, so the occluder that
+      // actually grounds an object (the metre of floor beside it) is never
+      // sampled and the AO collapses into a thin rim around creases.
+      s = s * (0.32 + 0.68 * s);
       float offsetLen = max(1.0, floor(s * screenRadius + 0.5));
       vec2 off = omega * offsetLen * uTexel;
 
@@ -350,7 +356,9 @@ void main() {
 
   // Hue-preserving pseudo-albedo: the shaded buffer is all we have here, and the
   // multi-bounce curve only needs the chromaticity to be roughly right.
-  vec3 albedo = sat(color.rgb / (maxc(color.rgb) + 1e-4)) * 0.42;
+  // 0.42 is brighter than almost any real surface; the multi-bounce curve then
+  // gives back so much energy that the occlusion barely survives it.
+  vec3 albedo = sat(color.rgb / (maxc(color.rgb) + 1e-4)) * 0.28;
   vec3 diffuseOcc = multiBounce(ao, albedo);
 
   vec3 nView = normalize(nr.xyz + vec3(1e-6));
@@ -375,10 +383,25 @@ void main() {
 
 interface QualityTier { slices: number; steps: number; half: boolean; }
 
+/**
+ * Cost/quality tiers.
+ *
+ * Resolution is the wrong place to spend an AO budget. A full-resolution buffer
+ * multiplies *five* stages (prefilter, gtao, denoise, temporal, apply) by four,
+ * and the horizon search is the most cache-hostile shader in the frame — it
+ * costs `slices * steps * 2` dependent depth taps at a stride that defeats the
+ * texture cache. Half resolution buys back roughly 2.4x the total fetch count,
+ * which is then spent on more *slices*: the azimuthal sample count is what
+ * decides whether a corner reads as occluded from every direction or bands, and
+ * the visibility term is low-frequency enough that the depth-aware bilateral
+ * upsample in `APPLY_FRAG` reconstructs it without softening contact darkening.
+ *
+ * Cinematic keeps the full-resolution path — it is not a real-time budget.
+ */
 function tierFor(quality: number): QualityTier {
   if (quality <= 0.55) return { slices: 2, steps: 3, half: true };
   if (quality <= 0.75) return { slices: 3, steps: 4, half: true };
-  if (quality <= 1.05) return { slices: 3, steps: 6, half: false };
+  if (quality <= 1.05) return { slices: 4, steps: 5, half: true };
   return { slices: 4, steps: 9, half: false };
 }
 
@@ -534,7 +557,11 @@ export class GtaoPass extends BasePass {
     (gu.uTexel.value as THREE.Vector2).set(1 / aw, 1 / ah);
     (gu.uProj.value as THREE.Vector4).copy(projVec);
     gu.uPixelsPerMeter.value = 0.5 * ah * proj[5];
-    gu.uRadius.value = Math.max(0.05, g.ssaoRadius);
+    // The preset's radius is the *detail* scale (creases, window reveals). World
+    // grounding — the darkening under a crate, in a doorway, along a kerb — needs
+    // roughly a metre and a half of reach, so scale it up here rather than
+    // asking every preset to carry a second number.
+    gu.uRadius.value = Math.max(0.05, g.ssaoRadius) * 2.1;
     gu.uThickness.value = 0.55;
     gu.uFrame.value = ctx.frame % 64;
     gu.uFar.value = ctx.cameraFar;
@@ -579,8 +606,11 @@ export class GtaoPass extends BasePass {
     (au.uAoTexel.value as THREE.Vector2).set(1 / aw, 1 / ah);
     au.uNear.value = ctx.cameraNear;
     au.uFar.value = ctx.cameraFar;
-    au.uIntensityPower.value = 1.0 + 1.2 * Math.max(0, g.ssaoIntensity);
-    au.uDirectPreserve.value = 0.25;
+    au.uIntensityPower.value = 1.0 + 1.9 * Math.max(0, g.ssaoIntensity);
+    // Direct light should survive occlusion, but not this much: at 0.25 a sunlit
+    // wall base kept a quarter of its ambient occlusion budget back and the
+    // contact never read.
+    au.uDirectPreserve.value = 0.14;
     ctx.blit(this.apply, output);
     return true;
   }

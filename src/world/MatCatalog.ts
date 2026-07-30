@@ -28,6 +28,7 @@ export type MatKey =
   | 'concrete' | 'concreteDark' | 'concreteWet' | 'stone' | 'stoneTrim' | 'cobble'
   /* ground */
   | 'asphalt' | 'asphaltWorn' | 'pavement' | 'kerb' | 'dirt' | 'gravel' | 'grass' | 'puddle'
+  | 'setts' | 'scorch'
   /* roofs */
   | 'roofTile' | 'roofFelt'
   /* timber */
@@ -41,7 +42,7 @@ export type MatKey =
   /* emissive practicals */
   | 'lampSodium' | 'lampWarm' | 'fluoro' | 'beacon' | 'ember' | 'signGlow'
   /* backdrop */
-  | 'backdropFar' | 'backdropMid' | 'ridge';
+  | 'backdropFar' | 'backdropMid' | 'ridgeNear' | 'ridgeMid' | 'ridge';
 
 interface MatDef {
   archetype: string;
@@ -53,43 +54,85 @@ interface MatDef {
   flat?: { roughness: number; metalness: number };
 }
 
+/**
+ * Surfaces that carry a second, vertex-blended layer.
+ *
+ * This is the level's grounding system. A wall is not one material: render
+ * blows off at the base and around shell damage to show the masonry behind it,
+ * and dirt banks up wherever the ground meets something vertical. Both are
+ * driven by a weight written into the geometry's colour attribute at build
+ * time, so the transition is height-aware (the blend layer settles into mortar
+ * lines rather than fading over them) and costs no extra draw calls.
+ *
+ * Anything listed here MUST be emitted with a blend weight — see
+ * `Chunk.emit({ blend })` and `PropScatter`.
+ */
+const BLENDED: Partial<Record<MatKey, true>> = {
+  plasterCream: true, plasterOchre: true, plasterSage: true, plasterRose: true,
+  plasterBlue: true, plasterGrey: true, plasterInt: true, plasterIntWarm: true,
+  brick: true, brickPale: true, brickSoot: true,
+  stone: true, concrete: true, concreteDark: true,
+  asphalt: true, asphaltWorn: true, pavement: true, cobble: true, setts: true,
+  roofFelt: true,
+};
+
 const D: Record<MatKey, MatDef> = {
   /* ------------------------------------------------------------- masonry */
-  brick: { archetype: 'brick', surface: 'brick', fallback: 0x8a4a38, opts: { scale: 1.9, wear: 0.35 } },
-  brickSoot: { archetype: 'brick', surface: 'brick', fallback: 0x4a3128, opts: { scale: 1.9, tint: 0x6e5c52, saturation: 0.45, wear: 0.85 } },
-  brickPale: { archetype: 'brick', surface: 'brick', fallback: 0xb09a72, opts: { scale: 2.1, tint: 0xd6c199, hue: 0.03, saturation: 0.62, wear: 0.45 } },
+  /* Fired clay, not terracotta plastic: the raw archetype reads far too light
+   * and pink at close range, so it is knocked down and slightly desaturated. */
+  brick: { archetype: 'brick', surface: 'brick', fallback: 0x8a4a38, opts: { scale: 3.2, tint: 0x8f6151, saturation: 0.9, wear: 0.55, blendWith: 'dirt', blendScale: 1.3 } },
+  brickSoot: { archetype: 'brick', surface: 'brick', fallback: 0x4a3128, opts: { scale: 3.2, tint: 0x6e5c52, saturation: 0.45, wear: 0.85, blendWith: 'dirt', blendScale: 1.3 } },
+  brickPale: { archetype: 'brick', surface: 'brick', fallback: 0xb09a72, opts: { scale: 3.4, tint: 0xd6c199, hue: 0.03, saturation: 0.62, wear: 0.5, blendWith: 'dirt', blendScale: 1.3 } },
 
-  plasterCream: { archetype: 'plaster', surface: 'plaster', fallback: 0xcfc0a2, opts: { scale: 2.4, tint: 0xd9c9a6, wear: 0.5 } },
-  plasterOchre: { archetype: 'plaster', surface: 'plaster', fallback: 0xc09a52, opts: { scale: 2.4, tint: 0xcfa259, saturation: 1.15, wear: 0.6 } },
-  plasterSage: { archetype: 'plaster', surface: 'plaster', fallback: 0x93a086, opts: { scale: 2.4, tint: 0x9dab8c, saturation: 0.85, wear: 0.55 } },
-  plasterRose: { archetype: 'plaster', surface: 'plaster', fallback: 0xb98a7c, opts: { scale: 2.4, tint: 0xc59486, saturation: 0.9, wear: 0.6 } },
-  plasterBlue: { archetype: 'plaster', surface: 'plaster', fallback: 0x8ba0ab, opts: { scale: 2.4, tint: 0x96a9b4, saturation: 0.8, wear: 0.55 } },
-  plasterGrey: { archetype: 'plaster', surface: 'plaster', fallback: 0xa5a099, opts: { scale: 2.4, tint: 0xb0aaa0, saturation: 0.5, wear: 0.7 } },
+  /* Facade renders. The blend layer is the masonry behind them: patches of
+   * blown render at the base and around damage, which is what stops a plaster
+   * wall reading as one flat tiled noise field. Warm renders expose brick, cool
+   * renders expose the grey block substrate. */
+  plasterCream: { archetype: 'plaster', surface: 'plaster', fallback: 0xcfc0a2, opts: { scale: 4.2, tint: 0xd6c8a8, wear: 0.5, blendWith: 'brick', blendScale: 0.55 } },
+  plasterOchre: { archetype: 'plaster', surface: 'plaster', fallback: 0xc09a52, opts: { scale: 4.2, tint: 0xcda45e, saturation: 1.12, wear: 0.6, blendWith: 'brick', blendScale: 0.55 } },
+  plasterSage: { archetype: 'plaster', surface: 'plaster', fallback: 0x93a086, opts: { scale: 4.2, tint: 0x9aab8a, saturation: 0.9, wear: 0.55, blendWith: 'concrete', blendScale: 0.7 } },
+  plasterRose: { archetype: 'plaster', surface: 'plaster', fallback: 0xb98a7c, opts: { scale: 4.2, tint: 0xc59486, saturation: 0.95, wear: 0.6, blendWith: 'brick', blendScale: 0.55 } },
+  plasterBlue: { archetype: 'plaster', surface: 'plaster', fallback: 0x8ba0ab, opts: { scale: 4.2, tint: 0x93a7b4, saturation: 0.82, wear: 0.55, blendWith: 'concrete', blendScale: 0.7 } },
+  plasterGrey: { archetype: 'plaster', surface: 'plaster', fallback: 0xa5a099, opts: { scale: 4.2, tint: 0xaea89e, saturation: 0.55, wear: 0.7, blendWith: 'concrete', blendScale: 0.7 } },
   /* Interior renders are darker and cooler: an authored ambient volume, since a
    * single global sky probe would otherwise light inside exactly like outside. */
-  plasterInt: { archetype: 'plaster', surface: 'plaster', fallback: 0x6d7076, opts: { scale: 2.2, tint: 0x76797f, saturation: 0.45, wear: 0.75 } },
-  plasterIntWarm: { archetype: 'plaster', surface: 'plaster', fallback: 0x7d766a, opts: { scale: 2.2, tint: 0x877d6d, saturation: 0.6, wear: 0.8 } },
+  plasterInt: { archetype: 'plaster', surface: 'plaster', fallback: 0x6d7076, opts: { scale: 3.6, tint: 0x686b72, saturation: 0.4, wear: 0.8, blendWith: 'concrete', blendScale: 0.7 } },
+  plasterIntWarm: { archetype: 'plaster', surface: 'plaster', fallback: 0x7d766a, opts: { scale: 3.6, tint: 0x7a7264, saturation: 0.55, wear: 0.85, blendWith: 'brick', blendScale: 0.6 } },
 
-  concrete: { archetype: 'concrete', surface: 'concrete', fallback: 0x8e8b84, opts: { scale: 2.2, wear: 0.4 } },
-  concreteDark: { archetype: 'concrete', surface: 'concrete', fallback: 0x5b5954, opts: { scale: 2.2, tint: 0x7d7a74, saturation: 0.6, wear: 0.8 } },
+  concrete: { archetype: 'concrete', surface: 'concrete', fallback: 0x8e8b84, opts: { scale: 2.6, tint: 0x8d8a82, saturation: 0.85, wear: 0.6, blendWith: 'dirt', blendScale: 1.1 } },
+  concreteDark: { archetype: 'concrete', surface: 'concrete', fallback: 0x5b5954, opts: { scale: 2.6, tint: 0x7d7a74, saturation: 0.6, wear: 0.85, blendWith: 'dirt', blendScale: 1.1 } },
   concreteWet: { archetype: 'concrete', surface: 'concrete', fallback: 0x6a6862, opts: { scale: 2.2, tint: 0x8d8a84, roughness: 0.55, wear: 0.9 } },
-  stone: { archetype: 'stone', surface: 'stone', fallback: 0x8a8880, opts: { scale: 2.4, wear: 0.5 } },
-  stoneTrim: { archetype: 'stone', surface: 'stone', fallback: 0x9d9a90, opts: { scale: 1.4, tint: 0xb5b1a5, wear: 0.35 } },
-  cobble: { archetype: 'stone', surface: 'stone', fallback: 0x6f6d66, opts: { scale: 0.55, tint: 0x55534e, saturation: 0.75, wear: 0.85, pom: false } },
+  stone: { archetype: 'stone', surface: 'stone', fallback: 0x8a8880, opts: { scale: 3.2, tint: 0x8b8779, saturation: 0.9, wear: 0.6, blendWith: 'dirt', blendScale: 1.2 } },
+  stoneTrim: { archetype: 'stone', surface: 'stone', fallback: 0x9d9a90, opts: { scale: 1.4, tint: 0xa39e8f, wear: 0.45 } },
+  cobble: { archetype: 'stone', surface: 'stone', fallback: 0x6f6d66, opts: { scale: 0.55, tint: 0x47443f, saturation: 0.7, wear: 0.95, pom: false, blendWith: 'dirt', blendScale: 3.2 } },
+  /* Dark granite setts: the tram trackbed, laid flush into the square. */
+  setts: { archetype: 'stone', surface: 'stone', fallback: 0x4b4a47, opts: { scale: 0.5, tint: 0x565350, saturation: 0.55, wear: 0.9, pom: false, blendWith: 'dirt', blendScale: 3.0 } },
 
   /* -------------------------------------------------------------- ground */
-  asphalt: { archetype: 'asphalt', surface: 'asphalt', fallback: 0x3b3c3e, opts: { scale: 3.0, wear: 0.6, tint: 0x4a4b4e, saturation: 0.7, pom: false } },
-  asphaltWorn: { archetype: 'asphalt', surface: 'asphalt', fallback: 0x4a4b4c, opts: { scale: 3.0, tint: 0x6a6862, saturation: 0.5, wear: 0.95, pom: false } },
-  pavement: { archetype: 'concrete', surface: 'concrete', fallback: 0x8b8880, opts: { scale: 1.35, tint: 0x69665f, saturation: 0.8, wear: 0.75, pom: false } },
-  kerb: { archetype: 'stone', surface: 'stone', fallback: 0x9b9890, opts: { scale: 1.1, tint: 0x716e68, wear: 0.6, pom: false } },
-  dirt: { archetype: 'dirt', surface: 'dirt', fallback: 0x5f4f3a, opts: { scale: 2.6, tint: 0x7a6a56, pom: false } },
+  asphalt: { archetype: 'asphalt', surface: 'asphalt', fallback: 0x3b3c3e, opts: { scale: 3.0, wear: 0.6, tint: 0x4a4b4e, saturation: 0.7, pom: false, blendWith: 'dirt', blendScale: 0.9 } },
+  asphaltWorn: { archetype: 'asphalt', surface: 'asphalt', fallback: 0x4a4b4c, opts: { scale: 3.0, tint: 0x6a6862, saturation: 0.5, wear: 0.95, pom: false, blendWith: 'dirt', blendScale: 0.9 } },
+  /* Pavement slabs read as *paper* at golden hour if their albedo is anywhere
+   * near neutral concrete: a horizontal plane still takes ~45 % of normal
+   * incidence from a 26° sun, and the exposure is anchored on the facades.
+   * City paving is a dark grey anyway once it has been walked on. */
+  pavement: { archetype: 'concrete', surface: 'concrete', fallback: 0x8b8880, opts: { scale: 1.35, tint: 0x4e4b46, saturation: 0.75, wear: 0.9, pom: false, blendWith: 'dirt', blendScale: 1.6 } },
+  kerb: { archetype: 'stone', surface: 'stone', fallback: 0x9b9890, opts: { scale: 1.1, tint: 0x67645e, wear: 0.65, pom: false } },
+  /* The blend layer under every ground surface. Kept a shade darker and less
+   * yellow than it wants to be: silt in a European town square is grey-brown,
+   * and at golden hour a warm mid-tone flares out to pale sand. */
+  dirt: { archetype: 'dirt', surface: 'dirt', fallback: 0x5f4f3a, opts: { scale: 2.6, tint: 0x635546, saturation: 0.85, wear: 0.5, pom: false } },
+  /* Blast scorch: burnt tarmac, near-black and matte, radiating from craters. */
+  scorch: { archetype: 'asphalt', surface: 'asphalt', fallback: 0x201d1b, opts: { scale: 3.4, tint: 0x2a2624, saturation: 0.35, wear: 1.0, roughness: 1.0, pom: false } },
   gravel: { archetype: 'gravel', surface: 'gravel', fallback: 0x7a7770, opts: { scale: 1.6, tint: 0x77746d, pom: false } },
   grass: { archetype: 'grass', surface: 'grass', fallback: 0x60653a, opts: { scale: 2.0, saturation: 0.75, pom: false } },
   puddle: { archetype: 'puddle', surface: 'puddle', fallback: 0x232628, opts: { scale: 2.4 } },
 
   /* --------------------------------------------------------------- roofs */
   roofTile: { archetype: 'tile', surface: 'tile', fallback: 0x9a5236, opts: { scale: 0.9, tint: 0xa4593a, saturation: 1.1, wear: 0.7 } },
-  roofFelt: { archetype: 'asphalt', surface: 'asphalt', fallback: 0x2e2f31, opts: { scale: 1.8, tint: 0x6a6a6c, saturation: 0.4, wear: 0.8 } },
+  /* Built-up felt roofing is never one surface: it is laid in overlapping bays,
+   * ballasted with grit where the wind lifts it and ponded where it has sagged.
+   * The blend layer carries the ballast. */
+  roofFelt: { archetype: 'asphalt', surface: 'asphalt', fallback: 0x2e2f31, opts: { scale: 1.8, tint: 0x5c5c5e, saturation: 0.4, wear: 0.9, blendWith: 'gravel', blendScale: 1.0 } },
 
   /* -------------------------------------------------------------- timber */
   wood: { archetype: 'wood', surface: 'wood', fallback: 0x9c968a, opts: { scale: 1.4, wear: 0.5 } },
@@ -131,10 +174,15 @@ const D: Record<MatKey, MatDef> = {
   ember: { archetype: 'metal', surface: 'metal', fallback: 0x903018, opts: { scale: 1.0, tint: 0x6a3020, emissive: 0xff5a18, emissiveIntensity: 1.5 } },
   signGlow: { archetype: 'plastic', surface: 'plastic', fallback: 0xd8ecff, opts: { scale: 0.5, tint: 0xcfe4ff, emissive: 0x63c4ff, emissiveIntensity: 1.4 } },
 
-  /* ----------------------------------------------------------- backdrop */
+  /* ----------------------------------------------------------- backdrop
+   * Three ridge bands, each a step further into the haze. Aerial perspective is
+   * a *value and saturation* ramp before it is a fog density: the near ridge
+   * still has some of its own local colour, the far one is almost pure sky. */
   backdropFar: { archetype: '', surface: 'concrete', fallback: 0x4c5464, flat: { roughness: 1.0, metalness: 0 } },
   backdropMid: { archetype: '', surface: 'concrete', fallback: 0x565b5e, flat: { roughness: 1.0, metalness: 0 } },
-  ridge: { archetype: '', surface: 'stone', fallback: 0x3d4653, flat: { roughness: 1.0, metalness: 0 } },
+  ridgeNear: { archetype: '', surface: 'stone', fallback: 0x232a33, flat: { roughness: 1.0, metalness: 0 } },
+  ridgeMid: { archetype: '', surface: 'stone', fallback: 0x36404e, flat: { roughness: 1.0, metalness: 0 } },
+  ridge: { archetype: '', surface: 'stone', fallback: 0x4b5769, flat: { roughness: 1.0, metalness: 0 } },
 };
 
 export class MatCatalog {
@@ -176,6 +224,13 @@ export class MatCatalog {
   }
 
   surface(key: MatKey): SurfaceType { return D[key].surface; }
+
+  /**
+   * True when this key carries a vertex-blended second layer. Callers that emit
+   * geometry with such a key *must* write a colour attribute, otherwise the
+   * blend mask reads as undefined.
+   */
+  blends(key: MatKey): boolean { return BLENDED[key] === true; }
 
   isTransparent(key: MatKey): boolean {
     return key === 'glass' || key === 'glassDirty';

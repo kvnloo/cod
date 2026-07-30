@@ -173,24 +173,55 @@ export function weaponGlyphHeight(width: number): number {
 /* ------------------------------------------------------ headshot / kill --- */
 
 /** Small skull-ish "headshot" mark used in the killfeed. */
+/**
+ * Headshot skull.
+ *
+ * Two details do the work at killfeed size (~14 px tall): the eye sockets are
+ * *painted dark* rather than punched out with `destination-out` — erasing also
+ * removed the row plate under them, which left two light holes that read as a
+ * smiley — and the cranium/jaw silhouette is stepped so the outline alone says
+ * "skull" before any interior detail resolves.
+ */
 export function headshotGlyph(c: Ctx, x: number, y: number, r: number, color: string): void {
+  const cranium = (): void => {
+    c.beginPath();
+    c.moveTo(x - r * 0.78, y + r * 0.1);
+    c.lineTo(x - r * 0.78, y - r * 0.28);
+    c.quadraticCurveTo(x - r * 0.78, y - r * 0.98, x, y - r * 0.98);
+    c.quadraticCurveTo(x + r * 0.78, y - r * 0.98, x + r * 0.78, y - r * 0.28);
+    c.lineTo(x + r * 0.78, y + r * 0.1);
+    c.lineTo(x + r * 0.42, y + r * 0.28);
+    c.lineTo(x + r * 0.42, y + r * 0.72);
+    c.lineTo(x - r * 0.42, y + r * 0.72);
+    c.lineTo(x - r * 0.42, y + r * 0.28);
+    c.closePath();
+  };
+
   c.save();
+  // Dark keyline first so the skull holds up against a bright sky.
+  c.strokeStyle = 'rgba(1,3,7,0.85)';
+  c.lineWidth = Math.max(1.4, r * 0.34);
+  c.lineJoin = 'round';
+  cranium();
+  c.stroke();
+
   c.fillStyle = color;
+  cranium();
+  c.fill();
+
+  // Sockets, nose and jaw line, painted in the house near-black.
+  c.fillStyle = 'rgba(4,7,12,0.94)';
   c.beginPath();
-  c.arc(x, y - r * 0.15, r * 0.72, Math.PI, 0);
-  c.lineTo(x + r * 0.72, y + r * 0.28);
-  c.lineTo(x + r * 0.34, y + r * 0.28);
-  c.lineTo(x + r * 0.34, y + r * 0.62);
-  c.lineTo(x - r * 0.34, y + r * 0.62);
-  c.lineTo(x - r * 0.34, y + r * 0.28);
-  c.lineTo(x - r * 0.72, y + r * 0.28);
+  c.ellipse(x - r * 0.34, y - r * 0.3, r * 0.24, r * 0.28, 0, 0, Math.PI * 2);
+  c.ellipse(x + r * 0.34, y - r * 0.3, r * 0.24, r * 0.28, 0, 0, Math.PI * 2);
+  c.fill();
+  c.beginPath();
+  c.moveTo(x, y - r * 0.06);
+  c.lineTo(x + r * 0.15, y + r * 0.16);
+  c.lineTo(x - r * 0.15, y + r * 0.16);
   c.closePath();
   c.fill();
-  c.globalCompositeOperation = 'destination-out';
-  c.beginPath();
-  c.arc(x - r * 0.32, y - r * 0.14, r * 0.2, 0, Math.PI * 2);
-  c.arc(x + r * 0.32, y - r * 0.14, r * 0.2, 0, Math.PI * 2);
-  c.fill();
+  c.fillRect(x - r * 0.42, y + r * 0.4, r * 0.84, Math.max(1, r * 0.13));
   c.restore();
 }
 

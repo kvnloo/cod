@@ -69,13 +69,63 @@ export class SettingsMenu extends Screen {
     bus.on('quality:changed', () => this.refreshAll());
   }
 
+  /** Right-hand aside: what the current graphics profile actually resolves to. */
+  private readonly profileNode = el('div', {});
+
   private refreshAll(): void {
     for (const c of this.controls) c.refresh();
+    this.renderProfile();
+  }
+
+  private renderProfile(): void {
+    const host = this.profileNode;
+    while (host.firstChild) host.removeChild(host.firstChild);
+    const g = settings.gfx;
+    const onOff = (v: boolean): string => (v ? 'ON' : 'OFF');
+
+    host.appendChild(el('div', {
+      class: 'ob-result',
+      style: { fontSize: 'calc(var(--ob-u)*40)', letterSpacing: '.16em' },
+      text: settings.preset.toUpperCase(),
+    }));
+    host.appendChild(el('div', {
+      class: 'ob-result-sub', text: 'Resolved graphics profile',
+    }));
+    host.appendChild(el('div', { class: 'ob-sb-bar' }));
+
+    const rows: Array<[string, string]> = [
+      ['Render Scale', `${Math.round(g.renderScale * 100)}%`],
+      ['Temporal AA', g.taa ? `${g.taaSamples} samples` : 'OFF'],
+      ['Shadows', g.shadows ? `${g.shadowCascades} × ${g.shadowMapSize}` : 'OFF'],
+      ['Contact Shadows', onOff(g.contactShadows)],
+      ['Ambient Occlusion', onOff(g.ssao)],
+      ['Reflections', g.ssr ? `${g.ssrSteps} steps` : 'OFF'],
+      ['Volumetrics', g.volumetrics ? `${g.volumetricSteps} steps` : 'OFF'],
+      ['Bloom', onOff(g.bloom)],
+      ['Motion Blur', onOff(g.motionBlur)],
+      ['Draw Distance', `${Math.round(g.drawDistance)} m`],
+    ];
+    for (const [name, value] of rows) {
+      host.appendChild(el('div', { class: 'ob-break' },
+        el('div', { class: 'ob-break-name', text: name }),
+        el('div', { class: 'ob-break-count', text: '' }),
+        el('div', { class: 'ob-break-pts', style: { fontSize: 'calc(var(--ob-u)*13)' }, text: value }),
+      ));
+    }
+    host.appendChild(el('div', {
+      class: 'ob-row-help',
+      style: { marginTop: 'calc(var(--ob-u)*14)' },
+      text: 'Changing any control below moves the profile to CUSTOM. '
+        + 'Presets are tuned so LOW holds 60 fps on integrated graphics.',
+    }));
   }
 
   protected build(): void {
     const parts = menuFrame(this, 'SETTINGS', 'System Configuration', 'cols-2');
-    parts.body.style.gridTemplateColumns = 'minmax(0,1fr)';
+    // The control rows cap out around 1180 design px; on a 16:9 screen that
+    // leaves a third of the panel empty. An active-profile aside fills it with
+    // something useful instead of void.
+    parts.body.style.gridTemplateColumns = 'minmax(0,1fr) calc(var(--ob-u)*312)';
 
     const tabs = el('div', { class: 'ob-tabs' });
     for (const t of TABS) {
@@ -110,6 +160,14 @@ export class SettingsMenu extends Screen {
 
     parts.body.appendChild(stagger(host, 0));
     host.classList.add('ob-stagger');
+
+    const aside = el('div', { class: 'ob-panel ob-stagger' },
+      el('div', { class: 'ob-panel-title' }, el('span', { text: 'Active Profile' })),
+      this.profileNode,
+    );
+    stagger(aside, 1);
+    parts.body.appendChild(aside);
+    this.renderProfile();
 
     parts.footerLeft.append(
       keyHint('ESC', 'Back'),

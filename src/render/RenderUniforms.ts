@@ -53,6 +53,9 @@ export class RenderUniforms {
   /** x base height, y max opacity, z inscatter boost, w weather grey */
   readonly boFogParams2 = { value: v4(0, 0.96, 1, 0) };
   readonly boFogTint = { value: new THREE.Color(0.7, 0.72, 0.76) };
+  /** Mirror of `boSunColor` for `GLSL_AERIAL`, which must not declare the sun
+   *  uniforms itself — see the note on `GLSL_SUN`. */
+  readonly boFogSun = { value: new THREE.Color(1, 1, 1) };
 
   /* --- reprojection ----------------------------------------------------- */
   readonly boPrevViewProjection = { value: m4() };
@@ -83,6 +86,7 @@ export class RenderUniforms {
       boFogParams: this.boFogParams,
       boFogParams2: this.boFogParams2,
       boFogTint: this.boFogTint,
+      boFogSun: this.boFogSun,
       boPrevViewProjection: this.boPrevViewProjection,
       boViewProjectionNoJitter: this.boViewProjectionNoJitter,
       boResolution: this.boResolution,

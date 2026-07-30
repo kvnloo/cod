@@ -126,7 +126,7 @@ export class MainMenu extends Screen {
 
     const feed = el('div', { class: 'ob-panel ob-stagger' },
       el('div', { class: 'ob-panel-title' }, el('span', { text: 'Recent Activity' })),
-      el('div', { class: 'ob-scroll', style: { maxHeight: 'calc(var(--ob-u)*230)' } },
+      el('div', { class: 'ob-scroll', style: { maxHeight: 'calc(var(--ob-u)*196)' } },
         ...this.activity().map((line, i) => el('div', {
           style: {
             display: 'flex', justifyContent: 'space-between',
@@ -144,12 +144,49 @@ export class MainMenu extends Screen {
     );
     stagger(feed, 2);
 
+    // Without this third panel the right column stops around a third of the way
+    // down and the rest of a 16:9 screen is empty scrim — the layout tell that
+    // separates a mock-up from a shipped front end.
+    const challenges = el('div', { class: 'ob-panel ob-stagger' },
+      el('div', { class: 'ob-panel-title' },
+        el('span', { text: 'Active Challenges' }),
+        el('span', { text: 'SEASON 01 · WEEK 4' }),
+      ),
+      ...this.challenges().map(([name, detail, value, goal]) => {
+        const track = el('div', { class: 'ob-stat-track' });
+        const fill = el('div', { class: 'ob-stat-fill' });
+        fill.style.width = `${Math.round((value / goal) * 100)}%`;
+        track.appendChild(fill);
+        // The shared `.ob-stat` template pins its first column at 104 design px,
+        // which wraps a full challenge description into four one-word lines.
+        return el('div', {
+          class: 'ob-stat',
+          style: {
+            padding: 'calc(var(--ob-u)*8) 0',
+            gridTemplateColumns: 'minmax(0,1.15fr) minmax(0,1fr) calc(var(--ob-u)*56)',
+          },
+        },
+          el('div', { style: { minWidth: '0' } },
+            el('div', { class: 'ob-row-name', style: { fontSize: 'calc(var(--ob-u)*14)' }, text: name }),
+            el('div', {
+              class: 'ob-row-help',
+              style: { whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+              text: detail,
+            }),
+          ),
+          track,
+          el('div', { class: 'ob-stat-val', text: `${value}/${goal}` }),
+        );
+      }),
+    );
+    stagger(challenges, 3);
+
     const right = el('div', {
       style: {
-        display: 'grid', gridTemplateRows: 'auto auto 1fr',
+        display: 'grid', gridTemplateRows: 'auto auto minmax(0,1fr)',
         gap: 'calc(var(--ob-u)*20)', minHeight: '0',
       },
-    }, brief, feed, el('div'));
+    }, brief, feed, challenges);
 
     parts.body.append(left, right);
 
@@ -158,6 +195,16 @@ export class MainMenu extends Screen {
       keyHint('ENTER', 'Select'),
       keyHint('ESC', 'Back'),
     );
+  }
+
+  /** Deterministic weekly challenge set. */
+  private challenges(): Array<[string, string, number, number]> {
+    return [
+      ['Precision', 'Headshot eliminations with an assault rifle', 34, 50],
+      ['Hold the Line', 'Objective defends across any mode', 12, 25],
+      ['Quartermaster', 'Killstreaks earned in a single match', 3, 5],
+      ['Long Watch', 'Eliminations beyond 60 metres', 41, 75],
+    ];
   }
 
   /** Deterministic filler so the panel is never empty and never uses Math.random. */

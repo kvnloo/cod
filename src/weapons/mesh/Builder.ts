@@ -20,7 +20,7 @@
 import * as THREE from 'three';
 import type { MaterialKey } from '../types';
 import type { MaterialSpace, WeaponMaterials } from '../WeaponMaterials';
-import { merge, projectUV, triangleCount } from './Geo';
+import { bakeWear, merge, projectUV, triangleCount } from './Geo';
 import { WEAPON_TEXEL_SCALE } from '../WeaponMaterials';
 
 interface PartSpec {
@@ -29,6 +29,21 @@ interface PartSpec {
   /** Pivot in weapon-local space. */
   pivot: THREE.Vector3;
   geos: Map<MaterialKey, THREE.BufferGeometry[]>;
+}
+
+/** A collimated optic reticle the view model steers every frame. */
+export interface RigReticle {
+  mesh: THREE.Mesh;
+  /** Parent node the reticle lives under (usually `optic`). */
+  parent: string;
+  /** Z of the reticle plane in that node's local space. */
+  planeZ: number;
+  /** Height of the optical axis in that node's local space. */
+  axisY: number;
+  /** Radius of the window the dot may travel inside, metres. */
+  window: number;
+  /** Half-angle the quad subtends from the eye, radians. */
+  halfAngle: number;
 }
 
 export interface WeaponRig {
@@ -44,6 +59,8 @@ export interface WeaponRig {
   point(name: string): THREE.Vector3 | null;
   /** Rest transform of every node, for animation to blend back to. */
   rest: Map<string, THREE.Vector3>;
+  /** Illuminated optic reticle, if the fitted sight has one. */
+  reticle: RigReticle | null;
   dispose(): void;
 }
 
@@ -59,6 +76,7 @@ export class RigBuilder {
   private byName = new Map<string, PartSpec>();
   private current: PartSpec;
   private points = new Map<string, THREE.Vector3>();
+  private reticleSpec: RigReticle | null = null;
 
   constructor(private mats: WeaponMaterials, private space: MaterialSpace = 'view') {
     this.current = this.declare('root', null, [0, 0, 0]);
@@ -110,6 +128,22 @@ export class RigBuilder {
     return this;
   }
 
+  /**
+   * Declares the illuminated reticle for whichever optic was fitted. The
+   * placement is given in weapon-local space and rebased onto the owning part
+   * exactly like geometry, so the view model can steer it in one clean frame.
+   */
+  reticle(
+    mesh: THREE.Mesh,
+    opts: { parent?: string; z: number; axisY: number; window: number; halfAngle: number },
+  ): this {
+    this.reticleSpec = {
+      mesh, parent: opts.parent ?? 'optic', planeZ: opts.z, axisY: opts.axisY,
+      window: opts.window, halfAngle: opts.halfAngle,
+    };
+    return this;
+  }
+
   hasPart(name: string): boolean { return this.byName.has(name); }
 
   build(name: string): WeaponRig {
@@ -147,6 +181,7 @@ export class RigBuilder {
             const gi = merge([list[i]]);
             gi.translate(-spec.pivot.x, -spec.pivot.y, -spec.pivot.z);
             projectUV(gi, WEAPON_TEXEL_SCALE);
+            bakeWear(gi);
             gi.computeBoundingSphere();
             const mi = new THREE.Mesh(gi, this.mats.get(key, this.space));
             mi.name = `${spec.name}:${key}:${i}`;
@@ -161,6 +196,7 @@ export class RigBuilder {
         const g = merge(list);
         g.translate(-spec.pivot.x, -spec.pivot.y, -spec.pivot.z);
         projectUV(g, WEAPON_TEXEL_SCALE);
+        bakeWear(g);
         g.computeBoundingSphere();
         const mesh = new THREE.Mesh(g, this.mats.get(key, this.space));
         mesh.name = `${spec.name}:${key}`;
@@ -182,6 +218,22 @@ export class RigBuilder {
       parent.add(node);
     }
 
+    // Reticle: rebase onto its owning part, exactly like geometry.
+    const reticle = this.reticleSpec;
+    if (reticle) {
+      const host = nodes.get(reticle.parent) ?? root;
+      const pivot = this.byName.get(reticle.parent)?.pivot ?? new THREE.Vector3();
+      reticle.planeZ -= pivot.z;
+      reticle.axisY -= pivot.y;
+      reticle.mesh.position.set(0, reticle.axisY, reticle.planeZ);
+      // Off until the view model collimates it. A reflex dot only exists for an
+      // eye on the optical axis; leaving it live would paint a two-metre
+      // additive quad across any catalogue or third-person shot of the weapon.
+      reticle.mesh.scale.setScalar(1e-4);
+      reticle.mesh.visible = false;
+      host.add(reticle.mesh);
+    }
+
     const points = this.points;
     const rig: WeaponRig = {
       root, nodes, points, meshes, triangles,
@@ -189,9 +241,15 @@ export class RigBuilder {
       node: (n) => nodes.get(n) ?? null,
       point: (n) => points.get(n) ?? null,
       rest,
+      reticle,
       dispose: () => {
         for (const m of meshes) m.geometry.dispose();
         meshes.length = 0;
+        if (rig.reticle) {
+          rig.reticle.mesh.geometry.dispose();
+          (rig.reticle.mesh.material as THREE.Material).dispose();
+          rig.reticle = null;
+        }
         root.clear();
       },
     };

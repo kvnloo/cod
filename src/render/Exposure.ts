@@ -159,6 +159,13 @@ export interface ExposureSettings {
   speedDown: number;
   minEV: number;
   maxEV: number;
+  /**
+   * Partial adaptation below EV100 0. 1 = the meter compensates a dark scene
+   * completely (night looks like noon); 0 = it does not compensate at all
+   * (night is unplayable). Anything in between keeps the *relationship* between
+   * times of day while making all of them legible.
+   */
+  darkAdapt: number;
 }
 
 export class ExposureSystem {
@@ -179,11 +186,14 @@ export class ExposureSystem {
     manual: 1,
     speedUp: 3.6,
     speedDown: 1.6,
-    // The floor is what keeps night looking like night: the eye does not fully
-    // adapt in a few seconds, and a game that brightens moonlight to daylight
-    // reads as broken. −1 EV caps the gain at roughly 2 stops over mid-grey.
-    minEV: 0.0,
+    // A *hard* luminance floor is the wrong tool for "night looks like night":
+    // at minEV 0 the meter refused to consider anything below 0.125, which
+    // capped exposure at ~3.4 and rendered golden hour two stops under and
+    // midnight as a black frame. The floor is now only a safety rail; the
+    // relationship between times of day comes from `darkAdapt`.
+    minEV: -8,
     maxEV: 16,
+    darkAdapt: 0.70,
   };
 
   private renderer!: THREE.WebGLRenderer;
@@ -391,10 +401,14 @@ export class ExposureSystem {
 
     // Standard saturation-based metering: EV100 = log2(L * 100 / K), K = 12.5.
     const lum = Math.max(this.averageLuminance, 1e-6);
-    const minLum = Math.pow(2, s.minEV) * 12.5 / 100;
-    const maxLum = Math.pow(2, s.maxEV) * 12.5 / 100;
-    const clamped = THREE.MathUtils.clamp(lum, minLum, maxLum);
-    this.exposure = (s.key / clamped) * Math.pow(2, s.compensation) * s.manual;
+    let ev = Math.log2((lum * 100) / 12.5);
+    // Below EV100 0 the meter only partially opens up, so dusk reads warmer and
+    // a stop under noon, and night reads as night — rather than every hour of
+    // the day metering to the same grey.
+    if (ev < 0) ev *= s.darkAdapt;
+    ev = THREE.MathUtils.clamp(ev, s.minEV, s.maxEV);
+    const effective = Math.pow(2, ev) * 12.5 / 100;
+    this.exposure = (s.key / effective) * Math.pow(2, s.compensation) * s.manual;
   }
 
   reset(): void {

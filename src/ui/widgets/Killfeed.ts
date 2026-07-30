@@ -159,18 +159,27 @@ export class Killfeed implements Widget {
       const victimW = measureText(c, r.victim, nameOpts);
       const glyphW = 30 * s;
       const gap = 9 * s;
-      const hsW = r.headshot ? 15 * s : 0;
+      const hsW = r.headshot ? 18 * s : 0;
       const killerW = measureText(c, r.killer, nameOpts);
       const totalW = killerW + gap + glyphW + hsW + gap + victimW;
       const left = right - totalW;
 
+      // Every row gets a plate that fades out to the left. Against the sunlit
+      // upper half of a golden-hour frame the feed was relying entirely on glyph
+      // outlines; a shipped feed always has some value behind it.
+      const bg = c.createLinearGradient(left - 16 * s, 0, right + 4 * s, 0);
+      bg.addColorStop(0, 'rgba(3,6,11,0)');
+      bg.addColorStop(1, 'rgba(3,6,11,0.46)');
+      c.fillStyle = bg;
+      c.fillRect(left - 16 * s, y - rowH * 0.74, totalW + 20 * s, rowH * 0.94);
+
       if (highlight) {
         const g = c.createLinearGradient(left - 10 * s, 0, right + 4 * s, 0);
         g.addColorStop(0, rgba(r.killerIsPlayer ? p.accent : p.hostile, 0));
-        g.addColorStop(1, rgba(r.killerIsPlayer ? p.accent : p.hostile, 0.16));
+        g.addColorStop(1, rgba(r.killerIsPlayer ? p.accent : p.hostile, 0.2));
         c.fillStyle = g;
         c.fillRect(left - 10 * s, y - rowH * 0.72, totalW + 14 * s, rowH * 0.9);
-        c.fillStyle = rgba(r.killerIsPlayer ? p.accent : p.hostile, 0.8);
+        c.fillStyle = rgba(r.killerIsPlayer ? p.accent : p.hostile, 0.85);
         c.fillRect(right + 2 * s, y - rowH * 0.72, 2 * s, rowH * 0.9);
       }
 
@@ -187,7 +196,7 @@ export class Killfeed implements Widget {
       weaponGlyph(c, r.weapon, gx, y - nameSize * 0.32, glyphW, rgba(lift(p.ink, 0.15), 0.95));
 
       if (r.headshot) {
-        headshotGlyph(c, gx + glyphW / 2 + hsW * 0.45, y - nameSize * 0.32, 6.2 * s, rgba(p.accent, 1));
+        headshotGlyph(c, gx + glyphW / 2 + hsW * 0.5, y - nameSize * 0.34, 7.4 * s, rgba(p.accent, 1));
       }
 
       text(c, r.victim, right, y, {

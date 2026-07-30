@@ -172,6 +172,40 @@ export class LoadoutMenu extends Screen {
     );
     stagger(leftPanel, 0);
 
+    // A class is more than its primary. Listing the rest of the kit fills the
+    // column under the six-weapon list and makes the screen read as one loadout
+    // rather than a weapon picker.
+    const kit: Array<[string, string]> = [
+      ['Secondary', 'SIDEWINDER · SIDEARM'],
+      ['Lethal', 'FRAG × 1'],
+      ['Tactical', 'FLASH × 2'],
+      ['Field Upgrade', 'TROPHY SYSTEM'],
+      ['Perk 1', 'DOUBLE TIME'],
+      ['Perk 2', 'HARDLINE'],
+      ['Perk 3', 'GHOST'],
+      ['Streaks', 'UAV · CUAV · CLUSTER'],
+    ];
+    const kitPanel = el('div', { class: 'ob-panel ob-stagger', style: { marginTop: 'calc(var(--ob-u)*16)' } },
+      el('div', { class: 'ob-panel-title' },
+        el('span', { text: 'Class' }),
+        el('span', { text: 'ALPHA · 01' }),
+      ),
+      ...kit.map(([slot, value]) => el('div', { class: 'ob-break' },
+        el('div', { class: 'ob-weapon-class', text: slot.toUpperCase() }),
+        el('div', { class: 'ob-break-count', text: '' }),
+        el('div', {
+          class: 'ob-weapon-name',
+          style: { fontSize: 'calc(var(--ob-u)*13)', textAlign: 'right' },
+          text: value,
+        }),
+      )),
+    );
+    stagger(kitPanel, 1);
+
+    const leftColumn = el('div', {
+      style: { display: 'grid', gridTemplateRows: 'minmax(0,1fr) auto', minHeight: '0' },
+    }, leftPanel, kitPanel);
+
     /* ------------------------------------------------------ detail --- */
     const canvas = el('canvas', { class: 'ob-schematic' });
     this.canvas = canvas;
@@ -204,9 +238,9 @@ export class LoadoutMenu extends Screen {
       }, info, stats),
       atts,
     );
-    stagger(rightPanel, 1);
+    stagger(rightPanel, 2);
 
-    parts.body.append(leftPanel, rightPanel);
+    parts.body.append(leftColumn, rightPanel);
 
     parts.footerLeft.append(
       keyHint('↑↓', 'Select Weapon'),

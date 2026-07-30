@@ -144,7 +144,7 @@ export class Impacts {
       r: tint[0] * 1.25, g: tint[1] * 1.22, b: tint[2] * 1.18,
       drag: 3.4, gravity: -0.03, turbulence: 0.5,
     });
-    g.pushMany(6 + Math.round(3 * detail), (d, i) => {
+    g.pushMany(9 + Math.round(6 * detail), (d, i) => {
       const s = 0.35 + rand.next() * 0.75;
       tmp.copy(nrm).multiplyScalar(1.1 + rand.next() * 1.6)
         .addScaledVector(tan, rand.signed() * 1.5)
@@ -153,12 +153,12 @@ export class Impacts {
       d.py = p.y + nrm.y * 0.12 + tmp.y * 0.05;
       d.pz = p.z + nrm.z * 0.12 + tmp.z * 0.05;
       d.vx = tmp.x * s; d.vy = tmp.y * s + 0.25; d.vz = tmp.z * s;
-      d.sizeBegin = (0.10 + rand.next() * 0.07) * dustMul;
-      d.sizeEnd = (0.55 + rand.next() * 0.55) * dustMul * (0.7 + power * 0.5);
+      d.sizeBegin = (0.07 + rand.next() * 0.05) * dustMul;
+      d.sizeEnd = (0.30 + rand.next() * 0.34) * dustMul * (0.7 + power * 0.5);
       d.lifetime = 0.7 + rand.next() * 0.8;
       d.rot = rand.range(0, 6.28);
       d.spin = rand.signed() * 1.2;
-      d.opacity = 0.42 + rand.next() * 0.28;
+      d.opacity = 0.34 + rand.next() * 0.24;
       void i;
     });
 
@@ -177,8 +177,8 @@ export class Impacts {
       d.py = p.y + nrm.y * 0.22 + tmp.y * 0.10;
       d.pz = p.z + nrm.z * 0.22 + tmp.z * 0.10;
       d.vx = tmp.x * 0.5; d.vy = tmp.y * 0.5 + 0.35; d.vz = tmp.z * 0.5;
-      d.sizeBegin = 0.16 * dustMul;
-      d.sizeEnd = (1.15 + rand.next() * 0.9) * dustMul;
+      d.sizeBegin = 0.12 * dustMul;
+      d.sizeEnd = (0.70 + rand.next() * 0.62) * dustMul;
       d.lifetime = 1.6 + rand.next() * 1.6;
       d.rot = rand.range(0, 6.28);
       d.spin = rand.signed() * 0.4;
@@ -192,7 +192,7 @@ export class Impacts {
       r: tint[0] * 0.85, g: tint[1] * 0.83, b: tint[2] * 0.8,
       drag: 0.28, gravity: 1, bounce: 0.22, floorY, opacity: 1,
     });
-    g.pushMany((5 + Math.round(6 * detail)) * debrisMul, () => {
+    g.pushMany((7 + Math.round(9 * detail)) * debrisMul, () => {
       const d = w.particles.desc;
       const s = 2.2 + rand.next() * 5.5 * power;
       tmp.copy(nrm).multiplyScalar(0.7 + rand.next() * 0.8)
@@ -202,7 +202,7 @@ export class Impacts {
       tmp.normalize();
       d.px = p.x + nrm.x * 0.02; d.py = p.y + nrm.y * 0.02; d.pz = p.z + nrm.z * 0.02;
       d.vx = tmp.x * s; d.vy = tmp.y * s + 1.0; d.vz = tmp.z * s;
-      const sz = 0.022 + rand.next() * 0.045 * power;
+      const sz = 0.028 + rand.next() * 0.055 * power;
       d.sizeBegin = sz; d.sizeEnd = sz;
       d.lifetime = 1.1 + rand.next() * 1.4;
       d.rot = rand.range(0, 6.28);
@@ -225,9 +225,9 @@ export class Impacts {
       cell: CELL.SPARK_DOT, frames: 1, model: MODEL.HOT,
       flags: FLAG.ADD | FLAG.STRETCH | FLAG.COLLIDE | FLAG.HOTRAMP | FLAG.FLICKER | FLAG.NOSOFT,
       r: 1.0, g: 0.74, b: 0.38, opacity: 1,
-      drag: 0.85, gravity: 1.05, bounce: 0.42, floorY, emissive: 0.28,
+      drag: 0.72, gravity: 1.05, bounce: 0.45, floorY, emissive: 0.75,
     });
-    g.pushMany((26 + Math.round(26 * detail)) * sparkMul, () => {
+    g.pushMany((30 + Math.round(30 * detail)) * sparkMul, () => {
       const d = g.desc;
       const s = 2.2 + rand.next() * 12 * power;
       // A wide fan, not a beam: real spatter leaves the steel across most of
@@ -239,13 +239,14 @@ export class Impacts {
         .normalize();
       d.px = p.x + nrm.x * 0.015; d.py = p.y + nrm.y * 0.015; d.pz = p.z + nrm.z * 0.015;
       d.vx = tmp.x * s; d.vy = tmp.y * s + 0.6; d.vz = tmp.z * s;
-      d.sizeBegin = 0.013 + rand.next() * 0.014;
-      d.sizeEnd = 0.004;
-      d.lifetime = 0.30 + rand.next() * 0.95;
+      d.sizeBegin = 0.019 + rand.next() * 0.021;
+      d.sizeEnd = 0.005;
+      // Long enough to arc, hit the deck and skip once before they go out.
+      d.lifetime = 0.45 + rand.next() * 1.15;
     });
 
     // --- the brightest few get a real swept ribbon
-    const trails = Math.round(clamp(3 * detail, 1, 6));
+    const trails = Math.round(clamp(5 * detail, 2, 9));
     for (let i = 0; i < trails; i++) {
       const s = 6 + rand.next() * 10 * power;
       tmp.copy(ref).multiplyScalar(0.8 + rand.next() * 0.6)
@@ -255,10 +256,10 @@ export class Impacts {
       w.ribbons.begin({
         px: p.x + nrm.x * 0.02, py: p.y + nrm.y * 0.02, pz: p.z + nrm.z * 0.02,
         vx: tmp.x * s, vy: tmp.y * s + 1.2, vz: tmp.z * s,
-        life: 0.35 + rand.next() * 0.35,
-        width: 0.012 + rand.next() * 0.010,
-        r: 1.0, g: 0.55, b: 0.18, intensity: 3.2,
-        drag: 0.6, gravity: 1.0, floorY, bounce: 0.4,
+        life: 0.45 + rand.next() * 0.45,
+        width: 0.018 + rand.next() * 0.014,
+        r: 1.0, g: 0.55, b: 0.18, intensity: 4.2,
+        drag: 0.55, gravity: 1.0, floorY, bounce: 0.45,
         sampleInterval: 1 / 90,
       });
       w.ribbons.push();
@@ -281,7 +282,7 @@ export class Impacts {
       w.ribbons.begin({
         px: p.x, py: p.y, pz: p.z,
         vx: tmp.x * s, vy: tmp.y * s + 1.5, vz: tmp.z * s,
-        life: 0.85, width: 0.016, r: 1.0, g: 0.60, b: 0.22, intensity: 3.6,
+        life: 1.05, width: 0.022, r: 1.0, g: 0.60, b: 0.22, intensity: 4.6,
         drag: 0.35, gravity: 0.9, floorY, bounce: 0.45, sampleInterval: 1 / 80,
       });
       w.ribbons.push();

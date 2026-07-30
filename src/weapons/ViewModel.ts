@@ -28,6 +28,7 @@ import type { AttachmentDef, WeaponDef } from './types';
 import type { ResolvedStats } from './Attachments';
 import type { WeaponRig } from './mesh/Builder';
 import { buildWeaponMesh } from './mesh/Models';
+import { setReticleFade } from './mesh/Reticle';
 import type { WeaponMaterials } from './WeaponMaterials';
 import { DEG, Spring1, Spring3, approach, clamp01, curve, curveLinear, fbm1, ring } from './Anim';
 
@@ -134,6 +135,8 @@ export class ViewModel {
   private readonly _e = new THREE.Euler(0, 0, 0, 'XYZ');
   private readonly _add = new THREE.Vector3();
   private readonly _addRot = new THREE.Vector3();
+  private readonly _eye = new THREE.Vector3();
+  private readonly _inv = new THREE.Matrix4();
 
   constructor(private mats: WeaponMaterials) {
     this.root.name = 'viewmodel';
@@ -408,6 +411,49 @@ export class ViewModel {
 
     this.root.position.copy(this._p);
     this.root.quaternion.copy(this._q);
+
+    this.updateReticle();
+  }
+
+  /**
+   * Collimates the optic's reticle.
+   *
+   * A reflex sight projects its dot to infinity: the ray from the eye through
+   * the dot is always parallel to the optical axis, whatever the eye is doing.
+   * The view model is authored in view space with the eye at the origin, so
+   * "the eye's position expressed in optic space" *is* the lateral offset the
+   * dot needs — two lines, and the sight then behaves exactly like the real
+   * thing: dead centre when the head is behind it, sliding across the glass
+   * and vignetting out as the weapon swings.
+   *
+   * The quad is also rescaled by eye distance each frame so the mark holds a
+   * constant angular size; that is what stops the reticle ballooning as the
+   * ADS blend pulls the sight toward the camera.
+   */
+  private updateReticle(): void {
+    const ret = this.rig?.reticle;
+    if (!ret) return;
+    const host = this.rig?.node(ret.parent) ?? this.root;
+    host.updateWorldMatrix(true, false);
+    this._inv.copy(host.matrixWorld).invert();
+    // The view-model camera sits at the origin of the view-model scene.
+    this._eye.set(0, 0, 0).applyMatrix4(this._inv);
+
+    const dz = this._eye.z - ret.planeZ;
+    if (dz <= 1e-4) { setReticleFade(ret.mesh, 0); return; }
+
+    ret.mesh.position.set(this._eye.x, this._eye.y, ret.planeZ);
+    ret.mesh.rotation.set(0, 0, 0);
+    const size = Math.max(1e-4, dz * Math.tan(ret.halfAngle));
+    ret.mesh.scale.set(size, size, size);
+
+    // Out past the window edge the dot is behind the tube wall, which is what
+    // a real optic does; a soft vignette avoids a hard pop at the boundary.
+    const off = Math.hypot(this._eye.x, this._eye.y - ret.axisY);
+    const edge = 1 - clamp01((off - ret.window * 0.55) / Math.max(1e-4, ret.window * 0.55));
+    // The dot is only worth drawing when the shooter is actually behind it.
+    const aimed = clamp01(this.ads * 1.35 - 0.12);
+    setReticleFade(ret.mesh, edge * (0.16 + aimed * 0.84));
   }
 
   /** Current ADS blend, for the HUD and the camera FOV. */
@@ -509,9 +555,12 @@ export class ViewModel {
     // over, rather than dropping out of frame. A reload is a hero moment; if
     // the player cannot see the magazine change there is no animation.
     const dip = curve(t, [[0, 0], [0.16, 1], [0.66, 1], [0.93, 0.06], [1, 0]]);
-    this._add.x += -0.052 * dip;
-    this._add.y += -0.018 * dip;
-    this._add.z += 0.048 * dip;
+    this._add.x += -0.062 * dip;
+    // *Up*, not down. The magazine well is the lowest thing on the weapon, and
+    // a reload that drops the gun puts the one moving part below the frame —
+    // which is the difference between an animation and a wobble.
+    this._add.y += 0.026 * dip;
+    this._add.z += 0.052 * dip;
     this._addRot.x += -9 * DEG * dip;
     this._addRot.y += 15 * DEG * dip;
     this._addRot.z += 27 * DEG * dip;
@@ -620,9 +669,9 @@ export class ViewModel {
   }
 
   private shellBody(k: number): void {
-    this._add.x += -0.038 * k;
-    this._add.y += -0.014 * k;
-    this._add.z += 0.036 * k;
+    this._add.x += -0.046 * k;
+    this._add.y += 0.020 * k;
+    this._add.z += 0.040 * k;
     this._addRot.x += -8 * DEG * k;
     this._addRot.y += 16 * DEG * k;
     this._addRot.z += 21 * DEG * k;

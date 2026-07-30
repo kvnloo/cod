@@ -15,7 +15,7 @@
 import { bus } from '../../core/EventBus';
 import { input } from '../../core/Input';
 import { clamp01, damp, Ease, Envelope, motion, Spring, SPRING } from '../Anim';
-import { chamferPath, hairWidth, measureText, text } from '../Draw';
+import { chamferPath, hairWidth, measureText, text, wash } from '../Draw';
 import type { DrawCtx } from '../Draw';
 import type { HudModel } from '../Model';
 import { lift, rgba, type Palette } from '../Theme';
@@ -100,6 +100,10 @@ export class Prompts implements Widget {
       c.save();
       c.globalAlpha = d.alpha * clamp01(vis);
 
+      // Local darkening so the cap, the ring and both text rows read against a
+      // sunlit street without any of them needing a solid box.
+      if (!d.cheap) wash(c, cx, y + 16 * s, 190 * s, 62 * s, 0.42);
+
       // Key cap.
       const capR = r * 0.72;
       chamferPath(c, cx - capR, y - capR, capR * 2, capR * 2, 4 * s);
@@ -143,9 +147,9 @@ export class Prompts implements Widget {
         color: rgba(p.ink, 0.96), shadow: Math.max(1, 1.3 * s),
       });
       if (q.detail) {
-        text(c, q.detail.toUpperCase(), cx, y + r + 34 * s, {
-          size: 10.5 * s, weight: 500, family: 'cond', tracking: 3 * s, align: 'center',
-          color: rgba(p.inkDim, 0.85),
+        text(c, q.detail.toUpperCase(), cx, y + r + 35 * s, {
+          size: 11 * s, weight: 600, family: 'cond', tracking: 3 * s, align: 'center',
+          color: rgba(p.inkDim, 0.9), outline: 2 * s,
         });
       }
       c.restore();
@@ -183,11 +187,13 @@ export class Prompts implements Widget {
       c.restore();
     } else if (w.magSize > 0 && w.ammo / w.magSize <= 0.25 && w.ammo > 0 && !w.reloading) {
       c.save();
-      c.globalAlpha = d.alpha * 0.9;
-      text(c, 'LOW AMMO', cx, d.h * 0.455, {
-        size: 13 * s, weight: 600, family: 'cond', tracking: 5.5 * s, align: 'center',
-        color: rgba(p.warn, 0.55 + 0.3 * Math.sin(this.t * 5) * motion()),
-        shadow: Math.max(1, 1.2 * s),
+      c.globalAlpha = d.alpha;
+      const y = d.h * 0.44;
+      if (!d.cheap) wash(c, cx, y - 5 * s, 190 * s, 26 * s, 0.42);
+      text(c, 'LOW AMMO', cx, y, {
+        size: 14 * s, weight: 700, family: 'cond', tracking: 5.5 * s, align: 'center',
+        color: rgba(p.warn, 0.78 + 0.22 * Math.sin(this.t * 5) * motion()),
+        shadow: Math.max(1, 1.2 * s), outline: 2.4 * s,
       });
       c.restore();
     }

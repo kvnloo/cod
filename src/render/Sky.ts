@@ -510,6 +510,7 @@ export class SkySystem {
     }
 
     this.uniforms.boSunColor.value.copy(this.sunIlluminance);
+    this.uniforms.boFogSun.value.copy(this.sunIlluminance);
   }
 
   /** Recomputes the environment when time of day or weather actually moved. */

@@ -551,8 +551,16 @@ float boContactShadow( const in vec3 viewPos, const in vec3 viewNormal,
 
 /* ------------------------------------------------------------------- sun -- */
 
-/** The analytic sun. Separate chunk so aerial perspective can use it without
- *  pulling in the whole lit-material prelude. */
+/**
+ * The analytic sun uniforms.
+ *
+ * This chunk is deliberately *not* pulled in by `GLSL_AERIAL`. Several shaders
+ * outside this module (fx/Quads, fx/ParticleShaders, render/Decals) hand-declare
+ * the same uniforms *after* their `${GLSL_AERIAL}` block, so a transitive
+ * declaration here makes every one of them fail to link with
+ * `'boSunDirWorld' : redefinition` — which silently kills decals and every lit
+ * particle. Aerial perspective carries its own private `boFogSun` instead.
+ */
 export const GLSL_SUN = /* glsl */ `
 #ifndef BO_SUN
 #define BO_SUN
@@ -567,7 +575,6 @@ uniform vec3 boSunColor;
 /* ------------------------------------------------------ aerial perspective -- */
 
 export const GLSL_AERIAL = /* glsl */ `
-${GLSL_SUN}
 #ifndef BO_AERIAL
 #define BO_AERIAL
 
@@ -575,6 +582,9 @@ uniform samplerCube boSkyCube;
 uniform vec4 boFogParams;      // x density, y heightFalloff, z sunAmount, w mieG
 uniform vec4 boFogParams2;     // x baseHeight, y maxOpacity, z inscatterBoost, w weatherGrey
 uniform vec3 boFogTint;
+// Sun illuminance under a private name, so this chunk can never collide with a
+// caller that declares boSunColor itself. Mirrors boSunColor every frame.
+uniform vec3 boFogSun;
 
 /**
  * Height-attenuated exponential fog whose in-scatter colour is sampled from the
@@ -614,7 +624,7 @@ vec3 boAerialPerspective( vec3 color, vec3 worldPos, vec3 camPos, vec3 sunDirWor
 	// whole forward hemisphere into a white sheet.
 	vec3 sky = textureLod( boSkyCube, dir, 3.0 ).rgb;
 	float mu = dot( dir, sunDirWorld );
-	vec3 inscatter = sky + boSunColor * ( boPhaseMie( mu, boFogParams.w ) * boFogParams.z );
+	vec3 inscatter = sky + boFogSun * ( boPhaseMie( mu, boFogParams.w ) * boFogParams.z );
 	inscatter = mix( inscatter, vec3( boLuma( inscatter ) ) * boFogTint, boFogParams2.w );
 	inscatter *= boFogParams2.z;
 

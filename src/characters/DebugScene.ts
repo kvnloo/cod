@@ -20,13 +20,15 @@ import type { EngineContext, System } from '../core/Engine';
 import { registerDebugScene, registerShots, DEBUG_SCENE } from '../core/Shots';
 import { settings } from '../core/Settings';
 import { Rand } from '../core/Rand';
-import type { CharacterFaction, CharacterLoadout } from './types';
+import type { HitZone } from '../physics/types';
+import type { AnimName, CharacterFaction, CharacterLoadout } from './types';
 import { CharacterSystem } from './CharacterSystem';
 import type { Character } from './Character';
 import { buildWeaponProp, type PropKind } from './Prop';
 import { heightFieldProbe } from './anim/FootIK';
 import type { Locomotion } from './anim/Animator';
 import { hitboxDebug } from './Hitboxes';
+import { makeAppearance, type Appearance } from './Appearance';
 
 const LINEUP_Z = 0;
 const CLOSE_Z = 16;
@@ -34,6 +36,10 @@ const STATE_Z = 32;
 const IK_Z = 56;
 const LOD_Z = 70;
 const BOX_Z = 82;
+/** Skinning check: one man, several poses, held still. */
+const POSE_Z = 94;
+/** Impact check: hit reactions and deaths frozen mid-motion. */
+const IMPACT_Z = 106;
 
 /* ------------------------------------------------------------------ terrain */
 
@@ -66,11 +72,29 @@ interface Actor {
   loop?: () => void;
   loopEvery?: number;
   timer?: number;
+  /**
+   * Held still after the scene settles. A hit reaction that has finished
+   * playing tells you nothing about whether it looks like an impact; the frames
+   * that matter are 100–350 ms in, so those actors are advanced to a chosen
+   * phase during `build()` and then frozen there.
+   */
+  frozen?: boolean;
+}
+
+interface FrozenScript {
+  actor: Actor;
+  /** Kicks the action off. */
+  fire: () => void;
+  /** Seconds of animation to run before the actor is held. */
+  hold: number;
+  /** Runs once the hold has elapsed — the ragdoll handoff uses this. */
+  after?: () => void;
 }
 
 class CharacterDebugScene {
   readonly root = new THREE.Group();
   readonly actors: Actor[] = [];
+  private frozen: FrozenScript[] = [];
   private sys: CharacterSystem;
   private ctx: EngineContext;
   private rand = new Rand('characters-debug');
@@ -121,12 +145,12 @@ class CharacterDebugScene {
     // Same reason as SSR: screen-space contact shadows are dithered and rely on
     // TAA to resolve, which cannot happen while the subject is skinned-animated.
     settings.setGfx('contactShadows', false);
-    // Wide PCSS penumbrae are dithered and resolved by TAA. A skinned mesh
-    // reports zero velocity in this renderer's G-buffer, so that history never
-    // converges and the contact area fills with colour speckle. Hard PCF and no
-    // SSAO keep the test bed honest about the character, not the shadow filter.
-    settings.setGfx('pcssSoftness', 0);
-    settings.setGfx('ssao', false);
+    // A narrow PCSS kernel is worth the residual dither: with hard PCF, every
+    // shadow the kit casts on the body is a stair-stepped edge, which is the
+    // opposite of the thing these shots exist to judge. SSAO stays on so the
+    // test bed matches what the game actually renders.
+    settings.setGfx('pcssSoftness', 0.35);
+    settings.setGfx('ssao', true);
 
     this.root.name = 'characters-debug';
     scene.add(this.root);
@@ -140,9 +164,14 @@ class CharacterDebugScene {
     this.buildFootIK();
     this.buildLods();
     this.buildHitboxes();
+    this.buildPoseSheet();
+    this.buildImpacts();
 
     // Settle: run enough frames for the smoothed IK and blends to reach rest.
     for (let i = 0; i < 40; i++) this.step(1 / 60);
+
+    // Then drive the frozen actors to the phase each was asked for and stop.
+    this.runFrozen();
   }
 
   /* -------------------------------------------------------------- ground */
@@ -160,7 +189,11 @@ class CharacterDebugScene {
   }
 
   private buildGround(): void {
+    // A bright sand plane filling two thirds of every frame drags auto-exposure
+    // down by two stops and leaves the subject in mud. The test bed uses dark
+    // asphalt so the character is what the image is exposed for.
     const mat = this.groundMaterial(0.92, 0x4a4640, 'asphalt');
+    mat.color.setRGB(0.26, 0.255, 0.245);
     const ground = new THREE.Mesh(new THREE.PlaneGeometry(240, 240), mat);
     ground.rotation.x = -Math.PI / 2;
     ground.position.z = 36;
@@ -245,15 +278,47 @@ class CharacterDebugScene {
     }
   }
 
+  /** First seed in `[from, from + 4000)` whose appearance satisfies `want`. */
+  private findSeed(
+    faction: CharacterFaction, loadout: CharacterLoadout,
+    want: (a: Appearance) => boolean, from: number,
+  ): number {
+    for (let s = from; s < from + 4000; s++) {
+      if (want(makeAppearance({ faction, loadout, seed: s }))) return s;
+    }
+    return from;
+  }
+
   private buildCloseups(): void {
-    const set: [CharacterFaction, CharacterLoadout, number][] = [
-      ['pmc', 'rifleman', 4210],
-      ['spetsnaz', 'rifleman', 771],
-      ['militia', 'smg', 3308],
+    // This is the station where faces are judged, so one of the three has to
+    // *have* one. Leaving it to the dice gave three balaclavas and a review
+    // that said "the faces are black holes" — which they were, because there
+    // were no faces. Seeds are searched for the combination each slot needs.
+    const want: {
+      faction: CharacterFaction; loadout: CharacterLoadout; from: number;
+      pick: (a: Appearance) => boolean;
+    }[] = [
+      {
+        faction: 'pmc', loadout: 'rifleman', from: 4000,
+        pick: (a) => a.faceGear === 'none' && a.headGear === 'helmet'
+          && a.eyeGear === 'goggles' && a.carrier === 'plate',
+      },
+      {
+        faction: 'spetsnaz', loadout: 'rifleman', from: 700,
+        pick: (a) => a.faceGear === 'balaclava' && a.headGear === 'helmet' && a.nvg,
+      },
+      {
+        faction: 'militia', loadout: 'smg', from: 3000,
+        pick: (a) => a.faceGear === 'shemagh' && a.headGear !== 'none',
+      },
     ];
-    for (let i = 0; i < set.length; i++) {
-      const [f, l, seed] = set[i];
-      const a = this.spawn(i * 3.0, CLOSE_Z, i === 1 ? -0.42 : 0, f, l, seed, 'rifle');
+    for (let i = 0; i < want.length; i++) {
+      const w = want[i];
+      const seed = this.findSeed(w.faction, w.loadout, w.pick, w.from);
+      // Turned into the key. A portrait lit from dead front by a 55° sun puts
+      // the entire face inside the helmet brim's shadow; a three-quarter key
+      // is what every character render in the reference actually uses.
+      const a = this.spawn(i * 3.0, CLOSE_Z, -1.10 + i * 0.12, w.faction, w.loadout, seed, 'rifle');
       a.aimPitch = -0.05;
       a.character.setLocomotion('idle', 0, 0);
     }
@@ -325,18 +390,126 @@ class CharacterDebugScene {
     hitboxDebug(a.character.rig, a.character.hitboxes);
   }
 
+  /* ---------------------------------------------------------- pose sheet */
+
+  /**
+   * The same soldier in the poses that break naive skinning: full waist twist,
+   * arm across the body, arm overhead, a deep crouch and prone. Anything that
+   * collapses a shoulder or candy-wraps a wrist shows here and nowhere else.
+   */
+  private buildPoseSheet(): void {
+    const poses: {
+      label: string; state: Locomotion; speed: number; strafe: number;
+      yaw: number; pitch: number; act?: AnimName; hold?: number;
+    }[] = [
+      { label: 'twist-left', state: 'idle', speed: 0, strafe: 0, yaw: 0.95, pitch: 0.10 },
+      { label: 'twist-right', state: 'idle', speed: 0, strafe: 0, yaw: -0.95, pitch: -0.10 },
+      { label: 'aim-up', state: 'idle', speed: 0, strafe: 0, yaw: 0, pitch: 0.62 },
+      { label: 'aim-down', state: 'idle', speed: 0, strafe: 0, yaw: 0, pitch: -0.70 },
+      { label: 'throw', state: 'idle', speed: 0, strafe: 0, yaw: 0.1, pitch: 0.2, act: 'throw', hold: 0.42 },
+      { label: 'sprint', state: 'sprint', speed: 5.8, strafe: 0, yaw: 0, pitch: 0 },
+      { label: 'crouch', state: 'crouch', speed: 0, strafe: 0, yaw: -0.4, pitch: -0.2 },
+      { label: 'prone', state: 'prone', speed: 0, strafe: 0, yaw: 0, pitch: 0 },
+    ];
+    for (let i = 0; i < poses.length; i++) {
+      const p = poses[i];
+      const x = (i - (poses.length - 1) / 2) * 1.55;
+      const a = this.spawn(x, POSE_Z, 0, 'pmc', 'rifleman', 3141, 'rifle');
+      a.state = p.state; a.speed = p.speed; a.strafe = p.strafe;
+      a.aimYaw = p.yaw; a.aimPitch = p.pitch;
+      if (p.act) {
+        a.frozen = true;
+        this.frozen.push({ actor: a, fire: () => a.character.play(p.act as AnimName), hold: p.hold ?? 0.4 });
+      } else if (p.state === 'sprint') {
+        // A stride is only readable at a chosen phase; freeze at full extension.
+        a.frozen = true;
+        this.frozen.push({ actor: a, fire: () => { /* locomotion only */ }, hold: 0.33 });
+      }
+    }
+  }
+
+  /* ------------------------------------------------------------- impacts */
+
+  /**
+   * Hit reactions and deaths, each held at the frame that decides whether they
+   * read as an impact or as a clip playing: the flinch at 90–200 ms, the
+   * collapse at 250–600 ms, and one man handed off to the ragdoll.
+   */
+  private buildImpacts(): void {
+    const shots: { dir: THREE.Vector3; zone: HitZone; power: number; hold: number }[] = [
+      { dir: new THREE.Vector3(0, 0, -1), zone: 'chest', power: 1.0, hold: 0.09 },
+      { dir: new THREE.Vector3(0, 0, -1), zone: 'stomach', power: 1.0, hold: 0.20 },
+      { dir: new THREE.Vector3(-1, 0, -0.3), zone: 'arm', power: 0.9, hold: 0.13 },
+      { dir: new THREE.Vector3(1, 0, 0.4), zone: 'head', power: 1.0, hold: 0.11 },
+    ];
+    for (let i = 0; i < shots.length; i++) {
+      const s = shots[i];
+      const x = (i - 3.5) * 1.7;
+      const a = this.spawn(x, IMPACT_Z, 0, 'spetsnaz', 'rifleman', 4400 + i * 97, 'rifle');
+      a.character.setLocomotion('idle', 0, 0);
+      a.frozen = true;
+      const dir = s.dir.clone().normalize();
+      this.frozen.push({
+        actor: a, hold: s.hold,
+        fire: () => a.character.react(dir, s.zone, s.power),
+      });
+    }
+
+    const deaths: { anim: AnimName; hold: number; ragdoll: boolean }[] = [
+      { anim: 'deathFront', hold: 0.22, ragdoll: false },
+      { anim: 'deathBack', hold: 0.40, ragdoll: false },
+      { anim: 'deathHead', hold: 0.14, ragdoll: false },
+      { anim: 'deathBack', hold: 0.30, ragdoll: true },
+    ];
+    for (let i = 0; i < deaths.length; i++) {
+      const d = deaths[i];
+      const x = (i + 0.5) * 1.7;
+      const a = this.spawn(x, IMPACT_Z, 0, 'militia', 'rifleman', 7700 + i * 131, 'rifle');
+      a.character.setLocomotion('idle', 0, 0);
+      a.frozen = true;
+      this.frozen.push({
+        actor: a, hold: d.hold,
+        fire: () => a.character.play(d.anim),
+        after: d.ragdoll
+          ? () => a.character.ragdoll(new THREE.Vector3(0, 1.5, 6.5), 'chest')
+          : undefined,
+      });
+    }
+  }
+
+  /** Fires each frozen script and advances only that actor to its hold time. */
+  private runFrozen(): void {
+    const dt = 1 / 120;
+    for (const f of this.frozen) {
+      f.fire();
+      const steps = Math.max(1, Math.round(f.hold / dt));
+      for (let i = 0; i < steps; i++) {
+        f.actor.character.setLocomotion(f.actor.state, f.actor.speed, f.actor.strafe);
+        f.actor.character.setAim(f.actor.aimYaw, f.actor.aimPitch);
+        f.actor.character.update(dt);
+      }
+      f.after?.();
+      // The character system updates every character it owns each frame, so
+      // "stop calling update" is not enough to hold a pose — the graph itself
+      // has to be pinned.
+      f.actor.character.animator.paused = true;
+    }
+  }
+
   /* --------------------------------------------------------------- frame */
 
   step(dt: number): void {
     this.time += dt;
     for (const a of this.actors) {
+      if (a.frozen) continue;
       a.character.setLocomotion(a.state, a.speed, a.strafe);
       a.character.setAim(a.aimYaw, a.aimPitch);
       if (a.loop && a.loopEvery) {
         a.timer = (a.timer ?? 0) - dt;
         if (a.timer <= 0) { a.timer = a.loopEvery; a.loop(); }
       }
-      a.character.update(dt);
+      // `CharacterSystem.update` advances every character it owns; stepping
+      // them again here would run the whole test bed at double speed.
     }
   }
 }
@@ -348,6 +521,22 @@ registerDebugScene('characters', async (ctx: EngineContext) => {
   const scene = new CharacterDebugScene(ctx);
   active = scene;
   await scene.build();
+
+  // A handle for the art-tuning probe in `dev/`: it reads the baked vertex
+  // tints straight off the geometry so albedo work can be checked numerically
+  // instead of guessed at from a screenshot.
+  (globalThis as unknown as { __CHARDBG__: unknown }).__CHARDBG__ = {
+    actors: scene.actors,
+    stats: () => scene.actors.slice(0, 8).map((a) => a.character.tintStats()),
+    kit: () => scene.actors.map((a) => {
+      const p = a.character.appearance;
+      return {
+        seed: p.seed, faction: p.faction, head: p.headGear, face: p.faceGear,
+        eyes: p.eyeGear, carrier: p.carrier, sleeves: p.sleeves, nvg: p.nvg,
+        z: Math.round(a.character.object.position.z),
+      };
+    }),
+  };
 
   // The characters system is registered as an engine system, so the harness's
   // settle frames animate it; this hook only exists for scenes where the
@@ -368,47 +557,72 @@ if (DEBUG_SCENE === 'characters') {
     {
       name: 'char-lineup',
       description: 'Squad line-up: eight procedurally varied soldiers, full body, front lit',
-      position: [0, 1.62, 7.6], yaw: 0, pitch: -2, fov: 48, viewModel: false, hour: 10,
+      position: [0, 1.62, 7.6], yaw: 0, pitch: -2, fov: 48, viewModel: false, hour: 13.5,
     },
     {
       name: 'char-lineup-close',
       description: 'Left half of the squad at 3.5 m — kit silhouette, plate carriers, helmets',
-      position: [-2.3, 1.45, 3.6], yaw: 0, pitch: -1, fov: 46, viewModel: false, hour: 10,
+      position: [-2.3, 1.45, 3.6], yaw: 0, pitch: -1, fov: 46, viewModel: false, hour: 13.5,
     },
     {
       name: 'char-hero',
       description: 'Hero three-quarter shot of one soldier, late afternoon key light',
-      position: [-3.0, 1.50, 1.9], yaw: 28, pitch: -2, fov: 40, viewModel: false, hour: 16,
+      position: [-3.0, 1.50, 1.9], yaw: 28, pitch: -2, fov: 40, viewModel: false, hour: 8.5,
     },
     {
       name: 'char-head',
       description: 'Head close-up: helmet, NVG mount, goggles, balaclava, comms headset',
-      position: [0.0, 1.625, 16.88], yaw: 0, pitch: 0, fov: 25, viewModel: false, hour: 10,
+      position: [-0.486, 1.633, 16.876], yaw: -29, pitch: 0, fov: 24, viewModel: false, hour: 15,
     },
     {
       name: 'char-head-3q',
       description: 'Three-quarter head close-up of a second soldier — face shaping and kit fit',
-      position: [3.86, 1.605, 16.76], yaw: 48, pitch: 0, fov: 28, viewModel: false, hour: 15,
+      position: [1.963, 1.612, 15.836], yaw: -99, pitch: 0, fov: 26, viewModel: false, hour: 15,
     },
     {
       name: 'char-torso',
       description: 'Torso close-up: plate carrier, magazine pouches, webbing, sling, cloth folds',
-      position: [0.0, 1.24, 17.05], yaw: 0, pitch: 2, fov: 36, viewModel: false, hour: 10,
+      position: [-0.938, 1.30, 16.97], yaw: -44, pitch: 0, fov: 36, viewModel: false, hour: 15,
     },
     {
       name: 'char-legs',
       description: 'Lower body close-up: trousers, blousing, knee pads, boots',
-      position: [0.0, 0.60, 17.1], yaw: 0, pitch: 4, fov: 42, viewModel: false, hour: 10,
+      position: [-1.53, 0.92, 17.58], yaw: -44, pitch: -9, fov: 40, viewModel: false, hour: 15,
     },
     {
       name: 'char-states',
       description: 'Locomotion states: idle, walk, run, sprint, strafe, crouch, crouch-walk, prone',
-      position: [0, 1.9, STATE_Z - 9.0], yaw: 180, pitch: -3, fov: 52, viewModel: false, hour: 11,
+      position: [-3.2, 1.55, STATE_Z - 7.4], yaw: 172, pitch: -2, fov: 38, viewModel: false, hour: 9,
     },
     {
       name: 'char-actions',
       description: 'Cover poses, peek, hit reaction, grenade throw and three directional deaths',
-      position: [0, 1.9, STATE_Z + 8 + 9.5], yaw: 0, pitch: -3, fov: 52, viewModel: false, hour: 11,
+      position: [-3.0, 1.55, STATE_Z + 8 + 7.6], yaw: 8, pitch: -2, fov: 38, viewModel: false, hour: 11,
+    },
+    {
+      name: 'char-poses',
+      description: 'Skinning sheet: waist twist both ways, aim up/down, throw, sprint, crouch, prone',
+      position: [0, 1.62, POSE_Z + 9.2], yaw: 0, pitch: -2, fov: 46, viewModel: false, hour: 13.5,
+    },
+    {
+      name: 'char-poses-close',
+      description: 'Shoulder, elbow and wrist deformation under full waist twist at 2.4 m',
+      position: [-5.30, 1.44, POSE_Z + 2.7], yaw: -4, pitch: 0, fov: 30, viewModel: false, hour: 13.5,
+    },
+    {
+      name: 'char-impacts',
+      description: 'Hit reactions frozen 90–200 ms after the round lands, plus limb and head hits',
+      position: [-3.4, 1.52, IMPACT_Z + 7.0], yaw: 0, pitch: -3, fov: 44, viewModel: false, hour: 13,
+    },
+    {
+      name: 'char-deaths',
+      description: 'Three directional deaths mid-collapse and one handed off to the ragdoll',
+      position: [3.4, 1.66, IMPACT_Z + 7.0], yaw: 0, pitch: -8, fov: 44, viewModel: false, hour: 13,
+    },
+    {
+      name: 'char-silhouette',
+      description: 'The squad at 50 m — does the kit still read as eight soldiers?',
+      position: [40, 1.74, 30], yaw: 53, pitch: -0.6, fov: 13, viewModel: false, hour: 13.0,
     },
     {
       name: 'char-footik',

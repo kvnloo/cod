@@ -23,6 +23,7 @@ import {
   shopfront, slab, slabWithHole, stairs, wall, windowUnit, rectWalls, chimney,
   WallFrame, type Opening,
 } from '../geom/Kit';
+import { V3 } from '../geom/Mesher';
 
 export type Side = 'n' | 'w' | 's' | 'e';
 const SIDE_INDEX: Record<Side, number> = { n: 0, w: 1, s: 2, e: 3 };
@@ -251,6 +252,71 @@ export function buildBlock(chunk: Chunk, spec: BlockSpec): BlockResult {
         cs.pop();
       }
     }
+  }
+
+  /* -------------------------------------------------- blown-open holes -- */
+  /**
+   * Every shell hole gets its spoil.
+   *
+   * Cut on its own, a hole is a hard-edged black rectangle in a sunlit wall —
+   * one of the most obvious unfinished reads on the map, because a real breach
+   * always has half its masonry still hanging in it and the other half on the
+   * pavement below. Each one now gets a ragged lintel of loose brick, rebar
+   * bent out of the reveal, a spill of rubble across the sill and a strip of
+   * torn curtain, which breaks the silhouette and stops the interior from
+   * reading as a void.
+   */
+  for (const h of spec.holes ?? []) {
+    const frame = frames[h.side];
+    if (!frame) continue;
+    const y0 = levels[Math.min(h.level, levels.length - 1)] + 0.9;
+    const u = uOn(spec, h.side, h.at);
+    const hh = h.height ?? 2.0;
+    const rand = new Rand(spec.seed + Math.round(h.at * 29) + h.level * 13);
+    const half = t * 0.5;
+
+    const rub = chunk.m('brickSoot');
+    rub.push(frame.matrix);
+    // Loose masonry still clinging to the top edge of the breach.
+    for (let i = 0; i < 7; i++) {
+      const du = (i / 6 - 0.5) * h.width * 0.95;
+      const drop = rand.range(0.05, 0.34);
+      rub.pushTRS(u + du, y0 + hh - drop * 0.5, half - 0.06, 0, 0, rand.range(-0.35, 0.35));
+      rub.box(0, 0, 0, rand.range(0.08, 0.2), drop * 0.5, half * 0.7, 0.5);
+      rub.pop();
+    }
+    // Spoil heaped on the sill and tipping out over the edge.
+    for (let i = 0; i < 9; i++) {
+      const du = rand.range(-h.width * 0.5, h.width * 0.5);
+      const s = rand.range(0.05, 0.14);
+      rub.pushTRS(u + du, y0 + s * 0.6, rand.range(-half * 0.4, half + 0.16),
+        rand.range(-0.5, 0.5), rand.range(-0.3, 0.3), rand.range(-0.4, 0.4));
+      rub.box(0, 0, 0, s, s * 0.6, s * rand.range(0.9, 1.6), 0.5);
+      rub.pop();
+    }
+    rub.pop();
+
+    const bar = chunk.m('rust');
+    bar.push(frame.matrix);
+    for (let i = 0; i < 3; i++) {
+      const du = (i / 2 - 0.5) * h.width * 0.7;
+      bar.tube([
+        V3(u + du, y0 + hh - 0.05, half - 0.1),
+        V3(u + du + rand.range(-0.1, 0.1), y0 + hh - 0.4, half + 0.16),
+        V3(u + du + rand.range(-0.2, 0.2), y0 + hh - 0.85, half + 0.1),
+      ], 0.011, 4, false, 0.3);
+    }
+    bar.pop();
+
+    // A curtain still on its rail, hanging out of the opening.
+    const cloth = chunk.m(rand.bool() ? 'canvasCream' : 'canvasRed');
+    cloth.push(frame.matrix);
+    const cu = u + rand.range(-h.width * 0.28, h.width * 0.28);
+    const cw = rand.range(0.3, 0.55);
+    cloth.pushTRS(cu, y0 + hh - 0.06, half - 0.05, 0, 0, rand.range(-0.18, 0.18));
+    cloth.box(0, -rand.range(0.5, 1.1) * 0.5, 0.06, cw * 0.5, rand.range(0.5, 1.1) * 0.5, 0.008, { unit: true });
+    cloth.pop();
+    cloth.pop();
   }
 
   /* ---------------------------------------------------------- shopfronts */

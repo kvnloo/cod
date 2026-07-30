@@ -22,7 +22,7 @@ import * as THREE from 'three';
 import { FX_LAYER_TRANSPARENT, fxSkipPatch, makeQuadGeometry } from './Common';
 import { GBUFFER_PASSTHROUGH_DECL } from './Common';
 import { ATLAS_COLS, type SpriteAtlas } from './SpriteAtlas';
-import { GLSL_AERIAL, GLSL_ATMOSPHERE, GLSL_COMMON, GLSL_SH } from '../render/Glsl';
+import { GLSL_AERIAL, GLSL_ATMOSPHERE, GLSL_COMMON, GLSL_SH, GLSL_SUN } from '../render/Glsl';
 
 export const QUAD_MODE = {
   BILLBOARD: 0,
@@ -186,6 +186,7 @@ precision highp float;
 ${GLSL_COMMON}
 ${GLSL_ATMOSPHERE}
 ${GLSL_SH}
+${GLSL_SUN}
 ${GLSL_AERIAL}
 
 in vec4 vColor;
@@ -205,8 +206,7 @@ uniform sampler2D tAtlasB;
 uniform sampler2D tScene;
 uniform sampler2D boSceneDepth;
 uniform vec4 boCameraParams;
-uniform vec3 boSunDirWorld;
-uniform vec3 boSunColor;
+// boSunDirWorld / boSunColor come from GLSL_SUN via GLSL_AERIAL above.
 uniform vec3 boAmbientSH[ 9 ];
 uniform vec3 boAmbientTint;
 uniform float boAmbientIntensity;

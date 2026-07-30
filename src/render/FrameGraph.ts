@@ -49,6 +49,7 @@ uniform vec2  uConcussion;      // intensity, phase
 uniform vec2  uSpatter;         // intensity, kind (0 blood, 1 water, 2 dirt)
 uniform float uVignette;
 uniform float uGrain;
+uniform float uDither;
 
 vec3 grade( vec3 c ) {
 	// Lift/contrast around middle grey, then saturation, then a gentle
@@ -145,8 +146,10 @@ void main() {
 
 	if ( uEncode == 1 ) color = boLinearToSRGB( color );
 
-	// Ordered dither kills banding in the dark sky gradients.
-	float dither = ( boIGN( gl_FragCoord.xy ) - 0.5 ) / 255.0;
+	// Dither kills banding in the dark sky gradients — but only when nothing
+	// downstream already did it. Stacking two dithers doubles the amplitude and
+	// beats the two patterns against each other, which is visible as stipple.
+	float dither = ( boIGN( gl_FragCoord.xy ) - 0.5 ) * uDither;
 	outColor = vec4( max( color + dither, vec3( 0.0 ) ), 1.0 );
 }
 `;
@@ -216,6 +219,7 @@ export class FrameGraph {
         uSpatter: { value: new THREE.Vector2(0, 0) },
         uVignette: { value: 0.25 },
         uGrain: { value: 0.2 },
+        uDither: { value: 1 / 255 },
       },
       depthTest: false,
       depthWrite: false,
@@ -347,6 +351,8 @@ export class FrameGraph {
     grade: THREE.Vector4;
     vignette: number;
     grain: number;
+    /** 0 when a post pass already dithered to 8 bits. */
+    dither: number;
     time: number;
   }): void {
     const u = this.presentMat.uniforms;
@@ -368,6 +374,7 @@ export class FrameGraph {
     (u.uSpatter.value as THREE.Vector2).set(fx ? s.spatter : 0, s.spatterKind);
     u.uVignette.value = o.vignette;
     u.uGrain.value = o.grain;
+    u.uDither.value = o.dither;
 
     this.renderer.setRenderTarget(null);
     this.renderer.setViewport(0, 0, this.renderer.domElement.width, this.renderer.domElement.height);

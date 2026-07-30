@@ -71,9 +71,13 @@ export class Vitals implements Widget {
     const barH = 8 * s;
     const barY = bottom - barH;
     const frac = m.healthBar.value;
-    const col: RGB = frac > 0.55
-      ? mixRGB(p.warn, p.good, clamp01((frac - 0.55) / 0.45))
-      : mixRGB(p.hostile, p.warn, clamp01(frac / 0.55));
+    // Healthy is *neutral*, not green. A saturated green bar is the single
+    // loudest "browser game" tell in a HUD that otherwise runs one accent
+    // colour; shipped shooters keep full health near-white and spend colour
+    // only on the warning states.
+    const col: RGB = frac > 0.35
+      ? mixRGB(p.warn, p.ink, clamp01((frac - 0.35) / 0.65))
+      : mixRGB(p.hostile, p.warn, clamp01(frac / 0.35));
 
     meter(c, left, barY, barW, barH, frac, col, {
       segments: 4, track: p.hair, glow: 8 * s, ghost: m.healthGhost,
@@ -99,25 +103,29 @@ export class Vitals implements Widget {
       c.fillRect(left, barY, barW * frac, barH);
     }
 
-    text(c, String(Math.round(m.health)), left + barW + 9 * s, barY + barH + 0.5 * s, {
-      size: 15 * s, weight: 600, family: 'cond', tracking: 0.6 * s,
-      color: rgba(frac < 0.35 ? p.hostile : p.inkDim, 0.95), shadow: Math.max(1, 1.2 * s),
+    // Health is a peripheral read: the number carries it, the bar qualifies it.
+    text(c, String(Math.round(m.health)), left + barW + 11 * s, barY + barH + 1.5 * s, {
+      size: 22 * s, weight: 700, family: 'cond', tracking: 0.4 * s,
+      color: rgba(frac < 0.35 ? p.hostile : p.ink, 0.98),
+      shadow: Math.max(1, 1.4 * s), outline: 3 * s,
     });
 
-    text(c, m.regenerating ? 'REGENERATING' : 'VITALS', left, barY - 6 * s, {
-      size: 10 * s, weight: 600, family: 'cond', tracking: 3.4 * s,
-      color: rgba(m.regenerating ? p.good : p.inkFaint, m.regenerating ? 0.9 : 0.7),
-      shadow: Math.max(1, 1 * s),
+    text(c, m.regenerating ? 'REGENERATING' : 'VITALS', left, barY - 7 * s, {
+      size: 10.5 * s, weight: 600, family: 'cond', tracking: 3.4 * s,
+      color: rgba(m.regenerating ? p.good : p.inkDim, m.regenerating ? 0.95 : 0.75),
+      shadow: Math.max(1, 1 * s), outline: 2 * s,
     });
 
     /* --------------------------------------------------- equipment ----- */
-    const eqY = barY - 26 * s;
+    const eqY = barY - 28 * s;
     this.drawEquipment(d, m, left, eqY, p);
 
     /* --------------------------------------------------- killstreaks --- */
-    // Tiles are 36 design-px tall and grow downward from ksY, so leave the
-    // equipment row clear above the health bar.
-    const ksY = eqY - 62 * s;
+    // Tiles are 36 design-px tall and grow downward from ksY. The equipment
+    // glyphs above the health bar are drawn 32 px tall from `eqY - 31`, so the
+    // tile row has to end well clear of that or the two collide — which is
+    // exactly what the original 62 px offset did.
+    const ksY = eqY - 80 * s;
     this.drawStreaks(d, m, left, ksY, p);
 
     c.restore();
@@ -159,8 +167,8 @@ export class Vitals implements Widget {
         });
       }
       text(c, it.key, cx - 19 * s, gy - 8 * s, {
-        size: 10 * s, weight: 700, family: 'mono', color: rgba(p.inkFaint, 0.9),
-        align: 'center', shadow: 1,
+        size: 10.5 * s, weight: 700, family: 'mono', color: rgba(p.inkDim, 0.95),
+        align: 'center', shadow: 1, outline: 2 * s,
       });
       c.restore();
     }
@@ -249,9 +257,9 @@ export class Vitals implements Widget {
     }
 
     // Section rule + label
-    text(c, 'KILLSTREAKS', x, y - 6 * s, {
+    text(c, 'KILLSTREAKS', x, y - 7 * s, {
       size: 9.5 * s, weight: 600, family: 'cond', tracking: 3.6 * s,
-      color: rgba(p.inkFaint, 0.7), shadow: Math.max(1, 1 * s),
+      color: rgba(p.inkDim, 0.72), shadow: Math.max(1, 1 * s), outline: 2 * s,
     });
   }
 }

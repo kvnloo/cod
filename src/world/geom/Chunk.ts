@@ -13,6 +13,7 @@
  */
 
 import * as THREE from 'three';
+import { setBlendWeights } from '../../material/MaterialShaders';
 import { tagSurface } from '../../core/Surfaces';
 import { LAYERS } from '../../render/types';
 import type { MatCatalog, MatKey } from '../MatCatalog';
@@ -30,6 +31,14 @@ export interface EmitOptions {
   userData?: Record<string, unknown>;
   /** Exclude from navigation voxelisation (decoration that must not block AI). */
   navIgnore?: boolean;
+  /**
+   * Second-layer weight for blended materials, evaluated per world-space vertex.
+   * Returns 0 for "pure base material", 1 for "fully the blend layer" — blown
+   * render showing masonry, or dirt banked against a wall. Keys that do not
+   * blend ignore it; keys that do blend get a zero attribute when it is absent,
+   * which is what keeps the shader's `vColor` defined everywhere.
+   */
+  blend?: (x: number, y: number, z: number, key: MatKey) => number;
 }
 
 export class Chunk {
@@ -56,6 +65,10 @@ export class Chunk {
     for (const [key, mesher] of this.meshers) {
       if (mesher.empty) continue;
       const geo = mesher.build();
+      if (cat.blends(key)) {
+        const fn = opts.blend;
+        setBlendWeights(geo, fn ? (x, y, z) => fn(x, y, z, key) : () => 0);
+      }
       const mesh = new THREE.Mesh(geo, cat.get(key));
       mesh.name = `${opts.name ?? 'chunk'}:${key}`;
       const alpha = cat.isAlphaCard(key);

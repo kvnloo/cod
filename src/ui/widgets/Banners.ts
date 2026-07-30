@@ -11,7 +11,7 @@
 
 import { bus } from '../../core/EventBus';
 import { clamp01, Ease, motion, motionTime } from '../Anim';
-import { hairWidth, measureText, text } from '../Draw';
+import { hairWidth, measureText, text, wash } from '../Draw';
 import type { DrawCtx } from '../Draw';
 import type { HudModel } from '../Model';
 import { lift, rgba, type Palette, type RGB } from '../Theme';
@@ -140,28 +140,20 @@ export class Banners implements Widget {
     c.save();
     c.globalAlpha = a;
 
-    const titleSize = 40 * s;
+    const titleSize = 34 * s;
     const titleOpts = {
-      size: titleSize, weight: 700, family: 'cond' as const, tracking: 7 * s,
+      size: titleSize, weight: 700, family: 'cond' as const, tracking: 6 * s,
       align: 'center' as const,
     };
     const tw = measureText(c, b.title, titleOpts);
     const ruleW = Math.max(tw + 70 * s, 260 * s);
 
-    // Backing wash so the banner survives a busy scene. Elliptical so there is
-    // no hard rectangle edge floating over the frame.
-    c.save();
-    c.translate(cx, cy - titleSize * 0.18);
-    c.scale(ruleW, titleSize * 1.15);
-    const wash = c.createRadialGradient(0, 0, 0, 0, 0, 1);
-    wash.addColorStop(0, 'rgba(4,7,12,0.62)');
-    wash.addColorStop(0.55, 'rgba(4,7,12,0.42)');
-    wash.addColorStop(1, 'rgba(4,7,12,0)');
-    c.fillStyle = wash;
-    c.beginPath();
-    c.arc(0, 0, 1, 0, Math.PI * 2);
-    c.fill();
-    c.restore();
+    // Backing wash so the banner survives a busy scene. Wide and shallow: the
+    // earlier tight ellipse read as a dark smudge stuck to the sky. Spreading
+    // the same total darkening over twice the width makes it read as haze.
+    if (!d.cheap) {
+      wash(c, cx, cy - titleSize * 0.16, ruleW * 1.25, titleSize * 1.75, 0.44);
+    }
 
     // Rules that overshoot then settle.
     const grow = Ease.outQuint(inT) * (1 + (1 - Ease.outQuart(inT)) * 0.22 * motion());
@@ -188,13 +180,13 @@ export class Banners implements Widget {
       ...titleOpts,
       color: rgba(lift(tint, 0.25), 1),
       shadow: Math.max(1.4, 2 * s),
-      glow: b.kind === 'reward' ? 20 * s : 10 * s,
+      glow: b.kind === 'reward' ? 16 * s : 7 * s,
       glowColor: rgba(tint, 0.45),
       chroma: (1 - Ease.outQuart(clamp01(inT * 1.5))) * 5 * s,
     });
 
     if (b.sub) {
-      text(c, b.sub, cx, cy + 40 * s, {
+      text(c, b.sub, cx, cy + 34 * s, {
         size: 15 * s, weight: 600, family: 'cond', tracking: 5.5 * s, align: 'center',
         color: rgba(p.ink, 0.9), shadow: Math.max(1.2, 1.6 * s),
         alpha: Ease.outQuart(clamp01((inT - 0.25) / 0.75)),
@@ -230,6 +222,8 @@ export class Banners implements Widget {
         size, weight: 700, family: 'cond' as const, tracking: 6.5 * s, align: 'center' as const,
       };
       const w = measureText(c, f.title, opts);
+
+      if (!d.cheap) wash(c, cx, cy - size * 0.3, w * 0.75 + 120 * s, 34 * s, 0.5);
 
       // Expanding hairlines either side of the type.
       const g = Ease.outQuint(inT);

@@ -347,12 +347,21 @@ export class VolumetricPass extends BasePass {
   /** Weather knobs — driven by `RenderAPI.setWeather` through the pass registry. */
   fogScale = 1;
   windSpeed = 0.02;
-  /** Base extinction per metre at ground level, before weather scaling. */
-  density = 0.0026;
+  /**
+   * Base extinction per metre at ground level, before weather scaling.
+   *
+   * This volume is *not* the only fog in the frame: every lit material also runs
+   * `boAerialPerspective` (0.0009/m, tinted by the sky cubemap along the view
+   * ray) and anything past `volFar` picks up the analytic distance term below.
+   * Budgeting 0.0026/m here on top of that lifted a shadowed wall 20 m away by
+   * ~40% and desaturated the whole midground — the froxel volume's job is local
+   * scattering and god rays, not bulk haze.
+   */
+  density = 0.0011;
   /** Fraction of the sun's illuminance that reaches the medium as in-scatter. */
-  sunStrength = 0.28;
+  sunStrength = 0.30;
   /** Fraction of the horizon sky radiance the medium scatters ambiently. */
-  ambientScale = 0.30;
+  ambientScale = 0.20;
 
   constructor(res: PostResources) {
     super(res);
@@ -495,9 +504,19 @@ export class VolumetricPass extends BasePass {
       this.setDefine(this.apply, 'VOL_SLICES', slices);
     }
 
-    // Froxel grid: ~12px cells, clamped so the atlas stays a sensible size.
-    const fx = Math.max(24, Math.min(240, Math.round(ctx.width / 12)));
-    const fy = Math.max(16, Math.min(160, Math.round(ctx.height / 12)));
+    // Froxel grid: 16px cells, clamped so the atlas stays a sensible size.
+    //
+    // 16px is the size Frostbite and the CoD engines use, and it is the right
+    // trade here for two reasons. The scatter stage is the expensive one — a
+    // 4-tap cascaded-shadow lookup plus three octaves of 3D noise per froxel —
+    // and the integration is quadratic in slice count *per froxel column*, so
+    // both scale with the cell area: 12px -> 16px is 1.78x less work in the two
+    // heaviest stages. And the volume is reconstructed with a trilinear fetch
+    // in APPLY_FRAG against a *depth-continuous* medium, so the extra 4px of
+    // cell width costs shaft-edge sharpness far below what the blue-noise slice
+    // dither and the temporal reprojection are already smoothing away.
+    const fx = Math.max(24, Math.min(240, Math.round(ctx.width / 16)));
+    const fy = Math.max(16, Math.min(160, Math.round(ctx.height / 16)));
     const tilesX = Math.ceil(Math.sqrt(slices));
     const tilesY = Math.ceil(slices / tilesX);
     const aw = fx * tilesX;
@@ -563,7 +582,7 @@ export class VolumetricPass extends BasePass {
     // (much darker) ground over the lower one; overcast evens the two out.
     const amb = this.ambientScale * (1 + 0.5 * atmo.weather);
     this.ambient.set(sky.r * amb, sky.g * amb, sky.b * amb);
-    const distantDensity = 0.0026 + 0.010 * atmo.weather;
+    const distantDensity = 0.0016 + 0.010 * atmo.weather;
     void sunLum;
 
     /* --- 1: scatter --------------------------------------------------------*/
@@ -580,9 +599,6 @@ export class VolumetricPass extends BasePass {
     (su.uAmbient.value as THREE.Vector3).copy(this.ambient);
     su.uVolNear.value = Math.max(0.25, ctx.cameraNear * 4);
     su.uVolFar.value = volFar;
-    // Calibration: clear air is ~0.0018/m of extinction, which is 3% opaque at
-    // 20 m and 28% at 180 m — depth without haze. The old 0.0071 milked
-    // everything past the first ten metres.
     su.uDensity.value = this.density * g.fogDensity * this.fogScale;
     su.uHeight.value = 1.5;
     su.uFalloff.value = 26;
@@ -619,7 +635,7 @@ export class VolumetricPass extends BasePass {
     au.uFrame.value = ctx.frame % 64;
     (au.uDistantFogColor.value as THREE.Vector3).copy(this.fogColor);
     au.uDistantFogDensity.value = distantDensity;
-    au.uDistantFogMax.value = 0.55 + 0.4 * ctx.atmosphere.weather;
+    au.uDistantFogMax.value = 0.40 + 0.5 * ctx.atmosphere.weather;
     ctx.blit(this.apply, output);
     return true;
   }

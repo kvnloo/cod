@@ -50,7 +50,9 @@ interface Footprint {
 
 const BLIP_CAPACITY = 32;
 /** Metres visible across the minimap. */
-const VIEW_METRES = 68;
+const VIEW_METRES = 86;
+/** Footprints taller than this read as structure; below it, as low cover. */
+const STRUCTURE_HEIGHT = 2.6;
 
 export class Minimap implements Widget {
   readonly name = 'minimap';
@@ -64,6 +66,14 @@ export class Minimap implements Widget {
   private readonly off: Array<() => void> = [];
   private readonly appear = new Spring(1, SPRING.heavy);
   private t = 0;
+  /**
+   * Footprints are composited through this rather than painted straight on to
+   * the HUD. Overlapping translucent quads accumulate alpha, which is exactly
+   * why the map used to read as pale blobs instead of buildings; drawing them
+   * opaque into a buffer and compositing the buffer once fixes it.
+   */
+  private buf: HTMLCanvasElement | null = null;
+  private bctx: CanvasRenderingContext2D | null = null;
 
   constructor(private pal: () => Palette) {
     for (let i = 0; i < BLIP_CAPACITY; i++) {
@@ -175,7 +185,7 @@ export class Minimap implements Widget {
     const headerH = 26 * s;
     const y = MARGIN * s * 0.7 + headerH;
 
-    const alpha = d.alpha * (1 - m.ads * 0.6);
+    const alpha = d.alpha * (1 - m.ads * 0.82);
     if (alpha <= 0.01) return;
 
     c.save();
@@ -201,48 +211,28 @@ export class Minimap implements Widget {
     const px = m.position.x;
     const pz = m.position.z;
 
+    /* --------------------------------------------- building footprints - */
+    this.compositeMap(d, size, x, y, cx, cy, px, pz, pxPerM);
+
     /* --------------------------------------------------- grid --------- */
-    c.strokeStyle = rgba(p.hair, 0.075);
+    // Drawn over the map bed, not under it, so the graticule reads as an
+    // overlay on a chart rather than as texture in the ground.
+    c.strokeStyle = rgba(p.hair, 0.07);
     c.lineWidth = hairWidth(d.dpr);
-    const gridStep = 10 * pxPerM;
-    const gx0 = cx - ((px % 10) * pxPerM) - Math.ceil(size / 2 / gridStep) * gridStep;
+    const gridStep = 20 * pxPerM;
+    const gx0 = cx - ((px % 20) * pxPerM) - Math.ceil(size / 2 / gridStep) * gridStep;
     for (let gx = gx0; gx < x + size + gridStep; gx += gridStep) {
       c.beginPath(); c.moveTo(gx, y); c.lineTo(gx, y + size); c.stroke();
     }
-    const gy0 = cy - ((pz % 10) * pxPerM) - Math.ceil(size / 2 / gridStep) * gridStep;
+    const gy0 = cy - ((pz % 20) * pxPerM) - Math.ceil(size / 2 / gridStep) * gridStep;
     for (let gy = gy0; gy < y + size + gridStep; gy += gridStep) {
       c.beginPath(); c.moveTo(x, gy); c.lineTo(x + size, gy); c.stroke();
     }
 
-    /* --------------------------------------------- building footprints - */
-    // Visible world rect, with a small skirt so partly-visible footprints still
-    // draw their edge. AABB rejection here is what keeps a 200-building level
-    // from costing anything on the minimap.
-    const half = VIEW_METRES * 0.5 + 4;
-    const wMinX = px - half, wMaxX = px + half;
-    const wMinZ = pz - half, wMaxZ = pz + half;
-    c.lineWidth = Math.max(1, 1.05 * s);
-    for (let i = 0; i < this.prints.length; i++) {
-      const fp = this.prints[i];
-      if (fp.maxX < wMinX || fp.minX > wMaxX || fp.maxZ < wMinZ || fp.minZ > wMaxZ) continue;
-      c.beginPath();
-      for (let k = 0; k < fp.pts.length; k += 2) {
-        const vx = cx + (fp.pts[k] - px) * pxPerM;
-        const vy = cy + (fp.pts[k + 1] - pz) * pxPerM;
-        if (k === 0) c.moveTo(vx, vy); else c.lineTo(vx, vy);
-      }
-      c.closePath();
-      const tall = clamp01(fp.height / 7);
-      c.fillStyle = `rgba(${(126 + tall * 46) | 0},${(146 + tall * 44) | 0},${(174 + tall * 40) | 0},${(0.17 + tall * 0.2).toFixed(3)})`;
-      c.fill();
-      c.strokeStyle = `rgba(196,220,248,${(0.26 + tall * 0.34).toFixed(3)})`;
-      c.stroke();
-    }
-
     /* --------------------------------------------------- range rings -- */
-    c.strokeStyle = rgba(p.hair, 0.12);
+    c.strokeStyle = rgba(p.hair, 0.11);
     c.lineWidth = hairWidth(d.dpr);
-    for (const r of [15, 30]) {
+    for (const r of [20, 40]) {
       c.beginPath();
       c.arc(cx, cy, r * pxPerM, 0, Math.PI * 2);
       c.stroke();
@@ -350,18 +340,115 @@ export class Minimap implements Widget {
     c.beginPath();
     c.moveTo(x + size / 2, y); c.lineTo(x + size / 2, y + 5 * s);
     c.stroke();
-    text(c, 'N', x + size / 2, y + 15 * s, {
-      size: 11 * s, weight: 700, family: 'cond', align: 'center', tracking: 1 * s,
-      color: rgba(p.ink, 0.8), shadow: Math.max(1, 1.2 * s),
+    text(c, 'N', x + size / 2, y + 16 * s, {
+      size: 12 * s, weight: 700, family: 'cond', align: 'center', tracking: 1 * s,
+      color: rgba(p.ink, 0.95), shadow: Math.max(1, 1.2 * s), outline: 2.4 * s,
     });
 
     // Scale legend.
-    text(c, `${Math.round(VIEW_METRES / 2)}M`, x + size - 7 * s, y + size - 7 * s, {
-      size: 9.5 * s, weight: 600, family: 'mono', align: 'right',
-      color: rgba(p.inkFaint, 0.85), shadow: 1,
+    text(c, `${Math.round(VIEW_METRES / 2)}M`, x + size - 8 * s, y + size - 8 * s, {
+      size: 10 * s, weight: 600, family: 'mono', align: 'right',
+      color: rgba(p.inkDim, 0.9), shadow: 1, outline: 2.2 * s,
     });
 
     c.restore();
+  }
+
+  /**
+   * Renders the map bed and every visible footprint into an offscreen buffer,
+   * then composites it once.
+   *
+   * Two tiers read very differently on a 200 px panel: structures (anything a
+   * player cannot shoot over) are solid silhouettes with a lit edge, and low
+   * cover is a dim outline only. Painting them opaque into the buffer means two
+   * overlapping walls stay one value instead of stacking into a bright blob.
+   */
+  private compositeMap(
+    d: DrawCtx, size: number, x: number, y: number,
+    cx: number, cy: number, px: number, pz: number, pxPerM: number,
+  ): void {
+    const bw = Math.max(2, Math.ceil(size * d.dpr));
+    if (!this.buf) {
+      this.buf = document.createElement('canvas');
+      this.bctx = this.buf.getContext('2d');
+    }
+    const buf = this.buf;
+    const b = this.bctx;
+    if (!buf || !b) return;
+    if (buf.width !== bw || buf.height !== bw) { buf.width = bw; buf.height = bw; }
+
+    b.setTransform(d.dpr, 0, 0, d.dpr, 0, 0);
+    b.clearRect(0, 0, size, size);
+
+    // Map bed: a cool slate that the sunlit street reads as negative space
+    // against. Slightly lighter toward the centre so the panel has some form.
+    const bed = b.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size * 0.75);
+    bed.addColorStop(0, 'rgb(30,38,50)');
+    bed.addColorStop(1, 'rgb(18,24,33)');
+    b.fillStyle = bed;
+    b.fillRect(0, 0, size, size);
+
+    const half = VIEW_METRES * 0.5 + 6;
+    const wMinX = px - half, wMaxX = px + half;
+    const wMinZ = pz - half, wMaxZ = pz + half;
+    // Buffer-local centre: the panel origin is (0,0) in here.
+    const ox = cx - x;
+    const oy = cy - y;
+
+    const trace = (fp: Footprint): void => {
+      b.beginPath();
+      for (let k = 0; k < fp.pts.length; k += 2) {
+        const vx = ox + (fp.pts[k] - px) * pxPerM;
+        const vy = oy + (fp.pts[k + 1] - pz) * pxPerM;
+        if (k === 0) b.moveTo(vx, vy); else b.lineTo(vx, vy);
+      }
+      b.closePath();
+    };
+
+    // Pass 1 — low cover, dim and outline-led.
+    b.lineWidth = Math.max(1, 1 * d.s);
+    for (let i = 0; i < this.prints.length; i++) {
+      const fp = this.prints[i];
+      if (fp.height >= STRUCTURE_HEIGHT) continue;
+      if (fp.maxX < wMinX || fp.minX > wMaxX || fp.maxZ < wMinZ || fp.minZ > wMaxZ) continue;
+      trace(fp);
+      b.fillStyle = 'rgb(44,54,68)';
+      b.fill();
+      b.strokeStyle = 'rgb(74,88,106)';
+      b.stroke();
+    }
+
+    // Pass 2 — structures, opaque, value keyed to height so the terrace reads
+    // as taller than the market stalls.
+    for (let i = 0; i < this.prints.length; i++) {
+      const fp = this.prints[i];
+      if (fp.height < STRUCTURE_HEIGHT) continue;
+      if (fp.maxX < wMinX || fp.minX > wMaxX || fp.maxZ < wMinZ || fp.minZ > wMaxZ) continue;
+      const tall = clamp01((fp.height - STRUCTURE_HEIGHT) / 9);
+      trace(fp);
+      b.fillStyle = `rgb(${(54 + tall * 22) | 0},${(64 + tall * 26) | 0},${(80 + tall * 30) | 0})`;
+      b.fill();
+    }
+
+    // Pass 3 — one edge pass over the structures. Separated from the fill so an
+    // edge is never buried under the next building's body.
+    b.lineWidth = Math.max(1, 1.05 * d.s);
+    b.strokeStyle = 'rgba(158,180,206,0.42)';
+    for (let i = 0; i < this.prints.length; i++) {
+      const fp = this.prints[i];
+      if (fp.height < STRUCTURE_HEIGHT) continue;
+      if (fp.maxX < wMinX || fp.minX > wMaxX || fp.maxZ < wMinZ || fp.minZ > wMaxZ) continue;
+      trace(fp);
+      b.stroke();
+    }
+
+    // Just short of opaque: enough to read as a chart, enough transparency that
+    // the panel still feels like part of the frame.
+    const g = d.c;
+    const prev = g.globalAlpha;
+    g.globalAlpha = prev * 0.94;
+    g.drawImage(buf, 0, 0, bw, bw, x, y, size, size);
+    g.globalAlpha = prev;
   }
 
   private drawHeader(

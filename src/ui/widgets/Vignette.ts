@@ -60,14 +60,17 @@ export class Vignette implements Widget {
     if (crit > 0.01) {
       const api = this.render();
       const beat = heartbeat(this.t);
-      api?.screenEffect({ damage: { intensity: Math.min(0.85, crit * (0.42 + 0.28 * beat)) } });
+      api?.screenEffect({ damage: { intensity: Math.min(0.6, crit * (0.3 + 0.22 * beat)) } });
       this.lastRequest = crit;
     } else if (this.lastRequest > 0) {
       this.lastRequest = 0;
     }
 
     // Desaturation plate.
-    const target = crit > 0.01 ? Math.min(0.72, crit * 0.8) : 0;
+    // Capped well short of full desaturation. Three red layers stacking (render
+    // damage pass + saturation plate + canvas vignette) turned the whole frame
+    // pink; the effect should read as tunnel vision, not a colour filter.
+    const target = crit > 0.01 ? Math.min(0.46, crit * 0.55) : 0;
     this.desatAmount = damp(this.desatAmount, target, 6.5, dt);
     if (this.desatAmount < 0.002) this.desatAmount = 0;
     if (this.desat) {
@@ -91,19 +94,19 @@ export class Vignette implements Widget {
 
     if (crit > 0.005) {
       const beat = heartbeat(this.t) * motion();
-      const intensity = clamp01(crit) * (0.34 + 0.3 * beat);
+      const intensity = clamp01(crit) * (0.24 + 0.22 * beat);
       const inner = outer * (0.30 - crit * 0.1 - beat * 0.045);
       const g = c.createRadialGradient(cx, cy, inner, cx, cy, outer);
       g.addColorStop(0, rgba(p.hostile, 0));
-      g.addColorStop(0.55, rgba(p.hostile, intensity * 0.20));
-      g.addColorStop(1, rgba(p.hostile, intensity * 0.78));
+      g.addColorStop(0.55, rgba(p.hostile, intensity * 0.14));
+      g.addColorStop(1, rgba(p.hostile, intensity * 0.68));
       c.fillStyle = g;
       c.fillRect(0, 0, d.w, d.h);
 
       // Darkening at the very edge keeps it from looking like a red filter.
       const dark = c.createRadialGradient(cx, cy, outer * 0.42, cx, cy, outer);
       dark.addColorStop(0, 'rgba(0,0,0,0)');
-      dark.addColorStop(1, `rgba(2,0,0,${(0.34 * crit).toFixed(3)})`);
+      dark.addColorStop(1, `rgba(2,0,0,${(0.46 * crit).toFixed(3)})`);
       c.fillStyle = dark;
       c.fillRect(0, 0, d.w, d.h);
     }

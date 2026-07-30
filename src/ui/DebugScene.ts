@@ -27,8 +27,12 @@ import { demoSummary } from './menus/SummaryMenu';
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => { window.setTimeout(r, ms); });
 
-export function registerUiDebugScene(hud: HUDSystem): void {
-  let ctxRef: EngineContext | null = null;
+export function registerUiDebugScene(hud: HUDSystem, ctx: EngineContext): void {
+  // Seeded with the live engine context so the shot timelines below work in the
+  // *real* level as well as in the `?debug=ui` lane. Without this, `step()` was
+  // a no-op outside the debug scene and every animated beat — killfeed slides,
+  // popup flights, hit-marker punches — collapsed into a single frame.
+  let ctxRef: EngineContext | null = ctx;
 
   const step = (frames: number): void => {
     const ctx = ctxRef;
@@ -60,6 +64,11 @@ export function registerUiDebugScene(hud: HUDSystem): void {
   /* -------------------------------------------------------- HUD state -- */
 
   const resetHud = (): void => {
+    // Shot setups run against the *real* level as well as the `?debug=ui` lane,
+    // and there the weapon and player systems are live — they would overwrite
+    // the posed magazine and health a frame later. The HUD owns its own state
+    // for the duration of a capture.
+    hud.model.syncMirrors = false;
     hud.closeMenus();
     hud.resetTransients();
     hud.clearObjective();
@@ -218,19 +227,20 @@ export function registerUiDebugScene(hud: HUDSystem): void {
   registerShots([
     {
       name: 'ui-combat',
-      description: 'Combat HUD mid-firefight: 62% health, 9 rounds left, live killfeed, '
-        + 'two directional damage indicators, XP popups in flight, a headshot hit marker '
-        + 'mid-punch, objective banner and a hold prompt at 62%',
-      position: [3.4, 1.68, 23], yaw: -6, pitch: -2.5, fov: 80, hour: 9.4, viewModel: false,
+      description: 'Combat HUD mid-firefight in the centre of the square at golden hour — '
+        + 'the brightest, busiest background on the map. 62% health, 9 rounds left, live '
+        + 'killfeed, two directional damage indicators, XP popups in flight, a headshot hit '
+        + 'marker mid-punch, objective banner and a hold prompt at 62%',
+      position: [1.5, 1.72, 14], yaw: 1.5, pitch: -1.5, fov: 80,
       setup: async () => {
         await combatTimeline();
       },
     },
     {
       name: 'ui-combat-ads',
-      description: 'Aiming down sights: reticle collapsed, HUD panels dimmed back, '
-        + 'compass and minimap faded, kill confirmed',
-      position: [3.4, 1.68, 23], yaw: -6, pitch: -2.5, fov: 62, hour: 9.4, viewModel: false,
+      description: 'Aiming down sights: reticle collapsed to nothing, minimap / compass / '
+        + 'killfeed dimmed back so the sight picture is clear, kill confirmed',
+      position: [4.5, 1.72, -12.0], yaw: -25.6, pitch: -0.8, fov: 56,
       setup: async () => {
         resetHud();
         objectives();
@@ -238,6 +248,10 @@ export function registerUiDebugScene(hud: HUDSystem): void {
         setHealth(84);
         setAmmo(21, 124);
         hud.model.weapon.ads = true;
+        // Announced as well as set, so a live weapons system poses the view
+        // model down its sight instead of leaving the gun at the hip in a shot
+        // whose whole point is the aimed sight picture.
+        bus.emit('weapon:ads', { active: true });
         step(90);
         hud.killfeed({
           killer: 'GHOST-ACTUAL', victim: 'REAPER', weapon: 'ar', headshot: true,
@@ -254,10 +268,69 @@ export function registerUiDebugScene(hud: HUDSystem): void {
       },
     },
     {
+      name: 'ui-spread',
+      description: 'Reticle bloom: sprinting-speed movement plus four rounds of recoil has '
+        + 'the crosshair wide open — the same frame as ui-combat-ads, which shows it shut',
+      // Starts 4.4 m south of the ui-combat mark and walks on to it, so the two
+      // shots frame the same view and differ only in the reticle.
+      position: [1.5, 1.72, 18.4], yaw: 1.5, pitch: -1.5, fov: 80,
+      setup: async () => {
+        resetHud();
+        objectives();
+        streaks();
+        setHealth(74);
+        setAmmo(14, 90);
+        // The movement term is derived from real camera displacement, so the
+        // spread spring only opens if the camera actually travels between steps.
+        const cam = ctxRef?.camera;
+        if (cam) {
+          for (let i = 0; i < 40; i++) {
+            cam.position.z -= 0.11;   // ≈6.6 m/s — sprint speed
+            step(1);
+          }
+        }
+        // Recoil on top of the movement bloom. Set directly rather than through
+        // `weapon:fire`, which would also drive muzzle FX and audio into a frame
+        // that is meant to isolate the reticle.
+        hud.model.recoil = 0.85;
+        // Four rounds fired inside the last 80 ms, so the magazine count is
+        // caught mid-tick: the digits are still counting 14 → 10 and the block
+        // is part-way through its punch when the shutter opens.
+        for (let i = 0; i < 4; i++) {
+          hud.model.weapon.ammo -= 1;
+          hud.model.ammoTicker.set(hud.model.weapon.ammo);
+          step(1);
+        }
+      },
+    },
+    {
+      name: 'ui-dark',
+      description: 'HUD legibility inside the warehouse — deep interior shade with a blown-out '
+        + 'roller door behind it, the opposite exposure problem to ui-combat',
+      position: [44.0, 5.9, -25.0], yaw: 102.3, pitch: -14.7, fov: 78,
+      setup: async () => {
+        resetHud();
+        objectives();
+        streaks();
+        setHealth(48);
+        setAmmo(6, 30);
+        step(40);
+        hud.killfeed({
+          killer: 'GHOST-ACTUAL', victim: 'VULTURE', weapon: 'smg', headshot: false,
+          killerIsPlayer: true, victimIsPlayer: false, friendlyKiller: true,
+        });
+        hud.scorePopup(100, 'ELIMINATION');
+        step(30);
+        hud.prompt({ id: 'ammo', label: 'Resupply', key: 'F', hold: 1.4, detail: '5.56 × 90' });
+        hud.promptProgress(0.34);
+        step(6);
+      },
+    },
+    {
       name: 'ui-critical',
       description: 'Critically wounded: desaturated frame, pulsing red vignette, '
         + 'three converging damage indicators, empty magazine and the reload prompt',
-      position: [-6.5, 1.66, 12], yaw: 26, pitch: -1, fov: 80, hour: 9.4, viewModel: false,
+      position: [-30.0, 1.72, 20.0], yaw: 0.5, pitch: -1.5, fov: 80,
       setup: async () => {
         resetHud();
         objectives();
@@ -279,7 +352,7 @@ export function registerUiDebugScene(hud: HUDSystem): void {
       name: 'ui-feedback',
       description: 'Reward layer: killstreak banner, elimination flourish, stacked XP '
         + 'popups flying to the tally, world-space damage numbers and a kill marker',
-      position: [-3.2, 1.75, 18], yaw: 9, pitch: -2, fov: 76, hour: 9.4, viewModel: false,
+      position: [7.5, 1.72, 5.0], yaw: 37.7, pitch: -1.3, fov: 76,
       setup: async () => {
         resetHud();
         objectives();
@@ -310,7 +383,7 @@ export function registerUiDebugScene(hud: HUDSystem): void {
     {
       name: 'ui-scoreboard',
       description: 'Scoreboard held open over the combat HUD',
-      position: [3.4, 1.68, 23], yaw: -6, pitch: -2.5, fov: 80, hour: 9.4, viewModel: false,
+      position: [1.5, 1.72, 14], yaw: 1.5, pitch: -1.5, fov: 80,
       setup: async () => {
         await combatTimeline();
         step(24);
@@ -323,7 +396,7 @@ export function registerUiDebugScene(hud: HUDSystem): void {
       name: 'ui-menu',
       description: 'Main menu over the live rendered scene: operator card, mission brief '
         + 'and activity feed',
-      position: [3.4, 1.95, 23], yaw: -6, pitch: 0.5, fov: 58, hour: 9.4, viewModel: false,
+      position: [6.0, 1.9, -14.5], yaw: 40.2, pitch: -3.0, fov: 58, viewModel: false,
       setup: async () => {
         resetHud();
         hud.setScoreboard(false);
@@ -337,7 +410,7 @@ export function registerUiDebugScene(hud: HUDSystem): void {
       name: 'ui-loadout',
       description: 'Loadout screen: weapon list, procedural weapon schematic with '
         + 'attachment callouts, stat bars with attachment deltas',
-      position: [3.4, 1.95, 23], yaw: -6, pitch: 0.5, fov: 58, hour: 9.4, viewModel: false,
+      position: [6.0, 1.9, -14.5], yaw: 40.2, pitch: -3.0, fov: 58, viewModel: false,
       setup: async () => {
         resetHud();
         hud.setScoreboard(false);
@@ -355,7 +428,7 @@ export function registerUiDebugScene(hud: HUDSystem): void {
       name: 'ui-settings',
       description: 'Settings screen, graphics tab — every control writes straight '
         + 'through to src/core/Settings.ts',
-      position: [3.4, 1.95, 23], yaw: -6, pitch: 0.5, fov: 58, hour: 9.4, viewModel: false,
+      position: [6.0, 1.9, -14.5], yaw: 40.2, pitch: -3.0, fov: 58, viewModel: false,
       setup: async () => {
         resetHud();
         hud.setScoreboard(false);
@@ -369,7 +442,7 @@ export function registerUiDebugScene(hud: HUDSystem): void {
       name: 'ui-summary',
       description: 'Post-match summary: result lockup, counted-up score breakdown, '
         + 'medals, rank progress',
-      position: [3.4, 1.95, 23], yaw: -6, pitch: 0.5, fov: 58, hour: 9.4, viewModel: false,
+      position: [6.0, 1.9, -14.5], yaw: 40.2, pitch: -3.0, fov: 58, viewModel: false,
       setup: async () => {
         resetHud();
         hud.setScoreboard(false);
@@ -382,7 +455,7 @@ export function registerUiDebugScene(hud: HUDSystem): void {
     {
       name: 'ui-pause',
       description: 'Pause menu over the frozen frame with the objective recap',
-      position: [3.4, 1.68, 23], yaw: -6, pitch: -2.5, fov: 80, hour: 9.4, viewModel: false,
+      position: [1.5, 1.72, 14], yaw: 1.5, pitch: -1.5, fov: 80,
       setup: async () => {
         await combatTimeline();
         step(30);

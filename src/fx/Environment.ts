@@ -18,7 +18,7 @@ import { FLAG, MODEL } from './GpuParticles';
 import { QUAD_BLEND, QUAD_MODE } from './Quads';
 import { FX_LAYER_TRANSPARENT, clamp, fxSkipPatch } from './Common';
 import { GBUFFER_PASSTHROUGH_DECL } from './Common';
-import { GLSL_COMMON } from '../render/Glsl';
+import { GLSL_COMMON, GLSL_SUN } from '../render/Glsl';
 import type { FxWorld } from './Context';
 
 /* -------------------------------------------------------------- light shaft -- */
@@ -38,6 +38,7 @@ void main() {
 const SHAFT_FRAG = /* glsl */ `
 precision highp float;
 ${GLSL_COMMON}
+${GLSL_SUN}
 in vec3 vLocal;
 in vec3 vWorld;
 layout(location = 0) out vec4 outColor;
@@ -50,7 +51,6 @@ uniform float uIntensity;
 uniform float uFalloff;
 uniform float uTime;
 uniform float uDust;
-uniform vec3 boSunDirWorld;
 uniform sampler2D boSceneDepth;
 uniform vec4 boCameraParams;
 
@@ -145,6 +145,17 @@ export class EnvironmentFX {
   private fires: Fire[] = [];
   private moteAcc = 0;
   private scrapAcc = 0;
+  /**
+   * Expiry clocks for the ambient layers.
+   *
+   * Rate alone is not a population control: the emitter runs off `dt`, and any
+   * hitch, capture step or slow frame silently multiplies how many particles
+   * are in flight. Ambient dust and litter are *always on*, so an unbounded
+   * population is how a scene ends up with scraps tumbling across the sky.
+   * These rings make the live count a hard number instead of an estimate.
+   */
+  private moteDeath: number[] = [];
+  private scrapDeath: number[] = [];
   private rainAcc = 0;
   private splashAcc = 0;
   private fogTimer = 0;
@@ -177,8 +188,18 @@ export class EnvironmentFX {
     for (const f of this.fires) f.active = false;
     for (const m of this.shafts) m.visible = false;
     this.moteAcc = 0; this.rainAcc = 0; this.scrapAcc = 0;
+    this.moteDeath.length = 0; this.scrapDeath.length = 0;
     this.fogBanks = 0;
     this.fogTimer = 0;
+  }
+
+  /** Drops expired entries and reports how many of a layer are still alive. */
+  private alive(ring: number[], now: number): number {
+    let n = 0;
+    for (let i = ring.length - 1; i >= 0; i--) {
+      if (ring[i] <= now) ring.splice(i, 1); else n++;
+    }
+    return n;
   }
 
   /* ------------------------------------------------------------------ fire */
@@ -279,62 +300,90 @@ export class EnvironmentFX {
       u.uTime.value = w.clock;
     }
 
-    /* --- ambient dust motes ------------------------------------------- */
+    /* --- ambient dust motes -------------------------------------------
+     *
+     * Motes are *additive glints*, not alpha sprites. A speck of dust is far
+     * too small to occlude anything: what the eye actually sees is the light
+     * it scatters, which means it flares when it is between you and the sun
+     * and disappears against a bright sky. Rendering them with alpha instead
+     * paints grey dots over the whole frame — the single fastest way to make
+     * a scene look like it has dirt on the lens.
+     */
     if (this.dust > 0) {
-      this.moteAcc += dt * 26 * this.dust * w.density;
-      const n = Math.floor(this.moteAcc);
+      const moteCap = Math.round(26 * this.dust * w.density);
+      const moteLive = this.alive(this.moteDeath, w.clock);
+      this.moteAcc += dt * 20 * this.dust * w.density;
+      const n = Math.min(Math.floor(this.moteAcc), Math.max(0, moteCap - moteLive));
       if (n > 0) {
-        this.moteAcc -= n;
+        this.moteAcc = 0;
+        const floorY = w.floorUnder(cam.x, cam.y, cam.z);
         g.begin({
           cell: CELL.GLOW_SOFT, frames: 1, model: MODEL.THIN,
-          flags: FLAG.FADEIN | FLAG.SHADOW,
-          r: 1.0, g: 0.94, b: 0.84, opacity: 0.22,
+          flags: FLAG.ADD | FLAG.FADEIN | FLAG.SHADOW | FLAG.NOSOFT,
+          r: 1.0, g: 0.93, b: 0.80, opacity: 0.14,
           drag: 2.4, gravity: 0.004, turbulence: 0.20,
         });
         for (let i = 0; i < n; i++) {
           const d = g.desc;
           const ma = rand.range(0, Math.PI * 2);
-          const mr = 4.5 + rand.next() * 12;
+          // Near field for parallax, but never so near that one mote can own a
+          // patch of the frame: at arm's length a 1 cm sprite is a 40 px smudge.
+          const mr = 3.2 + rand.next() * rand.next() * 10;
           d.px = cam.x + Math.cos(ma) * mr;
-          d.py = cam.y + rand.range(-2.2, 5.0);
+          d.py = clamp(cam.y + rand.range(-1.8, 1.6), floorY + 0.15, floorY + 4.5);
           d.pz = cam.z + Math.sin(ma) * mr;
           d.vx = rand.signed() * 0.10;
-          d.vy = rand.signed() * 0.06;
+          d.vy = rand.signed() * 0.05;
           d.vz = rand.signed() * 0.10;
-          d.sizeBegin = 0.008 + rand.next() * 0.016;
+          d.sizeBegin = 0.004 + rand.next() * 0.008;
           d.sizeEnd = d.sizeBegin;
-          d.lifetime = 6 + rand.next() * 8;
+          d.lifetime = 5 + rand.next() * 7;
+          this.moteDeath.push(w.clock + d.lifetime);
           g.push();
         }
       }
     }
 
-    /* --- wind-blown litter -------------------------------------------- */
+    /* --- wind-blown litter --------------------------------------------
+     *
+     * Scraps are the one environmental element that legitimately occludes,
+     * so they stay alpha — but they are kept small, sparse and inside the
+     * lower half of the sightline. Litter tumbling through the sky reads as
+     * a bug; litter skittering across the cobbles reads as wind.
+     */
     if (this.litter > 0) {
-      this.scrapAcc += dt * 1.4 * this.litter * w.density;
-      const n = Math.floor(this.scrapAcc);
+      // Three scraps in flight at full weather. Wind-blown litter is punctuation
+      // in a sightline, not a texture: more than a handful and the frame reads
+      // as though the lens is dirty.
+      const scrapCap = Math.max(1, Math.round(3 * this.litter * w.density));
+      const scrapLive = this.alive(this.scrapDeath, w.clock);
+      this.scrapAcc += dt * 0.55 * this.litter * w.density;
+      const n = Math.min(Math.floor(this.scrapAcc), Math.max(0, scrapCap - scrapLive));
       if (n > 0) {
-        this.scrapAcc -= n;
+        this.scrapAcc = 0;
         const floorY = w.floorUnder(cam.x, cam.y, cam.z);
         g.begin({
           cell: CELL.PAPER, frames: 1, model: MODEL.SOLID,
           flags: FLAG.SHADOW | FLAG.FADEIN,
-          r: 0.62, g: 0.58, b: 0.50, opacity: 1,
-          drag: 2.6, gravity: 0.06, turbulence: 2.2, floorY,
+          r: 0.60, g: 0.56, b: 0.49, opacity: 0.85,
+          drag: 2.6, gravity: 0.05, turbulence: 1.6, floorY,
         });
         for (let i = 0; i < n; i++) {
           const d = g.desc;
           const a = rand.range(0, Math.PI * 2);
-          const r = 11 + rand.next() * 14;
+          // Spawned far enough out that the wind cannot carry a scrap into the
+          // lens inside its own lifetime: at ~1 m/s it covers 7 m before it dies.
+          const r = 11 + rand.next() * 15;
           d.px = cam.x + Math.cos(a) * r;
-          d.py = floorY + rand.range(0.05, 2.4);
+          d.py = floorY + rand.range(0.04, 1.15);
           d.pz = cam.z + Math.sin(a) * r;
-          d.vx = w.wind.x * 1.4; d.vy = 0.2; d.vz = w.wind.z * 1.4;
-          d.sizeBegin = 0.04 + rand.next() * 0.09;
+          d.vx = w.wind.x * 1.4; d.vy = 0.12; d.vz = w.wind.z * 1.4;
+          d.sizeBegin = 0.009 + rand.next() * 0.016;
           d.sizeEnd = d.sizeBegin;
-          d.lifetime = 5 + rand.next() * 5;
+          d.lifetime = 4 + rand.next() * 3;
           d.rot = rand.range(0, 6.28);
-          d.spin = rand.signed() * 4;
+          d.spin = rand.signed() * 3;
+          this.scrapDeath.push(w.clock + d.lifetime);
           g.push();
         }
       }
@@ -443,7 +492,7 @@ export class EnvironmentFX {
         g.begin({
           cell: CELL.FLAME, frames: CELL.FLAME_FRAMES, model: MODEL.HOT,
           flags: FLAG.ADD | FLAG.ANIM | FLAG.FADEIN,
-          r: 1.0, g: 0.48, b: 0.14, opacity: 0.55, emissive: 0.8,
+          r: 1.0, g: 0.45, b: 0.13, opacity: 0.42, emissive: 0.42,
           drag: 1.6, gravity: -0.75, turbulence: 1.6,
         });
         for (let i = 0; i < n; i++) {
@@ -476,18 +525,18 @@ export class EnvironmentFX {
           d.vx = Math.cos(a) * 0.4 + w.wind.x * 0.5;
           d.vy = 1.6 + rand.next() * 2.2;
           d.vz = Math.sin(a) * 0.4 + w.wind.z * 0.5;
-          d.sizeBegin = 0.012 + rand.next() * 0.012;
-          d.sizeEnd = 0.004;
-          d.lifetime = 1.6 + rand.next() * 2.4;
+          d.sizeBegin = 0.020 + rand.next() * 0.018;
+          d.sizeEnd = 0.005;
+          d.lifetime = 1.8 + rand.next() * 2.6;
         });
         // smoke above the flame
         g.begin({
           cell: CELL.SMOKE, frames: CELL.SMOKE_FRAMES, model: MODEL.MEDIA,
           flags: FLAG.ANIM | FLAG.FADEIN | FLAG.SHADOW,
-          r: 0.13, g: 0.12, b: 0.115, opacity: 0.3,
-          drag: 0.8, gravity: -0.12, turbulence: 1.3,
+          r: 0.11, g: 0.104, b: 0.10, opacity: 0.52,
+          drag: 0.8, gravity: -0.16, turbulence: 1.3,
         });
-        g.pushMany(Math.max(1, n * 0.25), (d) => {
+        g.pushMany(Math.max(1, n * 0.42), (d) => {
           const a = rand.range(0, Math.PI * 2);
           d.px = f.x + Math.cos(a) * f.radius * 0.6;
           d.py = f.y + f.radius * 1.6;
@@ -507,7 +556,7 @@ export class EnvironmentFX {
         w.light({
           x: f.x, y: f.y + f.radius * 1.2, z: f.z,
           color: 0xff7a2a,
-          intensity: 12 * f.intensity * (0.7 + rand.next() * 0.6),
+          intensity: 7 * f.intensity * (0.7 + rand.next() * 0.6),
           radius: f.radius * 14,
           lifetime: 0.3,
           decay: 'flicker',

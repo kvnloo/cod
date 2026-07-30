@@ -72,12 +72,35 @@ export function createPasses(): RenderPass[] {
   passes.sort((a, b) => a.order - b.order);
   registry.clear();
   for (const p of passes) registry.set(p.name, p);
+  installProfilingHandle();
   return passes;
 }
 
 /** Looks up a pass created by `createPasses()`, for tuning at runtime. */
 export function getPass<T extends RenderPass>(name: string): T | undefined {
   return registry.get(name) as T | undefined;
+}
+
+/**
+ * Ablation handle for the perf harness, installed in capture mode only.
+ *
+ * There is exactly one `TIME_ELAPSED_EXT` query in flight per frame (the
+ * renderer's whole-frame timer) and WebGL2 forbids nesting them, so a per-pass
+ * GPU timer is not available. Toggling one pass off and re-reading the
+ * whole-frame GPU time is, and it measures the thing that actually matters:
+ * what the frame costs with and without that pass.
+ */
+function installProfilingHandle(): void {
+  const params = new URLSearchParams(globalThis.location?.search ?? '');
+  if (params.get('capture') !== '1') return;
+  (globalThis as unknown as Record<string, unknown>).__POSTPASS__ = {
+    list: () => [...registry.values()].map((p) => ({ name: p.name, order: p.order, enabled: p.enabled })),
+    setEnabled: (name: string, on: boolean) => {
+      const p = registry.get(name);
+      if (p) p.enabled = on;
+      return !!p;
+    },
+  };
 }
 
 /**

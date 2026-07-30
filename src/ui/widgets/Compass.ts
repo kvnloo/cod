@@ -71,7 +71,7 @@ export class Compass implements Widget {
     const x = Math.round(d.w / 2 - w / 2);
     const y = Math.round(MARGIN * s * 0.42);
 
-    const alpha = d.alpha * (1 - m.ads * 0.55);
+    const alpha = d.alpha * (1 - m.ads * 0.78);
     if (alpha <= 0.01) return;
 
     /* ------------------------------------------------ offscreen strip -- */
@@ -91,6 +91,20 @@ export class Compass implements Widget {
     const tickBase = ROW_TICK_BASE * s;
     const tickTop = ROW_TICK_TOP * s;
 
+    /* --- backing band ------------------------------------------------ */
+    // The strip spends most of its life against a blown-out sky, where a
+    // hairline tick at 40% white is simply not there. A shallow dark band under
+    // the tick rule is what shipped compasses use; it is masked to the same
+    // feathered ends as the strip itself, so it never reads as a bar.
+    const bandTop = (ROW_LABEL - 20) * s;
+    const band = c.createLinearGradient(0, bandTop, 0, tickBase + 2 * s);
+    band.addColorStop(0, 'rgba(2,5,10,0)');
+    band.addColorStop(0.42, 'rgba(2,5,10,0.14)');
+    band.addColorStop(0.74, 'rgba(2,5,10,0.32)');
+    band.addColorStop(1, 'rgba(2,5,10,0.44)');
+    c.fillStyle = band;
+    c.fillRect(0, bandTop, w, tickBase - bandTop + 2 * s);
+
     /* --- ticks ------------------------------------------------------- */
     const start = Math.floor((bearing - SPAN_DEG / 2) / 5) * 5;
     for (let deg = start; deg <= bearing + SPAN_DEG / 2 + 5; deg += 5) {
@@ -100,8 +114,8 @@ export class Compass implements Widget {
       const norm = ((deg % 360) + 360) % 360;
       if (norm % 45 === 0) continue; // cardinals draw their own, heavier tick
       const major = norm % 15 === 0;
-      c.strokeStyle = rgba(p.ink, major ? 0.72 : 0.4);
-      c.lineWidth = Math.max(1, (major ? 1.6 : 1.1) * s);
+      c.strokeStyle = rgba(p.ink, major ? 0.9 : 0.56);
+      c.lineWidth = Math.max(1, (major ? 1.8 : 1.2) * s);
       c.beginPath();
       c.moveTo(px, tickBase);
       c.lineTo(px, major ? tickTop : tickBase - (tickBase - tickTop) * 0.5);
@@ -158,10 +172,13 @@ export class Compass implements Widget {
     g.save();
     g.globalAlpha = alpha;
 
-    // Baseline rule under the whole strip.
+    // Baseline rule under the whole strip, with its own dark keyline so the
+    // rule itself does not vanish into a bright sky.
+    g.fillStyle = 'rgba(2,5,10,0.5)';
+    g.fillRect(x + w * 0.08, y + tickBase - 1, w * 0.84, Math.max(1.2, 1.4 * s) + 2);
     const grad = g.createLinearGradient(x, 0, x + w, 0);
     grad.addColorStop(0, rgba(p.hair, 0));
-    grad.addColorStop(0.5, rgba(p.hair, 0.55));
+    grad.addColorStop(0.5, rgba(p.hair, 0.72));
     grad.addColorStop(1, rgba(p.hair, 0));
     g.fillStyle = grad;
     g.fillRect(x, y + tickBase, w, Math.max(1.2, 1.4 * s));

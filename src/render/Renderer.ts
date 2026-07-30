@@ -297,6 +297,38 @@ export class RenderSystem implements System, RenderAPI {
     this.applyQuality();
 
     await this.loadPasses();
+    this.installDebugHandle();
+  }
+
+  /**
+   * Automation handle for the capture harness. Lets a script flip one render
+   * feature at a time between shots so an A/B pair isolates exactly one change —
+   * the only honest way to tell whether e.g. GTAO is actually contributing.
+   * Read-only from the game's point of view; nothing in the frame loop uses it.
+   */
+  private installDebugHandle(): void {
+    (globalThis as unknown as Record<string, unknown>).__RENDER__ = {
+      gfx: settings.gfx,
+      passes: () => this.passes.map((p) => ({ name: p.name, order: p.order, enabled: p.enabled !== false })),
+      setPass: (name: string, on: boolean) => {
+        for (const p of this.passes) if (p.name === name) p.enabled = on;
+      },
+      set: (key: string, value: unknown) => {
+        (settings.gfx as unknown as Record<string, unknown>)[key] = value;
+      },
+      sun: () => {
+        const s = this.sky.sunIlluminance;
+        const sh = this.sky.shCoefficients[0];
+        return {
+          sun: [s.r, s.g, s.b],
+          shDc: [sh.x, sh.y, sh.z],
+          ambientIntensity: this.sky.ambientIntensity,
+          exposure: this.exposure.exposure,
+          hours: this.sky.hours,
+          sunDir: this.sky.sun.direction.toArray(),
+        };
+      },
+    };
   }
 
   private lightBudget(): number {
@@ -481,9 +513,12 @@ export class RenderSystem implements System, RenderAPI {
     // Cycle over 8 frames: long enough to decorrelate, short enough that TAA's
     // history window always covers a full rotation.
     u.boFrameJitter.value = wantJitter ? (this.frameIndex % 8) / 8 : 0;
+    // x strength, y ray length (m), z steps, w thickness (m). The ray has to be
+    // long enough to reach the ground from the base of a prop — 0.45 m only ever
+    // caught the crease itself, which is why nothing looked planted.
     u.boContactParams.value.set(
-      g.contactShadows ? 0.85 : 0,
-      0.45, g.shadows ? 14 : 0, 0.55,
+      g.contactShadows ? 1.0 : 0,
+      0.85, g.shadows ? 16 : 0, 0.42,
     );
     this.updateFog();
 
@@ -550,6 +585,7 @@ export class RenderSystem implements System, RenderAPI {
       grade: this.gradeVec,
       vignette: this.passOwnsGrain() ? 0 : g.vignette * 0.6,
       grain: this.passOwnsGrain() ? 0 : g.filmGrain * 0.5,
+      dither: this.passOwnsGrain() ? 0 : 1 / 255,
       time: this.elapsed,
     });
 

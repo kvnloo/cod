@@ -75,8 +75,11 @@ export const CSS = `
 .ob-subs.is-on { opacity: calc(var(--ob-opacity)); }
 .ob-subs-line {
   display: inline-block;
-  padding: calc(var(--ob-u) * 5) calc(var(--ob-u) * 14);
-  background: rgba(4,7,12,.72);
+  padding: calc(var(--ob-u) * 5) calc(var(--ob-u) * 22) calc(var(--ob-u) * 5) calc(var(--ob-u) * 14);
+  /* Fades out to the right rather than ending on a hard rectangle edge — a
+     square plate floating over the frame is the giveaway that this is a web
+     page and not a game. */
+  background: linear-gradient(90deg, rgba(4,7,12,.8) 0%, rgba(4,7,12,.74) 62%, rgba(4,7,12,0) 100%);
   border-left: 2px solid var(--ob-accent);
   font-family: var(--ob-sans);
   font-size: calc(var(--ob-u) * 17);
@@ -84,7 +87,7 @@ export const CSS = `
   line-height: 1.34;
   letter-spacing: .012em;
   color: var(--ob-ink);
-  text-shadow: 0 1px 3px rgba(0,0,0,.9);
+  text-shadow: 0 1px 3px rgba(0,0,0,.95), 0 0 calc(var(--ob-u)*7) rgba(0,0,0,.7);
 }
 .ob-subs-speaker {
   font-family: var(--ob-cond);
@@ -268,7 +271,8 @@ table.ob-sb tr.is-me td { color: var(--ob-accent); background: rgba(255,194,75,.
 
 /* settings rows */
 .ob-row {
-  max-width: calc(var(--ob-u)*1180);
+  /* No max-width: with the active-profile aside taking the right third, capping
+     the rows left a second, pointless gutter inside the panel. */
   display: grid; grid-template-columns: minmax(0,1fr) calc(var(--ob-u)*280);
   align-items: center; gap: calc(var(--ob-u)*18);
   padding: calc(var(--ob-u)*7) 0;

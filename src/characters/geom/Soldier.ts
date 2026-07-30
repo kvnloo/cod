@@ -119,9 +119,14 @@ class SoldierArt {
       { y: this.spineY + 0.020 * s, rx: 0.149 * k, rz: 0.114 * k * cd, e: 2.9 },
       { y: this.spineY + 0.105 * s, rx: 0.163 * k, rz: 0.123 * k * cd, e: 3.0 },
       { y: this.chestY, rx: 0.182 * k, rz: 0.133 * k * cd, e: 3.0 },
-      { y: this.chestY + 0.080 * s, rx: 0.190 * k, rz: 0.128 * k * cd, e: 3.1 },
-      { y: this.shoulderY + 0.010 * s, rx: shoulderX * 1.03, rz: 0.117 * k, e: 3.0 },
-      { y: this.shoulderY + 0.055 * s, rx: 0.140 * k, rz: 0.103 * k, e: 2.7 },
+      { y: this.chestY + 0.080 * s, rx: 0.194 * k, rz: 0.130 * k * cd, e: 3.1 },
+      // Deltoid shelf: the widest point of a man in kit is a little *below* the
+      // shoulder joint, and the trapezius ramps in above it. Cutting straight
+      // from the chest to a narrow neck is what gives procedural characters
+      // that dropped-shoulder, coat-hanger look.
+      { y: this.shoulderY - 0.012 * s, rx: shoulderX * 1.07, rz: 0.124 * k, e: 3.0 },
+      { y: this.shoulderY + 0.036 * s, rx: shoulderX * 0.94, rz: 0.113 * k, e: 2.9 },
+      { y: this.shoulderY + 0.074 * s, rx: 0.128 * k, rz: 0.099 * k, e: 2.7 },
       { y: this.neckY + 0.050 * s, rx: 0.086 * k, rz: 0.082 * k, e: 2.5 },
     ];
   }
@@ -351,6 +356,21 @@ class SoldierArt {
 
     b.slot(SLOT.CLOTH).color(this.app.uniformTint).bind(BIND.torso);
     b.tube(rings, sides, { capStart: true, capEnd: false, warp });
+
+    // Stand-up collar. A combat shirt's collar is the only thing between the
+    // shoulder line and the head, and without it the neck reads as a pipe
+    // pushed into a bag.
+    if (this.mid) {
+      const nr = 0.052 * this.s * (0.94 + 0.14 * this.bulk);
+      const y0 = this.neckY - 0.020 * this.s;
+      b.slot(SLOT.CLOTH).color(this.app.uniformTint, 0.94).bind(BIND.neck);
+      b.tube([
+        { y: y0, rx: nr * 1.62, rz: nr * 1.58, e: 2.6 },
+        { y: y0 + 0.030 * this.s, rx: nr * 1.30, rz: nr * 1.28, e: 2.5 },
+        { y: y0 + 0.072 * this.s, rx: nr * 1.20, rz: nr * 1.20, e: 2.5 },
+        { y: y0 + 0.086 * this.s, rx: nr * 1.24, rz: nr * 1.24, e: 2.5 },
+      ], this.lod === 0 ? 14 : 9, {});
+    }
   }
 
   private neck(): void {
@@ -358,7 +378,7 @@ class SoldierArt {
     const covered = this.app.faceGear === 'balaclava' || this.app.faceGear === 'shemagh';
     const r = 0.0455 * this.s * (0.92 + 0.16 * this.bulk);
     b.slot(covered ? SLOT.GEAR : SLOT.SKIN)
-      .color(covered ? this.app.hardTint : this.app.skinTint, covered ? 0.68 : 0.9)
+      .color(covered ? this.app.hardTint : this.app.skinTint, covered ? 1.45 : 0.94)
       .bind(BIND.neck);
     b.tube([
       { y: this.neckY - 0.055 * this.s, rx: r * 1.25, rz: r * 1.2, e: 2.6 },
@@ -395,17 +415,19 @@ class SoldierArt {
       return out;
     };
 
+    // Deltoid mass at the top, a slight bicep swell, a narrow elbow, a forearm
+    // that flares back out below it and a wrist that is genuinely thin.
     const ctrl: [number, number][] = [
-      [sh.y + 0.062 * s, 0.048],
-      [sh.y + 0.028 * s, 0.060],
-      [sh.y - 0.010 * s, 0.064],
-      [THREE.MathUtils.lerp(sh.y, el.y, 0.35), 0.057],
-      [THREE.MathUtils.lerp(sh.y, el.y, 0.72), 0.051],
+      [sh.y + 0.066 * s, 0.052],
+      [sh.y + 0.030 * s, 0.068],
+      [sh.y - 0.014 * s, 0.072],
+      [THREE.MathUtils.lerp(sh.y, el.y, 0.35), 0.061],
+      [THREE.MathUtils.lerp(sh.y, el.y, 0.72), 0.052],
       [el.y + 0.010 * s, 0.049],
-      [THREE.MathUtils.lerp(el.y, wr.y, 0.22), 0.052],
-      [THREE.MathUtils.lerp(el.y, wr.y, 0.58), 0.044],
-      [wr.y + 0.020 * s, 0.035],
-      [wr.y - 0.006 * s, 0.033],
+      [THREE.MathUtils.lerp(el.y, wr.y, 0.22), 0.053],
+      [THREE.MathUtils.lerp(el.y, wr.y, 0.58), 0.043],
+      [wr.y + 0.020 * s, 0.034],
+      [wr.y - 0.006 * s, 0.032],
     ];
 
     const sleeveEnd = this.app.sleeves === 'long'
@@ -450,17 +472,19 @@ class SoldierArt {
       b.tube(skin, this.lod === 0 ? 10 : 7, {});
     }
 
-    // Shoulder pad / reinforced deltoid panel.
-    if (this.mid && this.app.carrier !== 'none') {
-      // A closed band around the deltoid: a shell patch here would need
-      // per-side winding care for no visual gain.
-      b.slot(SLOT.GEAR).color(this.app.webbingTint, 0.95).bind(L ? BIND.shoulderL : BIND.shoulderR);
+    // Deltoid protection. Only heavy rigs and juggernauts wear a brassard; on a
+    // normal plate carrier a full band around the arm reads as a pale cuff
+    // clamped onto the shoulder, which was the single most artificial thing on
+    // the model. Everyone else just gets the yoke strap lying on the trapezius.
+    const heavyRig = this.app.carrier === 'heavy';
+    if (this.mid && heavyRig) {
+      b.slot(SLOT.GEAR).color(this.app.webbingTint, 0.90).bind(L ? BIND.shoulderL : BIND.shoulderR);
       const padRings: Ring[] = [];
-      const padYs = [sh.y + 0.062 * s, sh.y + 0.040 * s, sh.y - 0.045 * s, sh.y - 0.070 * s];
+      const padYs = [sh.y + 0.058 * s, sh.y + 0.030 * s, sh.y - 0.060 * s, sh.y - 0.092 * s];
       for (let i = 0; i < padYs.length; i++) {
         const y = padYs[i];
         at(y, xz);
-        const inflate = i === 0 || i === padYs.length - 1 ? 1.02 : 1.10;
+        const inflate = i === 0 || i === padYs.length - 1 ? 1.01 : 1.13;
         const r = ctrlRadius(ctrl, y) * k * inflate;
         padRings.push({ y, x: xz.x, z: xz.y, rx: r * 0.99, rz: r * 1.06, e: 2.2 });
       }
@@ -499,6 +523,17 @@ class SoldierArt {
       _v2.copy(wr).addScaledVector(dir, 0.058 * s);
       b.roundedBox(_v2, _sz.set(0.058 * s, 0.108 * s, 0.088 * s), 0.026 * s, this.detail ? 3 : 2, q);
 
+      if (this.detail) {
+        // Finger block: four fingers curled round the grip, split by two
+        // grooves. Without it the hand is a rounded brick at every range.
+        b.color(this.app.gloves ? this.app.gloveTint : this.app.skinTint, 0.94);
+        for (let f = 0; f < 2; f++) {
+          _v2.copy(wr).addScaledVector(dir, (0.036 + f * 0.046) * s);
+          _v2.z += 0.036 * s;
+          b.roundedBox(_v2, _sz.set(0.052 * s, 0.040 * s, 0.030 * s), 0.013 * s, 2, q);
+        }
+        b.color(this.app.gloves ? this.app.gloveTint : this.app.skinTint);
+      }
       if (this.mid) {
         // Thumb, wrapped over the top of the fist.
         _v2.copy(wr).addScaledVector(dir, 0.045 * s);
@@ -587,7 +622,7 @@ class SoldierArt {
       // A balaclava is flat knit, so it uses the plain-weave gear material —
       // stamping camo on a head-sized patch just makes the face one blob of
       // whatever colour that blob happened to be.
-      b.slot(SLOT.GEAR).color(this.app.hardTint, 0.65).bind(BIND.head);
+      b.slot(SLOT.GEAR).color(this.app.hardTint, 1.45).bind(BIND.head);
       b.sphere(centre, radius, segU, segV, shape, this.app.faceGear === 'balaclava' ? eyePort : undefined);
       // Skin underneath, only where the port shows.
       b.slot(SLOT.SKIN).color(this.app.skinTint).bind(BIND.head);
@@ -599,7 +634,7 @@ class SoldierArt {
       b.sphere(centre, radius, segU, segV, shape);
       // Cropped hair.
       if (this.app.headGear === 'none' || this.app.headGear === 'cap') {
-        b.color(this.app.skinTint, 0.34);
+        b.color(this.app.skinTint, 0.26);
         const hair = radius.clone().multiplyScalar(1.022);
         b.sphere(centre, hair, Math.max(10, segU >> 1), Math.max(8, segV >> 1), shape,
           (u, v) => {
@@ -623,18 +658,21 @@ class SoldierArt {
     if (this.detail && this.app.eyeGear !== 'visor') {
       // Eyes — dark, deep in the socket. They do more for "alive" than anything
       // else on the head at close range.
-      b.slot(SLOT.SKIN).colorRGB(0.30, 0.29, 0.27).bind(BIND.head);
+      // Sclera is one of the brightest things on a human — near 0.5 albedo.
+      // Tinted at 0.30 it disappeared into the socket shadow, which is why the
+      // faces read as empty holes.
+      b.slot(SLOT.SKIN).colorRGB(0.94, 0.92, 0.88).bind(BIND.head);
       for (const side of [1, -1] as const) {
         _v.set(side * 0.030 * hs, centre.y + 0.014 * hs, centre.z + radius.z * 0.855);
         b.sphere(_v, _sz.set(0.0125 * hs, 0.0105 * hs, 0.009 * hs), 9, 7);
         // Iris/pupil: a small dark disc set into the eyeball.
-        b.colorRGB(0.045, 0.042, 0.040);
+        b.colorRGB(0.16, 0.14, 0.12);
         _v.z += 0.005 * hs;
         b.sphere(_v, _sz.set(0.0058 * hs, 0.0058 * hs, 0.004 * hs), 8, 6);
-        b.colorRGB(0.30, 0.29, 0.27);
+        b.colorRGB(0.94, 0.92, 0.88);
       }
       // Brows: a dark ridge that gives the eyes somewhere to sit.
-      b.color(this.app.skinTint, 0.30);
+      b.color(this.app.skinTint, 0.34);
       for (const side of [1, -1] as const) {
         _v.set(side * 0.034 * hs, centre.y + 0.036 * hs, centre.z + radius.z * 0.86);
         b.sphere(_v, _sz.set(0.024 * hs, 0.0055 * hs, 0.007 * hs), 8, 5);
@@ -649,8 +687,10 @@ class SoldierArt {
     const b = this.b;
     const hs = this.hs;
     const resp = this.app.faceGear === 'respirator';
+    // A shemagh or half-mask that renders at 2 % reflectance is not "black
+    // cloth", it is a hole in the head. Real black knit sits nearer 4–5 %.
     b.slot(resp ? SLOT.HARD : SLOT.GEAR)
-      .color(this.app.hardTint, resp ? 0.9 : 0.72)
+      .color(this.app.hardTint, resp ? 1.2 : 1.35)
       .bind(BIND.head);
     b.patchSize(0.16, 0.12);
     b.solidPatch(this.detail ? 9 : 5, this.detail ? 6 : 3, (u, v, out) => {
@@ -666,7 +706,7 @@ class SoldierArt {
     }, 0.008 * hs);
 
     if (resp && this.mid) {
-      b.slot(SLOT.METAL).color(this.app.hardTint, 1.4).bind(BIND.head);
+      b.slot(SLOT.METAL).color(this.app.metalTint, 1.4).bind(BIND.head);
       for (const side of [1, -1] as const) {
         _v.set(side * 0.055 * hs, centre.y - 0.055 * hs, centre.z + radius.z * 0.86);
         _v2.copy(_v).add(new THREE.Vector3(side * 0.020 * hs, -0.010 * hs, 0.038 * hs));
@@ -739,16 +779,17 @@ class SoldierArt {
 
     if (!this.mid) return;
 
-    // Side accessory rails.
-    b.slot(SLOT.METAL).color(this.app.hardTint, 1.15).bind(BIND.head);
+    // Side accessory rails, lying along the shell. Sunk inside it they used to
+    // surface as two black tabs poking out of the helmet.
+    b.slot(SLOT.METAL).color(this.app.metalTint, 1.1).bind(BIND.head);
     for (const side of [1, -1] as const) {
-      _v.set(side * R.x * 0.90, c.y + R.y * 0.30, c.z + R.z * 0.34);
-      _v2.set(side * R.x * 0.86, c.y + R.y * 0.16, c.z - R.z * 0.52);
-      b.cylinder(_v, _v2, 0.008 * hs, 0.008 * hs, 5, true);
+      _v.set(side * R.x * 1.00, c.y + R.y * 0.30, c.z + R.z * 0.36);
+      _v2.set(side * R.x * 0.97, c.y + R.y * 0.14, c.z - R.z * 0.50);
+      b.cylinder(_v, _v2, 0.011 * hs, 0.010 * hs, 8, true);
     }
 
     // NVG shroud on the forehead.
-    b.slot(SLOT.METAL).color(this.app.hardTint, 0.9).bind(BIND.head);
+    b.slot(SLOT.METAL).color(this.app.metalTint, 0.9).bind(BIND.head);
     _v.set(0, c.y + R.y * 0.42, c.z + R.z * 0.86);
     b.roundedBox(_v, _sz.set(0.056 * hs, 0.040 * hs, 0.034 * hs), 0.008 * hs, 1);
 
@@ -793,7 +834,7 @@ class SoldierArt {
     const b = this.b;
     const hs = this.hs;
     const down = this.app.nvgDown;
-    b.slot(SLOT.METAL).color(this.app.hardTint, 0.95).bind(BIND.head);
+    b.slot(SLOT.METAL).color(this.app.metalTint, 0.95).bind(BIND.head);
 
     // Arm from the shroud.
     const armA = new THREE.Vector3(0, c.y + R.y * 0.42, c.z + R.z * 0.90);
@@ -895,19 +936,38 @@ class SoldierArt {
 
     if (g === 'glasses' || g === 'goggles') {
       const wide = g === 'goggles';
-      // Frame + lens as one curved shell across the eyes.
-      b.slot(SLOT.METAL).colorRGB(0.05, 0.055, 0.06).bind(BIND.head);
+      // Frame + lens as one curved shell across the eyes. Smoke grey, not
+      // black: a lens takes its value from what it reflects, and an ink-black
+      // F0 reflects nothing at all and reads as a missing face.
+      b.slot(SLOT.METAL).colorRGB(0.60, 0.63, 0.68).bind(BIND.head);
       b.patchSize(0.20, 0.06);
+      // Heights are fractions of the *skull* radius, not of the global scale.
+      // Read as multiples of `hs` these spanned 10 cm — a welding shield across
+      // the whole face, which is exactly how it rendered.
       b.solidPatch(this.lod === 0 ? 14 : 8, 3, (u, v, out) => {
         const ang = THREE.MathUtils.lerp(-88 * DEG, 88 * DEG, u);
-        const yy = THREE.MathUtils.lerp(wide ? 0.055 : 0.045, wide ? -0.045 : -0.020, v);
-        const sr = 1.0;
+        const yy = THREE.MathUtils.lerp(wide ? 0.30 : 0.24, wide ? -0.18 : -0.06, v);
         out.set(
-          Math.sin(ang) * R.x * 1.045 * sr,
-          eyeY + yy * hs + Math.abs(Math.sin(ang)) * 0.012 * hs,
+          Math.sin(ang) * R.x * 1.045,
+          eyeY + yy * R.y + Math.abs(Math.sin(ang)) * 0.10 * R.y,
           c.z + Math.cos(ang) * R.z * 1.045,
         );
       }, 0.006 * hs);
+
+      // Rim: a soft frame the lens sits in.
+      b.slot(SLOT.GEAR).color(this.app.hardTint, 1.1).bind(BIND.head);
+      {
+        const rim: THREE.Vector3[] = [];
+        for (let i = 0; i <= 10; i++) {
+          const ang = THREE.MathUtils.lerp(-92 * DEG, 92 * DEG, i / 10);
+          rim.push(new THREE.Vector3(
+            Math.sin(ang) * R.x * 1.05,
+            eyeY + (wide ? 0.34 : 0.27) * R.y + Math.abs(Math.sin(ang)) * 0.10 * R.y,
+            c.z + Math.cos(ang) * R.z * 1.05,
+          ));
+        }
+        b.ribbon(rim, 0.020 * hs, 0.008 * hs, _wy);
+      }
 
       if (wide) {
         // Foam gasket + strap.
@@ -929,15 +989,16 @@ class SoldierArt {
         b.ribbon(pts, 0.030 * hs, 0.008 * hs, _wy);
       }
     } else if (g === 'visor') {
-      b.slot(SLOT.METAL).colorRGB(0.045, 0.05, 0.055).bind(BIND.head);
+      b.slot(SLOT.METAL).colorRGB(0.52, 0.56, 0.62).bind(BIND.head);
       b.patchSize(0.24, 0.14);
+      // Full-face shield: brow to jaw, in skull-radius units.
       b.solidPatch(this.lod === 0 ? 16 : 9, 5, (u, v, out) => {
         const ang = THREE.MathUtils.lerp(-92 * DEG, 92 * DEG, u);
-        const yy = THREE.MathUtils.lerp(0.075, -0.30, v);
-        const sr = Math.sqrt(Math.max(0.15, 1 - yy * yy * 0.6));
+        const yy = THREE.MathUtils.lerp(0.46, -0.92, v);
+        const sr = Math.sqrt(Math.max(0.24, 1 - yy * yy * 0.55));
         out.set(
           Math.sin(ang) * R.x * 1.07 * sr,
-          c.y + yy * hs * 0.9,
+          c.y + yy * R.y,
           c.z + Math.cos(ang) * R.z * 1.07 * sr,
         );
       }, 0.008 * hs);
@@ -971,7 +1032,7 @@ class SoldierArt {
 
     if (this.detail) {
       // Boom mic.
-      b.slot(SLOT.METAL).color(this.app.hardTint, 1.2).bind(BIND.head);
+      b.slot(SLOT.METAL).color(this.app.metalTint, 1.2).bind(BIND.head);
       const a = new THREE.Vector3(-R.x * 1.08, c.y - 0.020 * hs, c.z + 0.010 * hs);
       const m = new THREE.Vector3(-R.x * 0.72, c.y - 0.060 * hs, c.z + R.z * 0.86);
       b.cylinder(a, m, 0.005 * hs, 0.004 * hs, 5, true);
@@ -991,7 +1052,11 @@ class SoldierArt {
 
     const yTop = this.chestY + (heavy ? 0.085 : 0.070) * s;
     const yBot = this.spineY - (heavy ? 0.045 : 0.010) * s;
-    const gap = (plate ? 0.016 : 0.011) * s;
+    // Stand-off of the plate's *outer* face from the body. A carrier is not
+    // painted on: a plate, its spacer mesh and a cummerbund put the front face
+    // 25–35 mm proud of the chest, and that thickness is a large part of what
+    // makes an armoured silhouette read as armoured.
+    const gap = (heavy ? 0.036 : plate ? 0.027 : 0.017) * s;
     const phiMax = (heavy ? 66 : plate ? 58 : 52) * DEG;
     const nu = this.lod === 0 ? 14 : this.lod === 1 ? 8 : 4;
     const nv = this.lod === 0 ? 8 : this.lod === 1 ? 4 : 2;
@@ -1019,83 +1084,142 @@ class SoldierArt {
     b.patchSize(0.36, 0.34);
     b.solidPatch(nu, nv, face(false), thick);
 
-    // Shoulder straps: narrow, close to the neck, lying on the trapezius.
-    b.color(this.app.webbingTint, 0.94).bind(BIND.torso);
+    // Shoulder straps: broad and flat, lying on the trapezius. Narrow ones read
+    // as fins from the side; real yoke straps are ~65 mm of padded webbing.
+    b.color(this.app.webbingTint, 1.06).bind(BIND.torso);
     for (const side of [1, -1] as const) {
       const pts: THREE.Vector3[] = [];
       const frontTop = new THREE.Vector3();
       this.torsoPoint(yTop - 0.015 * s, side * 20 * DEG, gap * 0.8, frontTop);
       const overA = new THREE.Vector3();
-      this.torsoPoint(this.shoulderY + 0.040 * s, side * 40 * DEG, gap + 0.004 * s, overA);
+      this.torsoPoint(this.shoulderY + 0.040 * s, side * 40 * DEG, gap + 0.006 * s, overA);
       const backTop = new THREE.Vector3();
       this.torsoPoint(yTop - 0.05 * s, Math.PI - side * 20 * DEG, gap * 0.8, backTop);
-      pts.push(frontTop, new THREE.Vector3(
-        THREE.MathUtils.lerp(frontTop.x, overA.x, 0.55),
-        THREE.MathUtils.lerp(frontTop.y, overA.y, 0.85),
-        THREE.MathUtils.lerp(frontTop.z, overA.z, 0.8),
-      ), overA, new THREE.Vector3(
-        THREE.MathUtils.lerp(backTop.x, overA.x, 0.55),
-        THREE.MathUtils.lerp(backTop.y, overA.y, 0.85),
-        THREE.MathUtils.lerp(backTop.z, overA.z, 0.8),
-      ), backTop);
-      b.ribbon(pts, 0.046 * s, 0.015 * s, _wx);
+      const mid = (a: THREE.Vector3, c: THREE.Vector3, t: number, ty: number): THREE.Vector3 =>
+        new THREE.Vector3(
+          THREE.MathUtils.lerp(a.x, c.x, t),
+          THREE.MathUtils.lerp(a.y, c.y, ty),
+          THREE.MathUtils.lerp(a.z, c.z, t),
+        );
+      pts.push(
+        frontTop,
+        mid(frontTop, overA, 0.32, 0.60),
+        mid(frontTop, overA, 0.68, 0.92),
+        overA,
+        mid(backTop, overA, 0.68, 0.92),
+        mid(backTop, overA, 0.32, 0.60),
+        backTop,
+      );
+      b.ribbon(pts, 0.066 * s, 0.013 * s, _wx);
     }
 
     // Cummerbund.
     if (plate) {
       const cy0 = yBot + 0.075 * s, cy1 = yBot - 0.010 * s;
-      b.color(this.app.webbingTint, 0.85);
+      b.color(this.app.webbingTint, 0.92);
       this.band(cy0, cy1, gap * 0.85, this.lod === 0 ? 20 : 12);
     }
 
-    // Magazine pouches across the front.
+    // PALS webbing: horizontal rows stitched across the plate. This is the
+    // single most recognisable thing on a modern carrier — it is what turns the
+    // front from a slab into kit, and it still reads at fifty metres because it
+    // is a row of hard shadow lines rather than a texture.
+    if (this.mid) {
+      const rows = this.lod === 0 ? 4 : 3;
+      for (let r = 0; r < rows; r++) {
+        const y = THREE.MathUtils.lerp(this.chestY + 0.030 * s, yBot + 0.060 * s, (r + 0.5) / rows);
+        for (const front of [true, false] as const) {
+          const pts: THREE.Vector3[] = [];
+          const steps = this.lod === 0 ? 7 : 5;
+          for (let i = 0; i <= steps; i++) {
+            const phi = THREE.MathUtils.lerp(-phiMax * 0.86, phiMax * 0.86, i / steps)
+              + (front ? 0 : Math.PI);
+            const p = new THREE.Vector3();
+            this.torsoPoint(y, phi, gap + 0.005 * s, p);
+            pts.push(p);
+          }
+          b.color(this.app.webbingTint, r % 2 === 0 ? 0.86 : 0.94);
+          b.ribbon(pts, 0.030 * s, 0.008 * s, _wy);
+        }
+      }
+    }
+
+    // Magazine pouches across the front, standing proud of the plate with a
+    // closing flap and a pull tab.
     const n = Math.max(0, this.app.magPouches);
+    const pouchD = 0.058 * s;
     for (let i = 0; i < n; i++) {
       const t = (i + 0.5) / n;
-      const phi = THREE.MathUtils.lerp(-30 * DEG, 30 * DEG, t);
-      const y = THREE.MathUtils.lerp(this.spineY + 0.040 * s, this.spineY + 0.015 * s, Math.abs(t - 0.5) * 2);
-      this.torsoPoint(y, phi, gap + thick * 0.5, _v);
+      const phi = THREE.MathUtils.lerp(-32 * DEG, 32 * DEG, t);
+      // Chest height, on the face of the plate. They used to sit at spine
+      // height, which is exactly where the cummerbund wraps — so every carrier
+      // rendered with an empty front and a suspiciously lumpy waist.
+      const y = THREE.MathUtils.lerp(this.chestY - 0.030 * s, this.chestY - 0.070 * s, Math.abs(t - 0.5) * 2);
       const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), phi);
-      _v.x += Math.sin(phi) * 0.020 * s;
-      _v.z += Math.cos(phi) * 0.020 * s;
-      b.color(this.app.webbingTint, 0.86 + 0.12 * hash2(i, 3, this.app.seed));
-      b.roundedBox(_v, _sz.set(0.070 * s, 0.132 * s, 0.052 * s), 0.018 * s, this.detail ? 2 : 1, q);
+      // Sit the *back face* on the plate surface, then let the body stand out.
+      this.torsoPoint(y, phi, gap + 0.004 * s, _v);
+      _v.x += Math.sin(phi) * (pouchD * 0.5 - 0.008 * s);
+      _v.z += Math.cos(phi) * (pouchD * 0.5 - 0.008 * s);
+      b.color(this.app.webbingTint, 0.90 + 0.14 * hash2(i, 3, this.app.seed));
+      b.roundedBox(_v, _sz.set(0.072 * s, 0.140 * s, pouchD), 0.014 * s, this.detail ? 2 : 1, q);
       if (this.detail) {
-        // Flap.
-        b.color(this.app.webbingTint, 0.72);
-        _v.y += 0.052 * s;
-        _v.x += Math.sin(phi) * 0.004 * s;
-        _v.z += Math.cos(phi) * 0.004 * s;
-        b.roundedBox(_v, _sz.set(0.074 * s, 0.040 * s, 0.056 * s), 0.010 * s, 1, q);
+        // Flap folded over the top, hanging a little down the front.
+        b.color(this.app.webbingTint, 0.78);
+        _v2.copy(_v);
+        _v2.y += 0.058 * s;
+        _v2.x += Math.sin(phi) * 0.005 * s;
+        _v2.z += Math.cos(phi) * 0.005 * s;
+        b.roundedBox(_v2, _sz.set(0.078 * s, 0.044 * s, pouchD + 0.012 * s), 0.008 * s, 1, q);
+        // Pull tab.
+        b.color(this.app.webbingTint, 0.66);
+        _v2.y -= 0.030 * s;
+        _v2.x += Math.sin(phi) * (pouchD * 0.5 + 0.004 * s);
+        _v2.z += Math.cos(phi) * (pouchD * 0.5 + 0.004 * s);
+        b.roundedBox(_v2, _sz.set(0.024 * s, 0.030 * s, 0.006 * s), 0.003 * s, 1, q);
       }
     }
 
-    // Side utility pouches.
+    // Side utility pouches, wrapped onto the cummerbund.
     if (this.mid) {
       for (const side of [1, -1] as const) {
+        const ang = side * 84 * DEG;
         const y = this.spineY + 0.045 * s;
-        this.torsoPoint(y, side * 84 * DEG, gap * 0.5, _v);
-        const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), side * 84 * DEG);
-        _v.x += Math.sin(side * 84 * DEG) * 0.020 * s;
-        _v.z += Math.cos(side * 84 * DEG) * 0.020 * s;
-        b.color(this.app.webbingTint, 0.9);
-        b.roundedBox(_v, _sz.set(0.052 * s, 0.105 * s, 0.062 * s), 0.016 * s, 2, q);
+        const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), ang);
+        this.torsoPoint(y, ang, gap * 0.85, _v);
+        _v.x += Math.sin(ang) * 0.026 * s;
+        _v.z += Math.cos(ang) * 0.026 * s;
+        b.color(this.app.webbingTint, 0.94);
+        b.roundedBox(_v, _sz.set(0.058 * s, 0.108 * s, 0.066 * s), 0.014 * s, 2, q);
       }
     }
 
-    // Admin pouch / radio on the chest, grenades on the straps.
+    // Admin pouch with an antenna, and a frag on the opposite strap.
     if (this.detail) {
-      this.torsoPoint(this.chestY + 0.055 * s, -52 * DEG, gap + thick, _v);
-      const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -52 * DEG);
-      b.color(this.app.webbingTint, 0.95);
-      b.roundedBox(_v, _sz.set(0.062 * s, 0.088 * s, 0.048 * s), 0.014 * s, 2, q);
-      b.slot(SLOT.METAL).color(this.app.hardTint, 1.3).bind(BIND.torsoRigid);
+      const aPhi = -52 * DEG;
+      const aq = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), aPhi);
+      this.torsoPoint(this.chestY + 0.050 * s, aPhi, gap + 0.004 * s, _v);
+      _v.x += Math.sin(aPhi) * 0.019 * s;
+      _v.z += Math.cos(aPhi) * 0.019 * s;
+      b.color(this.app.webbingTint, 1.0);
+      b.roundedBox(_v, _sz.set(0.066 * s, 0.094 * s, 0.052 * s), 0.012 * s, 2, aq);
+      b.slot(SLOT.METAL).color(this.app.metalTint, 1.15).bind(BIND.torsoRigid);
       _v.y += 0.062 * s;
       b.cylinder(_v, _v.clone().add(new THREE.Vector3(0.006 * s, 0.115 * s, -0.008 * s)), 0.004 * s, 0.003 * s, 5, true);
 
-      b.slot(SLOT.HARD).color(this.app.hardTint, 0.85).bind(BIND.torsoRigid);
-      this.torsoPoint(this.chestY + 0.045 * s, 48 * DEG, gap + thick * 0.8, _v);
-      b.sphere(_v, _sz.set(0.028 * s, 0.040 * s, 0.028 * s), 8, 6);
+      // Frag: a body with a lever and a ring, not a floating dark egg.
+      const gPhi = 48 * DEG;
+      this.torsoPoint(this.chestY + 0.040 * s, gPhi, gap + 0.004 * s, _v);
+      _v.x += Math.sin(gPhi) * 0.024 * s;
+      _v.z += Math.cos(gPhi) * 0.024 * s;
+      b.slot(SLOT.HARD).color(this.app.hardTint, 0.92).bind(BIND.torsoRigid);
+      b.sphere(_v, _sz.set(0.026 * s, 0.038 * s, 0.026 * s), 9, 7);
+      b.slot(SLOT.METAL).color(this.app.metalTint, 1.25).bind(BIND.torsoRigid);
+      _v2.copy(_v); _v2.y += 0.040 * s;
+      b.cylinder(_v2, _v2.clone().add(new THREE.Vector3(0, 0.014 * s, 0)), 0.009 * s, 0.008 * s, 7, true);
+      b.ribbon([
+        _v.clone().add(new THREE.Vector3(Math.sin(gPhi) * 0.022 * s, 0.030 * s, Math.cos(gPhi) * 0.022 * s)),
+        _v.clone().add(new THREE.Vector3(Math.sin(gPhi) * 0.024 * s, -0.026 * s, Math.cos(gPhi) * 0.024 * s)),
+      ], 0.011 * s, 0.004 * s, _wx);
     }
   }
 
@@ -1122,7 +1246,7 @@ class SoldierArt {
 
     if (!this.mid) return;
     // Belt buckle.
-    b.slot(SLOT.METAL).color(this.app.hardTint, 1.5).bind(BIND.hips);
+    b.slot(SLOT.METAL).color(this.app.metalTint, 1.5).bind(BIND.hips);
     this.torsoPoint(y, 0, 0.020 * s, _v);
     b.roundedBox(_v, _sz.set(0.058 * s, 0.044 * s, 0.020 * s), 0.008 * s, 1);
 
@@ -1130,12 +1254,15 @@ class SoldierArt {
     const n = this.app.beltPouches;
     for (let i = 0; i < n; i++) {
       const phi = (110 + i * 45 + hash2(i, 9, this.app.seed) * 20) * DEG * (i % 2 === 0 ? 1 : -1);
-      this.torsoPoint(y - 0.012 * s, phi, 0.022 * s, _v);
+      // The belt band already stands 12 mm off the hip; the pouch hangs off
+      // *that*, so its back face has to land on the band, not 20 mm outside it.
+      this.torsoPoint(y - 0.014 * s, phi, 0.013 * s, _v);
       const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), phi);
-      _v.x += Math.sin(phi) * 0.024 * s;
-      _v.z += Math.cos(phi) * 0.024 * s;
-      b.slot(SLOT.GEAR).color(this.app.webbingTint, 0.9).bind(BIND.hips);
-      b.roundedBox(_v, _sz.set(0.070 * s, 0.090 * s, 0.052 * s), 0.014 * s, 2, q);
+      const depth = 0.056 * s;
+      _v.x += Math.sin(phi) * (depth * 0.5 - 0.010 * s);
+      _v.z += Math.cos(phi) * (depth * 0.5 - 0.010 * s);
+      b.slot(SLOT.GEAR).color(this.app.webbingTint, 0.94).bind(BIND.hips);
+      b.roundedBox(_v, _sz.set(0.074 * s, 0.096 * s, depth), 0.012 * s, 2, q);
     }
   }
 
@@ -1167,22 +1294,30 @@ class SoldierArt {
       _v.z -= 0.03 * s;
       b.slot(SLOT.GEAR).color(this.app.webbingTint, 0.9).bind(BIND.torsoRigid);
       b.roundedBox(_v, _sz.set(0.090 * s, 0.150 * s, 0.055 * s), 0.014 * s, 2);
-      b.slot(SLOT.METAL).color(this.app.hardTint, 1.1).bind(BIND.torsoRigid);
+      b.slot(SLOT.METAL).color(this.app.metalTint, 1.1).bind(BIND.torsoRigid);
       const a = _v.clone(); a.y += 0.070 * s;
       const c2 = a.clone(); c2.y += 0.230 * s; c2.z -= 0.045 * s;
       b.cylinder(a, c2, 0.005 * s, 0.003 * s, 5, true);
     }
 
-    // Sling across the chest.
+    // Two-point sling running over one shoulder and across the chest. It has to
+    // *lie on* the kit — a strap standing 5 cm off the body reads as a floating
+    // shard whenever it is seen edge-on.
     if (this.mid && this.app.carrier !== 'none') {
-      b.slot(SLOT.GEAR).color(this.app.webbingTint, 0.6).bind(BIND.torso);
-      const p0 = new THREE.Vector3();
-      this.torsoPoint(this.shoulderY + 0.030 * s, -58 * DEG, 0.030 * s, p0);
-      const p1 = new THREE.Vector3();
-      this.torsoPoint(this.chestY - 0.02 * s, -20 * DEG, 0.055 * s, p1);
-      const p2 = new THREE.Vector3();
-      this.torsoPoint(this.spineY - 0.03 * s, 34 * DEG, 0.050 * s, p2);
-      b.ribbon([p0, p1, p2], 0.030 * s, 0.007 * s, _wx);
+      b.slot(SLOT.GEAR).color(this.app.webbingTint, 0.72).bind(BIND.torso);
+      const pt = (y: number, phi: number, out: number): THREE.Vector3 => {
+        const p = new THREE.Vector3();
+        this.torsoPoint(y, phi * DEG, out * s, p);
+        return p;
+      };
+      b.ribbon([
+        pt(this.shoulderY + 0.045 * s, -128, 0.012),
+        pt(this.shoulderY + 0.030 * s, -74, 0.014),
+        pt(this.chestY + 0.035 * s, -44, 0.032),
+        pt(this.chestY - 0.045 * s, -14, 0.038),
+        pt(this.spineY + 0.010 * s, 22, 0.034),
+        pt(this.spineY - 0.045 * s, 48, 0.020),
+      ], 0.042 * s, 0.006 * s, _wy);
     }
   }
 
@@ -1241,6 +1376,8 @@ export function buildSoldier(rig: RigInstance, app: Appearance, lod = 0): Soldie
   const b = new SkinMeshBuilder(rig, boneSegments(rig));
   new SoldierArt(rig, app, b, lod).build();
   const tris = b.triangleCount;
-  const { geometry, slots } = b.build();
+  // Baked occlusion is what makes the kit look strapped on rather than decalled;
+  // it is worth the build cost at the two LODs where anyone can see it.
+  const { geometry, slots } = b.build(lod === 0 ? 'full' : lod === 1 ? 'cheap' : 'none');
   return { geometry, slots, triangles: tris };
 }

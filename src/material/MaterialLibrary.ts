@@ -93,6 +93,43 @@ const FALLBACK_TINT: Record<string, number> = {
   monitor: 0x0a1a16, fluorescent: 0xe2e8dc, strobe: 0xd4682a, hotMetal: 0x3a3230,
 };
 
+/**
+ * Archetypes that must not receive the world-space macro/ground layers:
+ * characters and foliage move (so a world-space stain would swim across them),
+ * and glass / emissive panels are not diffuse surfaces at all.
+ */
+const NO_WORLD_LAYERS = new Set([
+  'glass', 'glassThick', 'puddle', 'foliage', 'flesh', 'armor', 'helmet',
+  'monitor', 'fluorescent', 'strobe', 'hotMetal', 'ice',
+]);
+
+/** Archetypes that get the splash-back dirt band at the foot of a wall. */
+const GROUND_BAND: Record<string, number> = {
+  concrete: 0.55, brick: 0.50, stone: 0.52, plaster: 0.62, tile: 0.45,
+  metal: 0.40, metalThin: 0.40, aluminium: 0.32, grate: 0.30, pipe: 0.35,
+  diamondPlate: 0.30,
+  wood: 0.48, woodThin: 0.48, plywood: 0.50, crate: 0.42,
+  fabric: 0.35, sandbag: 0.30, cardboard: 0.55, rubber: 0.28, plastic: 0.35,
+};
+
+/** Per-family macro variation: wavelengths in metres, albedo + roughness gain. */
+const MACRO_DEFAULT: Record<string, [number, number, number, number]> = {
+  plaster: [6.5, 19, 0.125, 0.07],
+  concrete: [7.5, 24, 0.105, 0.06],
+  brick: [8.5, 26, 0.100, 0.05],
+  stone: [7.0, 21, 0.110, 0.06],
+  tile: [5.0, 15, 0.070, 0.05],
+  asphalt: [9.0, 28, 0.115, 0.06],
+  ceilingPanel: [4.0, 12, 0.060, 0.04],
+  dirt: [6.0, 18, 0.130, 0.06],
+  sand: [7.0, 20, 0.100, 0.05],
+  gravel: [5.5, 16, 0.115, 0.06],
+  grass: [5.0, 15, 0.140, 0.05],
+  mud: [5.5, 17, 0.125, 0.05],
+  snow: [8.0, 24, 0.055, 0.04],
+};
+const MACRO_FALLBACK: [number, number, number, number] = [6.0, 18, 0.075, 0.05];
+
 const EMISSIVE_DEFAULT: Record<EmissiveKind, { gain: number; rate: number; temp: number }> = {
   none: { gain: 1, rate: 1, temp: 1 },
   fluorescent: { gain: 3.4, rate: 1, temp: 1 },
@@ -325,6 +362,20 @@ export class MaterialSystem implements System {
       else { mat.alphaTest = 0.45; }
     }
 
+    // World-space layers: macro breakup everywhere it makes sense, plus the
+    // splash-back band that grounds vertical surfaces against the floor.
+    const worldLayers = !NO_WORLD_LAYERS.has(arch.id) && emissiveKind === 'none';
+    let macro = arch.shader?.macro ?? null;
+    if (!macro && worldLayers) {
+      const m = MACRO_DEFAULT[arch.id] ?? MACRO_FALLBACK;
+      macro = new THREE.Vector4(1 / m[0], 1 / m[1], m[2], m[3]);
+    }
+    let groundBand = arch.shader?.ground ?? null;
+    if (!groundBand && worldLayers) {
+      const g = GROUND_BAND[arch.id];
+      if (g) groundBand = new THREE.Vector3(0, 0.85, g);
+    }
+
     const cfg: ShaderExtensionConfig = {
       tile,
       triplanar,
@@ -333,7 +384,7 @@ export class MaterialSystem implements System {
       detailMap,
       detailScale: (arch.shader?.detailScale ?? 12) / Math.max(tile / set.tile, 0.05),
       detailStrength: arch.shader?.detailStrength,
-      detailFade: arch.shader?.detailFade ?? new THREE.Vector2(2.5, 9),
+      detailFade: arch.shader?.detailFade ?? new THREE.Vector2(4, 14),
       pom: (opts.pom ?? arch.shader?.pom ?? false) && settings.preset !== 'low',
       pomDepth: arch.shader?.pomDepth ?? set.depth,
       pomShadow: (arch.shader?.pomShadow ?? false) && (settings.preset === 'ultra' || settings.preset === 'cinematic'),
@@ -344,7 +395,9 @@ export class MaterialSystem implements System {
       blendTile: opts.blendScale ?? blendSet?.tile,
       wear: opts.wear ?? 0,
       specularAA: true,
-      normalFadeDistance: 12,
+      normalFadeDistance: 9,
+      macro,
+      ground: groundBand,
       alphaFromMap,
       emissiveMode: EMISSIVE_MODES[emissiveKind],
     };

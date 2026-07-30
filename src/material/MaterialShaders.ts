@@ -53,6 +53,23 @@ export interface ShaderExtensionConfig {
   specularAA?: boolean;
   /** Distance past which normal strength is damped, metres. */
   normalFadeDistance?: number;
+  /**
+   * World-space macro variation. Two octaves of low-frequency noise sampled
+   * from world position, applied as a *small* multiplicative tint and a
+   * roughness offset. This is what stops a 2 m texture repeat from reading as
+   * a pattern across a 20 m facade, and it is where "colour variation over
+   * metres" comes from — the base maps deliberately carry almost none.
+   *   x = coarse wavelength (m), y = fine wavelength (m),
+   *   z = albedo strength (0..1), w = roughness strength.
+   */
+  macro?: THREE.Vector4 | null;
+  /**
+   * Splash-back / rising-damp band at the foot of vertical surfaces, in world
+   * space. Grounds walls and props against the floor, which the base maps
+   * cannot do because they tile.
+   *   x = world Y of the ground, y = fade height (m), z = strength (0..1).
+   */
+  ground?: THREE.Vector3 | null;
   /** Take opacity from the albedo alpha channel (glass, grates, foliage). */
   alphaFromMap?: boolean;
   /**
@@ -91,6 +108,8 @@ export interface ObUniforms {
   obHueSat: THREE.IUniform<THREE.Vector2>;
   obTime: THREE.IUniform<number>;
   obEmissive: THREE.IUniform<THREE.Vector4>;
+  obMacro: THREE.IUniform<THREE.Vector4>;
+  obGround: THREE.IUniform<THREE.Vector3>;
   [key: string]: THREE.IUniform;
 }
 
@@ -140,6 +159,11 @@ uniform float obNormalFade;
 uniform vec2  obHueSat;
 uniform float obTime;
 uniform vec4  obEmissive;   // x = gain, y = rate, z = phase, w = temperature
+
+#ifdef OB_MACRO
+  uniform vec4 obMacro;     // x,y = 1/wavelength (m), z = albedo gain, w = rough gain
+  uniform vec3 obGround;    // x = ground Y, y = fade height, z = strength
+#endif
 
 #ifdef OB_DETAIL
   uniform sampler2D obDetailMap;
@@ -206,6 +230,47 @@ int obDomAxis(vec3 n) {
   vec3 a = abs(n);
   return (a.x > a.y && a.x > a.z) ? 0 : ((a.y > a.z) ? 1 : 2);
 }
+
+/**
+ * Clamp how far a shading normal may tilt away from the geometric one.
+ *
+ * With the sun 5-10° above the horizon, N·L on a wall is ~0.09, so a facet
+ * that leans even 15° toward the light is three times brighter than its
+ * neighbour. Uncapped micro-relief therefore stops reading as texture and
+ * starts reading as a rash of blown speckles — the single most common way a
+ * procedural surface betrays itself at golden hour. Sub-pixel geometry belongs
+ * in roughness, not in the normal.
+ */
+vec3 obClampTilt(vec3 n, vec3 g) {
+  const float OB_COS_MAX = 0.870;   // ~29.5 degrees
+  n = normalize(n);
+  float c = dot(n, g);
+  if (c >= OB_COS_MAX) return n;
+  vec3 t = n - g * c;
+  float tl = length(t);
+  if (tl < 1e-5) return g;
+  return normalize(g * OB_COS_MAX + (t / tl) * sqrt(1.0 - OB_COS_MAX * OB_COS_MAX));
+}
+
+#ifdef OB_MACRO
+/* Cheap 3D value noise (iq). Used only at metre wavelengths, so a couple of
+   octaves per fragment costs nothing and never aliases. */
+float obMHash(vec3 p) {
+  p = fract(p * 0.3183099 + vec3(0.11, 0.71, 0.37));
+  p *= 17.0;
+  return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+
+float obMNoise(vec3 x) {
+  vec3 i = floor(x);
+  vec3 f = fract(x);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(obMHash(i + vec3(0.0, 0.0, 0.0)), obMHash(i + vec3(1.0, 0.0, 0.0)), f.x),
+                 mix(obMHash(i + vec3(0.0, 1.0, 0.0)), obMHash(i + vec3(1.0, 1.0, 0.0)), f.x), f.y),
+             mix(mix(obMHash(i + vec3(0.0, 0.0, 1.0)), obMHash(i + vec3(1.0, 0.0, 1.0)), f.x),
+                 mix(obMHash(i + vec3(0.0, 1.0, 1.0)), obMHash(i + vec3(1.0, 1.0, 1.0)), f.x), f.y), f.z);
+}
+#endif
 `;
 
 /**
@@ -305,7 +370,7 @@ const FRAG_PROLOGUE = /* glsl */ `
     vec3 obNx = texture2D(normalMap, obUvX).xyz * 2.0 - 1.0;
     vec3 obNy = texture2D(normalMap, obUvY).xyz * 2.0 - 1.0;
     vec3 obNz = texture2D(normalMap, obUvZ).xyz * 2.0 - 1.0;
-    vec2 obNs = normalScale * mix(0.55, 1.0, obDistFade);
+    vec2 obNs = normalScale * mix(0.34, 1.0, obDistFade);
     obNx.xy *= obNs; obNy.xy *= obNs; obNz.xy *= obNs;
     // Reoriented whiteout blend: fold the geometric normal into each plane so
     // the result stays correct on curved and beveled surfaces.
@@ -373,7 +438,7 @@ const FRAG_PROLOGUE = /* glsl */ `
     obAlb = texture2D(map, obUv);
     obOrm = texture2D(roughnessMap, obUv);
     obNrmT = texture2D(normalMap, obUv).xyz * 2.0 - 1.0;
-    obNrmT.xy *= normalScale * mix(0.55, 1.0, obDistFade);
+    obNrmT.xy *= normalScale * mix(0.34, 1.0, obDistFade);
     vec2 obDetUv = obUv;
   #endif
 
@@ -427,7 +492,12 @@ const FRAG_PROLOGUE = /* glsl */ `
       float dfade = 1.0 - smoothstep(obDetailFade.x, obDetailFade.y, obDist);
       if (dfade > 0.002) {
         vec4 dt = texture2D(obDetailMap, obDetUv * obDetailScale);
-        vec2 dn = (dt.rg * 2.0 - 1.0) * obDetailStrength.x * dfade;
+        // The *normal* half of the detail layer has to die off far faster than
+        // the albedo/roughness half. Past a metre or two its texels fall below
+        // a pixel, the mip chain keeps their variance, and what should be sand
+        // grain turns into a crawling gravel rash across the whole wall.
+        float dnFade = mix(0.26, 1.0, 1.0 - smoothstep(0.8, 4.0, obDist));
+        vec2 dn = (dt.rg * 2.0 - 1.0) * obDetailStrength.x * dfade * dnFade;
         float da = (dt.b - 0.5) * obDetailStrength.y * dfade;
         float dr = (dt.a - 0.5) * obDetailStrength.z * dfade;
         obAlb.rgb *= (1.0 + da);
@@ -452,6 +522,59 @@ const FRAG_PROLOGUE = /* glsl */ `
     obAlb.rgb = mix(obAlb.rgb, obAlb.rgb * vec3(0.72, 0.68, 0.62), clamp(obV.z, 0.0, 1.0) * 0.35);
   #endif
 
+  /* ------------------------------------------- world-space macro breakup -- */
+  #ifdef OB_MACRO
+    {
+      // Two decorrelated octaves in metres. The coarse one carries the "this
+      // wall has been patched and weathered unevenly" story; the fine one
+      // desynchronises the texture repeat so the tiling never lines up.
+      float obM1 = obMNoise(obWPos * obMacro.x + 13.7);
+      float obM2 = obMNoise(obWPos * obMacro.y + 71.3);
+      float obMv = (obM1 - 0.5) * 1.30 + (obM2 - 0.5) * 0.70;
+
+      // Value drift, kept small: real render/plaster varies a few percent, and
+      // anything more reads as camouflage.
+      obAlb.rgb *= 1.0 + obMv * obMacro.z;
+      // Temperature drift — sun-bleached patches go warm-pale, sheltered ones
+      // stay cool. This is what sells "large scale variation" without contrast.
+      obAlb.rgb *= mix(vec3(0.985, 0.995, 1.020), vec3(1.022, 1.002, 0.968),
+                       clamp(obM2 * 1.35 - 0.18, 0.0, 1.0));
+      obOrm.g = clamp(obOrm.g + obMv * obMacro.w, 0.03, 1.0);
+
+      /* ------------------------------------------------ gravity runoff --- */
+      // The same noise stretched 6:1 vertically becomes staining that runs
+      // *down* a wall at building scale. A tiling texture physically cannot
+      // do this — any vertical gradient baked into the tile bands at every
+      // repeat — so the streaks that read as weathering have to live here.
+      {
+        float obRun = obMNoise(obWPos * vec3(0.62, 0.105, 0.62) + 47.1);
+        obRun = smoothstep(0.50, 0.84, obRun) * (1.0 - abs(obWNrm.y));
+        obRun *= obMacro.z * 2.4;
+        obAlb.rgb = mix(obAlb.rgb, obAlb.rgb * vec3(0.80, 0.785, 0.755), obRun);
+        obOrm.g = clamp(obOrm.g + obRun * 0.22, 0.03, 1.0);
+      }
+
+      /* ------------------------------------------- ground contact band --- */
+      if (obGround.z > 0.001) {
+        float obGy = 1.0 - smoothstep(obGround.x, obGround.x + obGround.y, obWPos.y);
+        // Only walls: a floor does not get splash-back on itself.
+        obGy *= 1.0 - abs(obWNrm.y);
+        // Broken up so the band is never a clean horizontal line.
+        obGy *= mix(0.35, 1.0, obM1) * mix(0.60, 1.15, obM2);
+        obGy = clamp(obGy, 0.0, 1.0) * obGround.z;
+        // Splash-back dirt: darker, desaturated, and much rougher.
+        vec3 obGrime = obAlb.rgb * vec3(0.46, 0.44, 0.41);
+        obAlb.rgb = mix(obAlb.rgb, obGrime, obGy);
+        obOrm.g = clamp(mix(obOrm.g, 0.97, obGy * 0.8), 0.03, 1.0);
+        // Salt bloom rising just above the wet line — pale, low contrast.
+        float obSalt = smoothstep(0.28, 0.62, obGy / max(obGround.z, 1e-3))
+                     * smoothstep(0.75, 0.42, obGy / max(obGround.z, 1e-3))
+                     * smoothstep(0.45, 0.85, obM2);
+        obAlb.rgb = mix(obAlb.rgb, obAlb.rgb * 1.16 + 0.012, obSalt * 0.55);
+      }
+    }
+  #endif
+
   /* ------------------------------------------------------------- wear --- */
   if (obWear > 0.001) {
     float cav = 1.0 - obOrm.a;
@@ -468,8 +591,10 @@ const FRAG_PROLOGUE = /* glsl */ `
 
   /* --------------------------------------------------- resolve normal --- */
   #ifdef OB_TRIPLANAR
+    obWn = obClampTilt(obWn, obWNrm);
     obNrmV = normalize((viewMatrix * vec4(obWn, 0.0)).xyz);
   #else
+    obNrmT = obClampTilt(obNrmT, vec3(0.0, 0.0, 1.0));
     obNrmV = normalize(obTBN * obNrmT);
   #endif
 `;
@@ -538,7 +663,7 @@ function ensureUniforms(material: THREE.MeshStandardMaterial): ObUniforms {
     obTriSharp: { value: 6 },
     obDetailMap: { value: null },
     obDetailScale: { value: 8 },
-    obDetailStrength: { value: new THREE.Vector3(0.6, 0.25, 0.15) },
+    obDetailStrength: { value: new THREE.Vector3(0.42, 0.30, 0.60) },
     obDetailFade: { value: new THREE.Vector2(3, 12) },
     obPom: { value: new THREE.Vector3(0.02, 8, 32) },
     obWear: { value: 0 },
@@ -550,6 +675,8 @@ function ensureUniforms(material: THREE.MeshStandardMaterial): ObUniforms {
     obHueSat: { value: new THREE.Vector2(0, 1) },
     obTime: { value: 0 },
     obEmissive: { value: new THREE.Vector4(1, 1, 0, 1) },
+    obMacro: { value: new THREE.Vector4(1 / 7.5, 1 / 23, 0.11, 0.05) },
+    obGround: { value: new THREE.Vector3(0, 0.9, 0) },
   };
   ud.obUniforms = u;
   return u;
@@ -579,6 +706,7 @@ export function extendStandardMaterial(
   if (cfg.instanceVariation) defines.OB_INSTANCE_VAR = '1'; else delete defines.OB_INSTANCE_VAR;
   if (cfg.blend) defines.OB_BLEND = '1'; else delete defines.OB_BLEND;
   if (cfg.specularAA !== false) defines.OB_SPEC_AA = '1'; else delete defines.OB_SPEC_AA;
+  if (cfg.macro) defines.OB_MACRO = '1'; else delete defines.OB_MACRO;
   if (cfg.alphaFromMap) defines.OB_ALPHA_FROM_MAP = '1'; else delete defines.OB_ALPHA_FROM_MAP;
   if (cfg.emissiveMode) defines.OB_EMISSIVE_MODE = String(cfg.emissiveMode);
   else delete defines.OB_EMISSIVE_MODE;
@@ -598,6 +726,9 @@ export function extendStandardMaterial(
   );
   u.obWear.value = cfg.wear ?? 0;
   u.obNormalFade.value = cfg.normalFadeDistance ?? 14;
+  if (cfg.macro) u.obMacro.value.copy(cfg.macro);
+  if (cfg.ground) u.obGround.value.copy(cfg.ground);
+  else u.obGround.value.set(0, 0.9, 0);
   if (cfg.blend) {
     u.obBlendAlb.value = cfg.blend.albedo;
     u.obBlendNrm.value = cfg.blend.normal;
@@ -627,10 +758,14 @@ export function extendStandardMaterial(
         normal = obNrmV;
         #ifdef OB_SPEC_AA
           {
+            // Kaplanyan-style normal-variance filtering. The cap has to be
+            // generous: at 15-30 m a cobble or brick normal map swings a full
+            // hemisphere inside one pixel, and anything left unfiltered turns
+            // into the sparkle that chromatic aberration then paints magenta.
             vec3 dnx = dFdx(normal);
             vec3 dny = dFdy(normal);
             float variance = 0.5 * (dot(dnx, dnx) + dot(dny, dny));
-            float kernel = min(variance * 1.6, 0.18);
+            float kernel = min(variance * 2.6, 0.42);
             roughnessFactor = sqrt(clamp(roughnessFactor * roughnessFactor + kernel, 0.0, 1.0));
           }
         #endif
@@ -667,7 +802,7 @@ export function extendStandardMaterial(
     shader.fragmentShader = f;
   };
 
-  material.customProgramCacheKey = () => 'ob|${Object.keys(defines).sort().join(',')}';
+  material.customProgramCacheKey = () => `ob|${Object.keys(defines).sort().join(',')}`;
   material.needsUpdate = true;
   return u;
 }

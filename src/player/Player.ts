@@ -124,7 +124,10 @@ export class PlayerSystem implements System {
     this.camera.look(s.mouseDX, s.mouseDY, dt, adsHeld);
     if (s.usingGamepad) this.camera.stick(s.lookX, s.lookY, dt, adsHeld);
 
-    this.camera.update(dt, this.movement.out, this.position, ctx.camera);
+    // The capture harness owns the camera while a fixed shot is framed.
+    if (!ctx.engine.cameraLockedByCapture) {
+      this.camera.update(dt, this.movement.out, this.position, ctx.camera);
+    }
 
     // Depth of field focuses where the player is looking.
     if (this.renderApi && settings.gfx.dof) {

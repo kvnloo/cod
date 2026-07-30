@@ -47,6 +47,8 @@ export class CaptureController {
       setShot: async (name, opts = {}) => {
         const shot = this.shots.get(name);
         if (!shot) throw new Error(`unknown shot "${name}"`);
+        // A fixed shot owns the camera; the player rig must not fight it.
+        engine.cameraLockedByCapture = true;
         rng.seed(name); // per-shot determinism for particles and scatter
 
         const cam = engine.camera;
@@ -139,6 +141,8 @@ export class CaptureController {
       },
       probe: (key, arg) => this.hooks.probes?.[key]?.(arg) ?? null,
       act: async (steps) => {
+        // Scripted gameplay hands the camera back to the player rig.
+        engine.cameraLockedByCapture = false;
         for (const s of steps) {
           const frames = s.frames ?? 1;
           const dt = s.dt ?? 1 / 60;

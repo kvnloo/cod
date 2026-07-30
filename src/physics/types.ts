@@ -112,6 +112,10 @@ export interface CharacterMoveResult {
   ceiling: boolean;
   /** Speed lost to collisions this step, for landing/impact audio. */
   impactSpeed: number;
+  /** World displacement contributed by a moving platform under the feet. */
+  platformDelta?: Vector3;
+  /** Yaw the platform rotated by this step, radians. Add it to the view yaw. */
+  platformYaw?: number;
 }
 
 export interface CharacterController {
@@ -121,6 +125,14 @@ export interface CharacterController {
   /** Collide-and-slide move with step-up, slope limits and ground snapping. */
   move(position: Vector3, motion: Vector3, dt: number, out: CharacterMoveResult): Vector3;
   dispose(): void;
+  /** True when a capsule `h` tall would fit at `position` — gate standing up. */
+  canSetHeight?(h: number, position: Vector3): boolean;
+  /** Hard-sets the position, clearing ground/platform state. */
+  teleport?(position: Vector3): void;
+  /** Maximum walkable slope in degrees. */
+  slopeLimit?: number;
+  /** Obstacle height traversed without leaving the ground, metres. */
+  stepHeight?: number;
 }
 
 export interface OverlapResult {
@@ -153,3 +165,107 @@ export interface PhysicsAPI {
   /** Debug: number of active bodies. */
   stats(): { bodies: number; active: number; contacts: number; stepMs: number };
 }
+
+/* ---------------------------------------------------------------- extensions */
+/* Everything below is additive: the core `PhysicsAPI` above is unchanged, these
+ * are the richer services the Rapier backend also provides. Consumers should
+ * import them from here so the backend stays swappable. */
+
+/** Result of walking a scene graph and baking static colliders out of it. */
+export interface StaticBuildResult {
+  colliders: number;
+  triangles: number;
+  merged: number;
+  ms: number;
+}
+
+export interface DebrisOptions {
+  /** Number of chunks to produce. Clamped by the debris budget. */
+  count?: number;
+  /** Chunk size in metres; defaults to a fraction of the source bounds. */
+  size?: number;
+  surface?: SurfaceType;
+  /** Velocity inherited from the parent object. */
+  inherit?: Vector3;
+  /** Outward speed imparted by the impact, m/s. */
+  speed?: number;
+  /** Seconds before the chunk fades and despawns. */
+  lifetime?: number;
+  /** Deterministic seed; derived from the impact point when omitted. */
+  seed?: number;
+  /** Parent to attach the debris meshes to. Defaults to the physics scene root. */
+  parent?: Object3D | null;
+}
+
+export interface GlassShatterOptions {
+  /** Impact point in world space. */
+  point: Vector3;
+  /** Direction the projectile was travelling. */
+  direction: Vector3;
+  /** Radial shard count. */
+  shards?: number;
+  seed?: number;
+  /** Energy of the hit — drives how far the shards are thrown. */
+  power?: number;
+}
+
+/** A live ragdoll, driven by the solver and used to pose a skinned mesh. */
+export interface RagdollHandle {
+  readonly id: number;
+  /** Body count. */
+  readonly bones: number;
+  /** Copies the simulated pose onto the rig this ragdoll was created from. */
+  syncToRig(): void;
+  /** World transform of one ragdoll segment. */
+  segmentTransform(index: number, outPos: Vector3, outRot: Quaternion): void;
+  applyImpulse(zone: HitZone, impulse: Vector3): void;
+  /** True once every segment has come to rest. */
+  readonly settled: boolean;
+  remove(): void;
+}
+
+export interface RagdollOptions {
+  /** Root object whose bones will be driven; may be null for physics-only. */
+  root?: Object3D | null;
+  /**
+   * Live bone objects from the character rig, keyed by canonical bone name.
+   * When present the ragdoll drives them every frame via `syncToRig()`.
+   */
+  bones?: Record<string, Object3D | null>;
+  /** World bone transforms, used when live bone objects are unavailable. */
+  pose?: Record<string, { position: [number, number, number]; rotation: [number, number, number, number] }>;
+  /** Total mass of the character in kg. */
+  mass?: number;
+  entityId?: number;
+  /** Velocity the character had when it died. */
+  velocity?: Vector3;
+  /** Extra solver iterations; raise for hero deaths, lower for crowd deaths. */
+  quality?: number;
+}
+
+export interface ProjectileOptions {
+  position: Vector3;
+  velocity: Vector3;
+  radius?: number;
+  mass?: number;
+  restitution?: number;
+  friction?: number;
+  /** Rolling resistance; higher settles a grenade faster. */
+  rollingFriction?: number;
+  /** Scene object slaved to the body transform. */
+  object?: Object3D | null;
+  entityId?: number;
+  surface?: SurfaceType;
+  /** Extra layers the projectile should collide with. */
+  mask?: number;
+}
+
+export interface TrajectoryResult {
+  /** Number of points written into the caller's buffer. */
+  count: number;
+  /** Index of the first bounce, or -1. */
+  firstBounce: number;
+  /** Total simulated time covered. */
+  time: number;
+}
+

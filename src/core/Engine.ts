@@ -81,6 +81,13 @@ export class Engine {
   profileSamples: number[] = [];
   profileStart = 0;
 
+  /**
+   * True while the capture harness owns the camera for a fixed shot. Systems
+   * that normally drive the camera (the player rig) must not write to it — but
+   * scripted *gameplay* capture clears this so the rig takes over again.
+   */
+  cameraLockedByCapture = false;
+
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
     this.camera = new THREE.PerspectiveCamera(

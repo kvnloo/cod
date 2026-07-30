@@ -17,6 +17,30 @@ function finiteNumber(value, label) {
 export function validatePipelineManifest(manifest) {
   assertRecord(manifest, 'manifest');
   assertRecord(manifest.loops, 'manifest.loops');
+  assertRecord(manifest.resourceIsolation, 'manifest.resourceIsolation');
+  const isolation = manifest.resourceIsolation;
+  if (isolation.mode !== 'remote-safe') throw new Error('resource isolation mode must be remote-safe');
+  if (!Array.isArray(isolation.pauseCommands) || isolation.pauseCommands.length === 0
+      || isolation.pauseCommands.some((command) => typeof command !== 'string' || !command)) {
+    throw new Error('resource isolation requires non-empty pauseCommands');
+  }
+  if (!Array.isArray(isolation.desktopPauseCommands)
+      || isolation.desktopPauseCommands.some((command) => typeof command !== 'string' || !command)) {
+    throw new Error('resource isolation requires a desktopPauseCommands array');
+  }
+  for (const field of ['maxCpuUtilization', 'maxGpuUtilization']) {
+    const value = finiteNumber(isolation[field], `resourceIsolation.${field}`);
+    if (value < 0 || value > 100) throw new Error(`resourceIsolation.${field} must be within 0..100`);
+  }
+  for (const field of ['quietSamples', 'sampleIntervalMs', 'maxWaitSeconds']) {
+    const value = finiteNumber(isolation[field], `resourceIsolation.${field}`);
+    if (!Number.isInteger(value) || value < 1) throw new Error(`resourceIsolation.${field} must be a positive integer`);
+  }
+  if (isolation.monitor !== true) throw new Error('resource isolation activity monitor must be enabled');
+  for (const field of ['monitorIntervalMs', 'maxExternalCpuPercent', 'maxExternalGpuPercent']) {
+    const value = finiteNumber(isolation[field], `resourceIsolation.${field}`);
+    if (value <= 0) throw new Error(`resourceIsolation.${field} must be positive`);
+  }
 
   for (const id of REQUIRED_LOOPS) {
     if (!manifest.loops[id]) throw new Error(`manifest requires a ${id} loop`);

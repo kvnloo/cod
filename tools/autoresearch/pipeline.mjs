@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { buildHarnessConfig, validatePipelineManifest } from './pipeline-lib.mjs';
+import { enterResourceIsolation } from './resource-isolation.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '../..');
@@ -57,6 +58,31 @@ function worktreePath(loop) {
 
 function baselinePath(loop) {
   return path.join(commonGitDir(), 'autoresearch-state', loop.branch, loop.id, 'baseline.json');
+}
+
+function isolationStatePath() {
+  return path.join(commonGitDir(), 'autoresearch-state', 'resource-isolation.json');
+}
+
+function isolationAuditPath(loop) {
+  return path.join(commonGitDir(), 'autoresearch-state', 'resource-evidence', `${Date.now()}-${loop.id}.json`);
+}
+
+async function withResourceIsolation(loop, action) {
+  const isolation = structuredClone(manifest.resourceIsolation);
+  if (process.env.AR_BENCHMARK_EXCLUSIVE === '1') {
+    isolation.mode = 'desktop-exclusive';
+    isolation.pauseCommands = [...new Set([...isolation.pauseCommands, ...isolation.desktopPauseCommands])];
+  }
+  const release = await enterResourceIsolation(isolation, {
+    statePath: isolationStatePath(),
+    auditPath: isolationAuditPath(loop),
+  });
+  try {
+    return await action();
+  } finally {
+    await release();
+  }
 }
 
 async function exists(file) {
@@ -185,6 +211,12 @@ async function main() {
     for (const loop of selectedLoops()) await setup(loop);
     return;
   }
+  if (command === 'isolation-check') {
+    for (const loop of selectedLoops()) {
+      await withResourceIsolation(loop, async () => console.log(`[isolation] ${loop.id}: machine is ready`));
+    }
+    return;
+  }
   if (command === 'baseline') {
     requireClean();
     for (const loop of selectedLoops()) await baseline(loop);
@@ -195,7 +227,7 @@ async function main() {
     for (const loop of selectedLoops()) await runLoop(loop);
     return;
   }
-  throw new Error(`unknown command '${command}'; use status, bootstrap, setup, baseline, or run`);
+  throw new Error(`unknown command '${command}'; use status, bootstrap, setup, isolation-check, baseline, or run`);
 }
 
 main().catch((error) => {

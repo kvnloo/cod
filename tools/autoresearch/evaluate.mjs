@@ -101,6 +101,7 @@ function performanceRows() {
     '--ms', String(loop.evaluator.measureMs),
     '--w', String(loop.evaluator.width),
     '--h', String(loop.evaluator.height),
+    '--shots', loop.expectedShots.join(','),
     '--port', String(basePort + trial),
     '--dist', dist,
     '--no-build',
@@ -134,6 +135,7 @@ async function evaluateCinematic() {
   run('node', [
     'tools/capture.mjs', '--quality', loop.preset,
     '--w', String(loop.evaluator.width), '--h', String(loop.evaluator.height),
+    '--shots', loop.expectedShots.join(','),
     '--label', label, '--port', String(basePort + 100 + trial), '--dist', dist, '--no-build',
   ]);
   const capturePath = path.join(ROOT, 'shots', label, 'manifest.json');

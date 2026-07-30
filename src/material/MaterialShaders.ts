@@ -64,6 +64,17 @@ export interface ShaderExtensionConfig {
    */
   macro?: THREE.Vector4 | null;
   /**
+   * World-space *story* layers, all of which need `macro` to be on.
+   *   x = patch strength    — replaced slabs, repairs, a second pour
+   *   y = damp strength     — standing damp, silt drift and oil marks
+   *   z = traffic strength  — polished wheel/foot lanes
+   *   w = metal wash        — rain-burnished up-facing metal
+   * A tiling texture cannot carry any of these: they are all features of
+   * *where a surface is in the world*, and without them a ground plane has the
+   * same value from the player's boots to the far end of the street.
+   */
+  surface?: THREE.Vector4 | null;
+  /**
    * Splash-back / rising-damp band at the foot of vertical surfaces, in world
    * space. Grounds walls and props against the floor, which the base maps
    * cannot do because they tile.
@@ -72,6 +83,12 @@ export interface ShaderExtensionConfig {
   ground?: THREE.Vector3 | null;
   /** Take opacity from the albedo alpha channel (glass, grates, foliage). */
   alphaFromMap?: boolean;
+  /**
+   * Roll and mirror the UVs per flat panel, keyed off the panel's recovered uv
+   * origin. Only meaningful in the UV path (glass, signage) where every panel
+   * is mapped 0..1 and would otherwise show the same baked damage.
+   */
+  uvVariation?: boolean;
   /**
    * Animated emissive mode. 1 = fluorescent tube, 2 = hazard strobe,
    * 3 = monitor, 4 = hot metal, 5 = emergency lamp, 6 = sodium.
@@ -109,6 +126,7 @@ export interface ObUniforms {
   obTime: THREE.IUniform<number>;
   obEmissive: THREE.IUniform<THREE.Vector4>;
   obMacro: THREE.IUniform<THREE.Vector4>;
+  obSurf: THREE.IUniform<THREE.Vector4>;
   obGround: THREE.IUniform<THREE.Vector3>;
   [key: string]: THREE.IUniform;
 }
@@ -162,6 +180,7 @@ uniform vec4  obEmissive;   // x = gain, y = rate, z = phase, w = temperature
 
 #ifdef OB_MACRO
   uniform vec4 obMacro;     // x,y = 1/wavelength (m), z = albedo gain, w = rough gain
+  uniform vec4 obSurf;      // x = patch, y = damp, z = traffic, w = metal wash
   uniform vec3 obGround;    // x = ground Y, y = fade height, z = strength
 #endif
 
@@ -269,6 +288,55 @@ float obMNoise(vec3 x) {
                  mix(obMHash(i + vec3(0.0, 1.0, 0.0)), obMHash(i + vec3(1.0, 1.0, 0.0)), f.x), f.y),
              mix(mix(obMHash(i + vec3(0.0, 0.0, 1.0)), obMHash(i + vec3(1.0, 0.0, 1.0)), f.x),
                  mix(obMHash(i + vec3(0.0, 1.0, 1.0)), obMHash(i + vec3(1.0, 1.0, 1.0)), f.x), f.y), f.z);
+}
+
+/**
+ * Trilinear value noise is *not* uniform on 0..1.
+ *
+ * Averaging eight independent uniforms gives a Gaussian about 0.5 with a
+ * standard deviation of only ~0.15 (and ~0.11 once two octaves are mixed), so a
+ * threshold written as smoothstep(0.6, 0.85, n) — which looks perfectly
+ * sensible — fires on well under one percent of the surface. That single
+ * mistake is why every world-space weathering layer in this shader was
+ * invisible and why a street held one value for sixty metres. Stretch the
+ * distribution once, here, and let every consumer use honest thresholds.
+ */
+float obMWide(float v, float k) { return clamp((v - 0.5) * k + 0.5, 0.0, 1.0); }
+
+float obMNoiseN(vec3 p) { return obMWide(obMNoise(p), 2.7); }
+
+float obMFbm(vec3 p) {
+  return obMNoise(p) * 0.62 + obMNoise(p * 2.17 + 19.7) * 0.38;
+}
+
+float obMFbmN(vec3 p) { return obMWide(obMFbm(p), 3.4); }
+
+/**
+ * An irregular patch lattice in the ground plane.
+ *
+ * A regular grid warped by a metre-scale noise gives quadrilateral cells with
+ * wobbly borders — which is exactly the shape of a road repair, a replaced
+ * paving slab or a second concrete pour. The returned value is
+ *   x = 1 inside a patch (with a firm, not gradual, edge)
+ *   y = per-patch random, for its own value and roughness
+ *   z = distance to the patch border, for a rim of ground-in dirt
+ */
+vec4 obPatch(vec2 p, float cell, float coverage, float seed) {
+  // Rotated off the world axes on purpose. Aligned with them the lattice lands
+  // on top of the level's own 0.5 m grid and the paving reads as a chessboard
+  // rather than as repairs.
+  const vec2 obRot = vec2(0.8988, 0.4384);   // ~26 degrees
+  p = vec2(p.x * obRot.x - p.y * obRot.y, p.x * obRot.y + p.y * obRot.x);
+  vec2 q = p / max(cell, 1e-3);
+  vec2 wob = vec2(obMNoise(vec3(q * 0.75, seed)), obMNoise(vec3(q * 0.75, seed + 31.0))) - 0.5;
+  q += wob * 1.5;
+  vec2 cid = floor(q);
+  vec2 lf = fract(q);
+  float rnd = obMHash(vec3(cid, seed + 7.0));
+  vec2 dv = min(lf, 1.0 - lf);
+  float d = min(dv.x, dv.y);
+  float on = step(coverage, rnd);
+  return vec4(on * smoothstep(0.0, 0.055, d), obMHash(vec3(cid, seed + 53.0)), d, on);
 }
 #endif
 `;
@@ -387,6 +455,33 @@ const FRAG_PROLOGUE = /* glsl */ `
       obUv += obV.w;
     #endif
 
+    #ifdef OB_UV_VARY
+      {
+        /* Per-panel variation without a per-instance attribute.
+           World position is an affine function of uv across a flat panel, so
+           the panel's uv origin can be recovered from screen-space derivatives.
+           Every fragment on the panel resolves the same origin, so hashing it
+           gives a stable per-panel id with no seam down the middle — which is
+           what stops twelve windows carrying the same baked crack. */
+        vec2 obDux = dFdx(vMapUv), obDuy = dFdy(vMapUv);
+        vec3 obDpx = dFdx(obWPos), obDpy = dFdy(obWPos);
+        float obDet = obDux.x * obDuy.y - obDux.y * obDuy.x;
+        vec3 obOrg = obWPos;
+        if (abs(obDet) > 1e-10) {
+          vec3 obPu = ( obDuy.y * obDpx - obDux.y * obDpy) / obDet;
+          vec3 obPv = (-obDuy.x * obDpx + obDux.x * obDpy) / obDet;
+          obOrg = obWPos - vMapUv.x * obPu - vMapUv.y * obPv;
+        }
+        vec3 obPid = floor(obOrg * 3.0 + 0.137);
+        float obJ0 = obHash1(dot(obPid, vec3(1.0, 57.0, 113.0)) + 0.5);
+        float obJ1 = obHash1(dot(obPid, vec3(11.0, 7.0, 191.0)) + 3.7);
+        float obJ2 = obHash1(dot(obPid, vec3(31.0, 97.0, 5.0)) + 9.1);
+        if (obJ2 > 0.5) obUv.x = -obUv.x;
+        if (obJ2 > 0.75) obUv.y = -obUv.y;
+        obUv += vec2(obJ0, obJ1) * 3.0;
+      }
+    #endif
+
     #ifdef OB_POM
       {
         vec3 vts = normalize(vec3(dot(obVdirV, obTBN[0]), dot(obVdirV, obTBN[1]), dot(obVdirV, obTBN[2])));
@@ -496,7 +591,7 @@ const FRAG_PROLOGUE = /* glsl */ `
         // the albedo/roughness half. Past a metre or two its texels fall below
         // a pixel, the mip chain keeps their variance, and what should be sand
         // grain turns into a crawling gravel rash across the whole wall.
-        float dnFade = mix(0.26, 1.0, 1.0 - smoothstep(0.8, 4.0, obDist));
+        float dnFade = mix(0.28, 1.0, 1.0 - smoothstep(1.2, 7.0, obDist));
         vec2 dn = (dt.rg * 2.0 - 1.0) * obDetailStrength.x * dfade * dnFade;
         float da = (dt.b - 0.5) * obDetailStrength.y * dfade;
         float dr = (dt.a - 0.5) * obDetailStrength.z * dfade;
@@ -528,9 +623,10 @@ const FRAG_PROLOGUE = /* glsl */ `
       // Two decorrelated octaves in metres. The coarse one carries the "this
       // wall has been patched and weathered unevenly" story; the fine one
       // desynchronises the texture repeat so the tiling never lines up.
-      float obM1 = obMNoise(obWPos * obMacro.x + 13.7);
-      float obM2 = obMNoise(obWPos * obMacro.y + 71.3);
-      float obMv = (obM1 - 0.5) * 1.30 + (obM2 - 0.5) * 0.70;
+      float obM1 = obMNoiseN(obWPos * obMacro.x + 13.7);
+      float obM2 = obMNoiseN(obWPos * obMacro.y + 71.3);
+      float obM3 = obMNoiseN(obWPos * (obMacro.x * 2.9) + 41.9);
+      float obMv = (obM1 - 0.5) * 1.30 + (obM2 - 0.5) * 0.70 + (obM3 - 0.5) * 0.60;
 
       // Value drift, kept small: real render/plaster varies a few percent, and
       // anything more reads as camouflage.
@@ -547,25 +643,126 @@ const FRAG_PROLOGUE = /* glsl */ `
       // do this — any vertical gradient baked into the tile bands at every
       // repeat — so the streaks that read as weathering have to live here.
       {
-        float obRun = obMNoise(obWPos * vec3(0.62, 0.105, 0.62) + 47.1);
-        obRun = smoothstep(0.50, 0.84, obRun) * (1.0 - abs(obWNrm.y));
+        float obRun = obMNoiseN(obWPos * vec3(0.62, 0.105, 0.62) + 47.1);
+        obRun = smoothstep(0.48, 0.80, obRun) * (1.0 - abs(obWNrm.y));
         obRun *= obMacro.z * 2.4;
         obAlb.rgb = mix(obAlb.rgb, obAlb.rgb * vec3(0.80, 0.785, 0.755), obRun);
         obOrm.g = clamp(obOrm.g + obRun * 0.22, 0.03, 1.0);
       }
 
+      /* --------------------------------------------- repairs and patches -- */
+      // Two lattices at different scales: the coarse one is a resurfaced bay
+      // or a second pour, the fine one is an individual replaced slab. Without
+      // them a tiled ground plane holds one value from the player's boots to
+      // the end of the street, which is the single loudest procedural tell.
+      if (obSurf.x > 0.001) {
+        // Project into the surface's own plane. Using world xz everywhere put
+        // the whole height of a wall — and the whole of a jersey barrier or an
+        // arcade pier — inside one lattice cell, so a vertical surface came out
+        // as a single flat value: exactly the complaint about the plaster pier.
+        vec2 obPp = abs(obWNrm.y) > 0.5
+          ? obWPos.xz
+          : (abs(obWNrm.x) > abs(obWNrm.z) ? vec2(obWPos.z, obWPos.y) : vec2(obWPos.x, obWPos.y));
+        vec4 pA = obPatch(obPp, 5.2, 0.60, 3.0);
+        vec4 pB = obPatch(obPp, 2.35, 0.58, 61.0);
+        float wA = pA.x * obSurf.x;
+        float wB = pB.x * obSurf.x * 0.62;
+
+        // Value: a repair is laid in a different batch, so it reads at a
+        // different exposure — this is where most of the frame's tonal range
+        // on the ground comes from.
+        obAlb.rgb *= mix(1.0, mix(0.44, 1.34, pA.y), wA);
+        obAlb.rgb *= mix(1.0, mix(0.66, 1.24, pB.y), wB);
+        // Cooler when darker, warmer when paler: fresh tarmac against old.
+        obAlb.rgb *= mix(vec3(1.0), mix(vec3(0.955, 0.985, 1.035), vec3(1.035, 1.005, 0.960), pA.y), wA);
+        obOrm.g = clamp(mix(obOrm.g, mix(0.30, 0.99, pA.y), wA * 0.80), 0.03, 1.0);
+        obOrm.g = clamp(mix(obOrm.g, mix(0.48, 0.99, pB.y), wB * 0.60), 0.03, 1.0);
+
+        // Ground-in dirt in the joint around a patch — but only around a patch,
+        // never around every cell, or the lattice itself becomes the pattern.
+        float rim = (1.0 - smoothstep(0.0, 0.085, pA.z)) * pA.w * obSurf.x;
+        obAlb.rgb *= mix(1.0, 0.66, rim * 0.75);
+        obOrm.g = clamp(obOrm.g + rim * 0.16, 0.03, 1.0);
+      }
+
+      /* ---------------------------------- what happens on a ground plane -- */
+      // Everything below is gravity-driven, so it belongs only on surfaces
+      // that actually face up. A wall gets none of it.
+      float obUp = clamp(obWNrm.y * 2.4 - 0.7, 0.0, 1.0);
+      if (obUp > 0.002 && obSurf.y + obSurf.z + obSurf.w > 0.001) {
+        // Standing damp in the low, sheltered ground. Wet stone is both much
+        // darker and much smoother, so this carries a stop and a half of value
+        // *and* puts a sheen under a low sun.
+        // Broken up at a second, much shorter wavelength so the wet area has a
+        // ragged edge and a mottled interior instead of reading as one smooth
+        // lens of oil laid over the street.
+        float obDamp = obMFbmN(obWPos * vec3(0.155, 0.03, 0.155) + 5.3);
+        obDamp = smoothstep(0.40, 0.74, obDamp);
+        obDamp *= mix(0.45, 1.0, obMNoiseN(obWPos * vec3(0.95, 0.10, 0.95) + 33.1));
+        obDamp *= obUp * obSurf.y;
+        obAlb.rgb *= mix(1.0, 0.55, obDamp);
+        obOrm.g = clamp(mix(obOrm.g, 0.42, obDamp * 0.92), 0.03, 1.0);
+
+        // Wheel and foot lanes: polished, slightly darker, and stretched 20:1
+        // along whichever axis the traffic runs.
+        float obLnA = obMNoiseN(obWPos * vec3(0.032, 0.0, 0.62) + 27.1);
+        float obLnB = obMNoiseN(obWPos * vec3(0.62, 0.0, 0.032) + 63.7);
+        float obPol = max(smoothstep(0.50, 0.86, obLnA), smoothstep(0.50, 0.86, obLnB));
+        obPol *= obUp * obSurf.z;
+        obAlb.rgb *= mix(1.0, 0.74, obPol);
+        obOrm.g = clamp(mix(obOrm.g, 0.40, obPol * 0.8), 0.03, 1.0);
+
+        // Silt and blown dust: pale, warm, dead matte, and it lands where the
+        // damp is not.
+        float obSilt = obMNoiseN(obWPos * vec3(0.30, 0.03, 0.30) + 91.3);
+        obSilt = smoothstep(0.48, 0.84, obSilt) * obUp * obSurf.y * (1.0 - obDamp * 0.8);
+        obAlb.rgb = mix(obAlb.rgb, obAlb.rgb * vec3(1.15, 1.09, 0.99) + 0.010, obSilt * 0.7);
+        obOrm.g = clamp(obOrm.g + obSilt * 0.20, 0.03, 1.0);
+
+        // Oil and tar: small, tight, near black, and glossy.
+        float obOil = obMNoiseN(obWPos * vec3(0.95, 0.06, 0.95) + 151.7);
+        obOil = smoothstep(0.72, 0.93, obOil) * obUp * obSurf.y;
+        obAlb.rgb *= mix(1.0, 0.30, obOil);
+        obOrm.g = clamp(mix(obOrm.g, 0.18, obOil * 0.9), 0.03, 1.0);
+
+        // Rain-burnished metal. An up-facing steel surface outdoors loses its
+        // paint and its oxide film to weather and traffic, and what is left is
+        // a mirror that takes its colour from the sky — the thing the whole
+        // scene is currently missing.
+        if (obSurf.w > 0.001) {
+          // Long wavelength and a low threshold: a rail running face or a
+          // handrail top is continuously burnished, not polished in 60 cm
+          // patches.
+          float obWash = smoothstep(0.08, 0.48, obMNoiseN(obWPos * 0.55 + 7.9)) * obUp * obSurf.w;
+          obOrm.b = clamp(mix(obOrm.b, 1.0, obWash), 0.0, 1.0);
+          obOrm.g = clamp(mix(obOrm.g, 0.13, obWash * 0.9), 0.02, 1.0);
+          obAlb.rgb = mix(obAlb.rgb, mix(obAlb.rgb, vec3(0.62, 0.63, 0.66), 0.7), obWash);
+        }
+      }
+
       /* ------------------------------------------- ground contact band --- */
       if (obGround.z > 0.001) {
-        float obGy = 1.0 - smoothstep(obGround.x, obGround.x + obGround.y, obWPos.y);
+        // The top of the wedge has to be ragged at a *decimetre* wavelength,
+        // not a metre one: a clean line where a wall meets a floor is one of
+        // the loudest reads in the whole frame, and a smooth metre-scale
+        // gradient still leaves a clean line, just a blurrier one.
+        float obRag = obMNoiseN(vec3(obWPos.x, obWPos.y * 0.25, obWPos.z) * 3.1 + 5.7);
+        float obH = obGround.y * mix(0.45, 1.55, obRag);
+        float obGy = 1.0 - smoothstep(obGround.x, obGround.x + obH, obWPos.y);
         // Only walls: a floor does not get splash-back on itself.
         obGy *= 1.0 - abs(obWNrm.y);
         // Broken up so the band is never a clean horizontal line.
-        obGy *= mix(0.35, 1.0, obM1) * mix(0.60, 1.15, obM2);
+        obGy *= mix(0.45, 1.0, obM1) * mix(0.65, 1.15, obM2);
         obGy = clamp(obGy, 0.0, 1.0) * obGround.z;
+        // A hard wedge of ground-in silt in the last few centimetres, where
+        // the wall is genuinely buried rather than merely splashed.
+        float obWedge = pow(1.0 - smoothstep(obGround.x, obGround.x + obH * 0.30, obWPos.y), 1.6)
+                      * (1.0 - abs(obWNrm.y)) * obGround.z;
         // Splash-back dirt: darker, desaturated, and much rougher.
-        vec3 obGrime = obAlb.rgb * vec3(0.46, 0.44, 0.41);
+        vec3 obGrime = obAlb.rgb * vec3(0.42, 0.40, 0.37);
         obAlb.rgb = mix(obAlb.rgb, obGrime, obGy);
-        obOrm.g = clamp(mix(obOrm.g, 0.97, obGy * 0.8), 0.03, 1.0);
+        obAlb.rgb = mix(obAlb.rgb, obAlb.rgb * vec3(0.86, 0.79, 0.66) * 0.72 + vec3(0.020, 0.017, 0.012), obWedge * 0.85);
+        obOrm.g = clamp(mix(obOrm.g, 0.97, obGy * 0.8 + obWedge * 0.5), 0.03, 1.0);
         // Salt bloom rising just above the wet line — pale, low contrast.
         float obSalt = smoothstep(0.28, 0.62, obGy / max(obGround.z, 1e-3))
                      * smoothstep(0.75, 0.42, obGy / max(obGround.z, 1e-3))
@@ -663,8 +860,8 @@ function ensureUniforms(material: THREE.MeshStandardMaterial): ObUniforms {
     obTriSharp: { value: 6 },
     obDetailMap: { value: null },
     obDetailScale: { value: 8 },
-    obDetailStrength: { value: new THREE.Vector3(0.42, 0.30, 0.60) },
-    obDetailFade: { value: new THREE.Vector2(3, 12) },
+    obDetailStrength: { value: new THREE.Vector3(0.26, 0.20, 0.74) },
+    obDetailFade: { value: new THREE.Vector2(7, 24) },
     obPom: { value: new THREE.Vector3(0.02, 8, 32) },
     obWear: { value: 0 },
     obNormalFade: { value: 14 },
@@ -676,6 +873,7 @@ function ensureUniforms(material: THREE.MeshStandardMaterial): ObUniforms {
     obTime: { value: 0 },
     obEmissive: { value: new THREE.Vector4(1, 1, 0, 1) },
     obMacro: { value: new THREE.Vector4(1 / 7.5, 1 / 23, 0.11, 0.05) },
+    obSurf: { value: new THREE.Vector4(0, 0, 0, 0) },
     obGround: { value: new THREE.Vector3(0, 0.9, 0) },
   };
   ud.obUniforms = u;
@@ -708,6 +906,7 @@ export function extendStandardMaterial(
   if (cfg.specularAA !== false) defines.OB_SPEC_AA = '1'; else delete defines.OB_SPEC_AA;
   if (cfg.macro) defines.OB_MACRO = '1'; else delete defines.OB_MACRO;
   if (cfg.alphaFromMap) defines.OB_ALPHA_FROM_MAP = '1'; else delete defines.OB_ALPHA_FROM_MAP;
+  if (cfg.uvVariation && !cfg.triplanar) defines.OB_UV_VARY = '1'; else delete defines.OB_UV_VARY;
   if (cfg.emissiveMode) defines.OB_EMISSIVE_MODE = String(cfg.emissiveMode);
   else delete defines.OB_EMISSIVE_MODE;
   defines.OB_EXTENDED = '1';
@@ -727,6 +926,8 @@ export function extendStandardMaterial(
   u.obWear.value = cfg.wear ?? 0;
   u.obNormalFade.value = cfg.normalFadeDistance ?? 14;
   if (cfg.macro) u.obMacro.value.copy(cfg.macro);
+  if (cfg.surface) u.obSurf.value.copy(cfg.surface);
+  else u.obSurf.value.set(0, 0, 0, 0);
   if (cfg.ground) u.obGround.value.copy(cfg.ground);
   else u.obGround.value.set(0, 0.9, 0);
   if (cfg.blend) {

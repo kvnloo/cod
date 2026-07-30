@@ -18,7 +18,7 @@ import { chevronPath, fadeMaskH, text } from '../Draw';
 import type { DrawCtx } from '../Draw';
 import { objectiveMarker } from '../Glyphs';
 import type { HudModel } from '../Model';
-import { FONT_COND, lift, rgba, type Palette } from '../Theme';
+import { ADS_FADE, adsFade, FONT_COND, lift, rgba, type Palette } from '../Theme';
 import { LAYOUT, MARGIN } from '../Theme';
 import { ui } from '../UiSettings';
 import type { Widget } from './Widget';
@@ -71,7 +71,7 @@ export class Compass implements Widget {
     const x = Math.round(d.w / 2 - w / 2);
     const y = Math.round(MARGIN * s * 0.42);
 
-    const alpha = d.alpha * (1 - m.ads * 0.78);
+    const alpha = adsFade(d.alpha, m.ads, ADS_FADE.ambient);
     if (alpha <= 0.01) return;
 
     /* ------------------------------------------------ offscreen strip -- */

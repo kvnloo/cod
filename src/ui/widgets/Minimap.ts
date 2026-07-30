@@ -23,7 +23,7 @@ import {
 import type { DrawCtx } from '../Draw';
 import { objectiveMarker } from '../Glyphs';
 import type { HudModel } from '../Model';
-import { FONT_COND, lift, rgba, type Palette } from '../Theme';
+import { ADS_FADE, adsFade, FONT_COND, lift, rgba, type Palette } from '../Theme';
 import { LAYOUT, MARGIN } from '../Theme';
 import { ui } from '../UiSettings';
 import type { Widget } from './Widget';
@@ -185,12 +185,25 @@ export class Minimap implements Widget {
     const headerH = 26 * s;
     const y = MARGIN * s * 0.7 + headerH;
 
-    const alpha = d.alpha * (1 - m.ads * 0.82);
+    // Aiming removes the map rather than ghosting it. A panel held at 18% still
+    // owns its whole corner — it reads as a smear the eye keeps returning to,
+    // and it is the one element a player can do nothing about while holding a
+    // sight picture. It leaves by shrinking back into the corner it lives in,
+    // so the exit is a movement rather than a dissolve.
+    const alpha = adsFade(d.alpha, m.ads, ADS_FADE.gone);
     if (alpha <= 0.01) return;
+    const tuck = Ease.inQuad(clamp01(m.ads * 1.25));
 
     c.save();
     c.globalAlpha = alpha;
     c.translate(-(1 - this.appear.value) * 26 * s * motion(), 0);
+    if (tuck > 0.001) {
+      // Scale about the panel's top-left anchor.
+      const k = 1 - tuck * 0.34;
+      c.translate(x, y - headerH);
+      c.scale(k, k);
+      c.translate(-x, -(y - headerH));
+    }
 
     /* --------------------------------------------------- header ------- */
     this.drawHeader(d, m, x, y - headerH, size, headerH, p);

@@ -31,6 +31,18 @@ interface Ctx {
   rand: Rand;
 }
 
+/**
+ * Interchangeable castings.
+ *
+ * Anywhere the level wants "a concrete barrier" or "an emplacement" it picks
+ * from these rather than naming one prop, so no two positions on the map get
+ * the same mesh in the same orientation. The critic's strongest single note was
+ * three jersey barriers of identical mesh, identical tint and near-identical
+ * yaw, evenly spaced in a straight line down lane A.
+ */
+const BARRIERS = ['jerseyBarrier', 'jerseyBarrierWorn', 'jerseyBarrier', 'jerseyBarrierWorn', 'jerseyBarrierDown'] as const;
+const SANDBAGS = ['sandbagRow', 'sandbagRowLow', 'sandbagPost'] as const;
+
 /** The toppled tram: shared so nothing else gets placed inside it. */
 export const TRAM = { x: -2.0, z: -7.6, yaw: 1.28, half: 7.0, wide: 1.9 } as const;
 
@@ -135,8 +147,12 @@ function squareComposition(ctx: Ctx): void {
   // the silhouette and the story without changing the cover layout.
   for (let i = 0; i < chicane.length; i++) {
     const [x, z, yaw] = chicane[i];
-    const id = i % 3 === 1 ? 'sandbagRow' : i % 5 === 3 ? 'hedgehog' : 'jerseyBarrier';
-    grounded(ctx, { id, x, z, yaw: yaw + rand.range(-0.05, 0.05) }, 1.15);
+    const id = i % 3 === 1 ? rand.pick(SANDBAGS) : i % 5 === 3 ? 'hedgehog' : rand.pick(BARRIERS);
+    grounded(ctx, {
+      id, x, z,
+      yaw: yaw + rand.range(-0.30, 0.30),
+      scale: rand.range(0.94, 1.06),
+    }, 1.15);
   }
 
   // Big concrete blocks anchoring the corners of the square.
@@ -193,6 +209,47 @@ function squareComposition(ctx: Ctx): void {
       });
     }
   }
+
+  // --- town hall terrace ------------------------------------------------
+  //
+  // The terrace deck is a 37 × 6.5 m stone plane 1.25 m above the square, and
+  // the north-street vantage stands on it with its eye half a metre off the
+  // slabs: the bottom 60 % of that frame was one paving plane running dead
+  // straight to the vanishing point. It is a fought-over position, so it gets
+  // dressed like one — a firing line of sandbags along the balustrade, ammunition
+  // and rubble behind it, wire on the steps, and a fallen cable drooping through
+  // the near foreground.
+  const tY = SQUARE.terraceY;
+  const placeT = (id: string, x: number, z: number, yaw: number, scale = 1) => {
+    scatter.place({ id, x, y: tY, z, yaw, scale });
+  };
+  const firing: [number, number][] = [
+    [-9.6, -34.7], [-7.2, -34.5], [-1.2, -34.6], [1.4, -34.5],
+    [11.8, -34.6], [14.2, -34.7],
+  ];
+  for (let i = 0; i < firing.length; i++) {
+    const [x, z] = firing[i];
+    placeT(rand.pick(SANDBAGS), x + rand.range(-0.3, 0.3), z, Math.PI + rand.range(-0.24, 0.24), rand.range(0.92, 1.08));
+  }
+  for (const [x, z] of [
+    [-12.4, -37.5], [-10.2, -36.9], [-8.4, -35.6],
+    [-2.6, -36.3], [2.4, -36.0], [10.6, -36.2], [15.0, -36.6], [7.4, -37.4],
+  ] as const) {
+    placeT(rand.pick(['ammoCrate', 'ammoBoxMetal', 'crateSmall', 'jerryCan', 'rubbleSmall', 'brickPile', 'plankPile']),
+      x, z, rand.range(0, 6.28), rand.range(0.85, 1.1));
+  }
+  // Coping and render brought down by the shell that took out the balustrade.
+  for (let i = 0; i < 9; i++) {
+    const x = rand.range(-14.4, -9.5);
+    const z = rand.range(-36.2, -34.2);
+    placeT(rand.pick(['brickPile', 'rubbleSmall', 'brickPile', 'concreteChunk', 'rubbleSmall']),
+      x, z, rand.range(0, 6.28), rand.range(0.6, 0.92));
+  }
+  placeT('razorWire', -6.0, -34.4, 0.1);
+  placeT('razorWire', 4.6, -34.4, -0.08);
+  placeT('barrelBurning', -11.6, -38.4, rand.range(0, 6.28));
+  placeT('crateLarge', 16.2, -37.2, rand.range(0, 3.14));
+  placeT('weeds', -16.8, -37.8, rand.range(0, 6.28), 1.2);
 
   // Burning barrels — the map's warm practical light sources at dusk.
   for (const [x, z] of [[-10.2, -8.5], [9.5, -14.0], [-27.5, 6.0], [31.5, -26.0], [-3.0, 24.0]] as const) {
@@ -275,10 +332,18 @@ function streetFurniture(ctx: Ctx): void {
   // sightline reads in three depth layers instead of one.
   const laneBank = (x: number, z: number, yaw: number, seed: number) => {
     const r = new Rand(seed);
+    // Uneven spacing, mixed castings, real yaw spread and a stagger across the
+    // line: a checkpoint that has been driven through, not a row of pegs.
+    let along = -2.6;
     for (let i = 0; i < 3; i++) {
-      const px = x + Math.cos(yaw) * (i - 1) * 2.15;
-      const pz = z + Math.sin(yaw) * (i - 1) * 2.15;
-      grounded(ctx, { id: 'jerseyBarrier', x: px, z: pz, yaw: yaw + r.range(-0.08, 0.08) }, 1.15);
+      const off = r.range(-0.55, 0.55);
+      const px = x + Math.cos(yaw) * along - Math.sin(yaw) * off;
+      const pz = z + Math.sin(yaw) * along + Math.cos(yaw) * off;
+      grounded(ctx, {
+        id: r.pick(BARRIERS), x: px, z: pz,
+        yaw: yaw + r.range(-0.42, 0.42), scale: r.range(0.92, 1.08),
+      }, 1.15);
+      along += r.range(1.75, 3.1);
     }
     grounded(ctx, {
       id: r.bool() ? 'rubbleHeap' : 'sandPile',
@@ -409,7 +474,10 @@ function defences(ctx: Ctx): void {
     [-1.2, 22.0, Math.PI], [1.6, 22.2, Math.PI],
   ];
   for (const [x, z, yaw] of positions) {
-    scatter.place({ id: 'sandbagRow', x, y: surfaceY(x, z), z, yaw: yaw + rand.range(-0.08, 0.08) });
+    scatter.place({
+      id: rand.pick(SANDBAGS), x, y: surfaceY(x, z), z,
+      yaw: yaw + rand.range(-0.26, 0.26), scale: rand.range(0.93, 1.07),
+    });
     if (rand.bool(0.5)) {
       const px = x + Math.sin(yaw + Math.PI) * 1.1, pz = z + Math.cos(yaw + Math.PI) * 1.1;
       scatter.place({
@@ -450,10 +518,15 @@ function defences(ctx: Ctx): void {
   ] as const) {
     ctx.scatter.place({ id: 'manhole', x, y: surfaceY(x, z) + 0.005, z, yaw: ctx.rand.range(0, 6.28) });
   }
+  // Gullies sit *in* the gutter dish against the kerb, at the spacing a real
+  // street uses — every 25 m or so, both sides.
+  const g = LANE.aHalf - 0.55;
   for (const [x, z] of [
-    [LANE.aX + 4.3, -22.0], [LANE.aX + 4.3, 6.0], [LANE.aX - 4.3, -8.0],
-    [LANE.cX - 4.3, -18.0], [LANE.cX - 4.3, 14.0], [LANE.cX + 4.3, 2.0],
-    [-13.2, -12.0], [13.2, 8.0], [-13.2, 14.0], [13.2, -26.0],
+    [LANE.aX + g, -30.0], [LANE.aX + g, -6.0], [LANE.aX + g, 18.0],
+    [LANE.aX - g, -18.0], [LANE.aX - g, 8.0],
+    [LANE.cX - g, -26.0], [LANE.cX - g, -2.0], [LANE.cX - g, 22.0],
+    [LANE.cX + g, -14.0], [LANE.cX + g, 12.0],
+    [-3.9, -24.0], [3.9, 6.0], [-3.9, 12.0], [3.9, -30.0],
   ] as const) {
     ctx.scatter.place({ id: 'drainGrate', x, y: surfaceY(x, z) + 0.005, z, yaw: Math.PI / 2 });
   }
@@ -567,16 +640,19 @@ function roofDressing(ctx: Ctx, roofs: Record<string, number>): void {
     for (let i = 0; i < n; i++) {
       const x = rand.range(f.x0 + 1.6, f.x1 - 1.6);
       const z = rand.range(f.z0 + 1.6, f.z1 - 1.6);
+      // Bedded a few millimetres *into* the deck, not floated 2 cm above it.
+      // Every roof prop used to sit at y + 0.02, which left daylight under the
+      // legs of the water tanks on the rooftop route.
       scatter.place({
         id: rand.pick(['acUnit', 'ventDuct', 'satelliteDish', 'roofTank', 'antennaMast', 'crateSmall', 'rubbleSmall', 'binRound', 'pipeCluster']),
-        x, y: y + 0.02, z, yaw: rand.range(0, 6.28),
+        x, y: y - 0.006, z, yaw: rand.range(0, 6.28),
       });
     }
     // Chimney-side clutter that reads at silhouette height.
     for (let i = 0; i < 2; i++) {
       const x = rand.range(f.x0 + 2, f.x1 - 2);
       const z = rand.range(f.z0 + 2, f.z1 - 2);
-      scatter.place({ id: rand.bool() ? 'antennaMast' : 'satelliteDish', x, y: y + 0.02, z, yaw: rand.range(0, 6.28) });
+      scatter.place({ id: rand.bool() ? 'antennaMast' : 'satelliteDish', x, y: y - 0.006, z, yaw: rand.range(0, 6.28) });
     }
   }
 }
@@ -744,6 +820,13 @@ function overheadCables(ctx: Ctx): void {
     runs.push([V3(x, 7.4, LANE.northZ - 4.6), V3(x + rand.range(-2, 2), 7.4, LANE.northZ + 4.6), 0.8]);
     runs.push([V3(x, 7.4, LANE.southZ - 4.6), V3(x + rand.range(-2, 2), 7.4, LANE.southZ + 4.6), 0.8]);
   }
+
+  // Downed feeder across the town hall terrace: the near-foreground element the
+  // north-street sightline was missing entirely. It hangs from a bracket on the
+  // hall wall to a snapped standard on the balustrade, so it crosses the frame
+  // at chest height 3 m from the camera.
+  runs.push([V3(-19.6, 3.1, -39.4), V3(-6.2, 2.0, -34.2), 1.35]);
+  runs.push([V3(-19.4, 2.6, -39.2), V3(2.4, 1.55, -34.0), 1.9]);
 
   for (const [a, b, sag] of runs) cable(chunk, 'rubber', a, b, sag, 0.017);
 

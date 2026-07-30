@@ -44,6 +44,26 @@ export type MatKey =
   /* backdrop */
   | 'backdropFar' | 'backdropMid' | 'ridgeNear' | 'ridgeMid' | 'ridge';
 
+/**
+ * Fixture classes for anything that emits light of its own.
+ *
+ * A lamp lens is not "an emissive material", it is *a fixture that is switched
+ * on or off*, and which one depends on the hour. Tagging the class here is what
+ * lets `PracticalLights` run the whole level's photocell from one place —
+ * see `setPracticalNight`.
+ */
+export type FixtureClass =
+  /** Street lighting: dead in daylight, full after dusk. */
+  | 'street'
+  /** Backlit signage and printed sign stock: dead in daylight. */
+  | 'signage'
+  /** Room lighting: on around the clock, because rooms are dark inside. */
+  | 'interior'
+  /** Burning/smouldering material: mostly washed out by the sun. */
+  | 'ember'
+  /** Signal lenses: dimmed but never fully off. */
+  | 'beacon';
+
 interface MatDef {
   archetype: string;
   surface: SurfaceType;
@@ -52,6 +72,8 @@ interface MatDef {
   fallback: number;
   /** Backdrop-style materials skip the procedural stack entirely. */
   flat?: { roughness: number; metalness: number };
+  /** Present when the material glows: drives the day/night switch. */
+  fixture?: FixtureClass;
 }
 
 /**
@@ -153,9 +175,16 @@ const D: Record<MatKey, MatDef> = {
   paintRed: { archetype: 'metal', surface: 'metal', fallback: 0x8c2a20, opts: { scale: 1.4, tint: 0xa8382a, saturation: 1.2, wear: 0.8 } },
   paintYellow: { archetype: 'metal', surface: 'metal', fallback: 0xb08a1c, opts: { scale: 1.4, tint: 0xcaa334, saturation: 1.2, wear: 0.85 } },
 
-  /* ---------------------------------------------------------- soft/misc */
-  glass: { archetype: 'glass', surface: 'glass', fallback: 0xb6c8c8, opts: { scale: 1.6 } },
-  glassDirty: { archetype: 'glass', surface: 'glass', fallback: 0x8d9a96, opts: { scale: 1.6, tint: 0x9fb0a8, saturation: 0.6 } },
+  /* ----------------------------------------------------------- soft/misc
+   * Glazing has to *transmit*. At opacity 1 the archetype is an opaque grey
+   * panel lit by whatever is on the camera's side of it, which is how a window
+   * on to a sunlit street ends up measuring darker than the interior wall
+   * beside it — the one measurement that says loudest "this is not a window".
+   * Letting the exterior through is also what gives the threshold its
+   * brightness step, and from outside it correctly turns the openings into the
+   * dark holes a real facade has rather than pale grey plates. */
+  glass: { archetype: 'glass', surface: 'glass', fallback: 0xb6c8c8, opts: { scale: 1.6, opacity: 0.22 } },
+  glassDirty: { archetype: 'glass', surface: 'glass', fallback: 0x8d9a96, opts: { scale: 1.6, tint: 0x9fb0a8, saturation: 0.6, opacity: 0.34 } },
   canvasRed: { archetype: 'fabric', surface: 'fabric', fallback: 0x8c3a30, opts: { scale: 1.0, tint: 0x9c4638, saturation: 1.2, doubleSided: true } },
   canvasGreen: { archetype: 'fabric', surface: 'fabric', fallback: 0x3f5836, opts: { scale: 1.0, tint: 0x516b42, saturation: 1.0, doubleSided: true } },
   canvasCream: { archetype: 'fabric', surface: 'fabric', fallback: 0xa89c7e, opts: { scale: 1.0, tint: 0xc2b694, saturation: 0.7, doubleSided: true } },
@@ -166,13 +195,49 @@ const D: Record<MatKey, MatDef> = {
   foliage: { archetype: 'foliage', surface: 'foliage', fallback: 0x465c2c, opts: { scale: 0.7, doubleSided: true, instanced: true } },
   foliageDry: { archetype: 'foliage', surface: 'foliage', fallback: 0x6a6232, opts: { scale: 0.7, tint: 0xa89a58, saturation: 0.7, doubleSided: true, instanced: true } },
 
-  /* --------------------------------------------------------- practicals */
-  lampSodium: { archetype: 'plastic', surface: 'plastic', fallback: 0xffbb62, opts: { scale: 0.5, tint: 0xffcf95, emissive: 0xffb257, emissiveIntensity: 2.4 } },
-  lampWarm: { archetype: 'plastic', surface: 'plastic', fallback: 0xffe0b0, opts: { scale: 0.5, tint: 0xfff0d8, emissive: 0xffd9a0, emissiveIntensity: 1.8 } },
-  fluoro: { archetype: 'fluorescent', surface: 'plastic', fallback: 0xe2e8dc, opts: { emissiveIntensity: 1.9 } },
-  beacon: { archetype: 'plastic', surface: 'plastic', fallback: 0xff5a1c, opts: { scale: 0.4, tint: 0xff7a3a, emissive: 0xff4a10, emissiveIntensity: 2.6 } },
-  ember: { archetype: 'metal', surface: 'metal', fallback: 0x903018, opts: { scale: 1.0, tint: 0x6a3020, emissive: 0xff5a18, emissiveIntensity: 1.5 } },
-  signGlow: { archetype: 'plastic', surface: 'plastic', fallback: 0xd8ecff, opts: { scale: 0.5, tint: 0xcfe4ff, emissive: 0x63c4ff, emissiveIntensity: 1.4 } },
+  /* ---------------------------------------------------------- practicals
+   * Every value here is the *peak* — what the fixture looks like with the
+   * switch on and nothing else lighting it. `setPracticalNight` scales them
+   * down towards the fixture class's daylight floor, so a lamp lens at noon is
+   * the dull warm glass it actually is rather than a lit bulb.
+   *
+   * Peaks are deliberately low. Perpendicular sunlight in this renderer is
+   * ~16 units, and the night exposure lands about a factor of six above the
+   * day exposure, so an emissive of 2 at night is six stops into the clip and
+   * comes back as a white blob with a white bloom. Keeping the peak near 1
+   * with a saturated colour lets the tonemapper roll the highlight off and
+   * hold the hue, which is the whole difference between a sodium lamp and a
+   * headlight. */
+  lampSodium: {
+    archetype: 'plastic', surface: 'plastic', fallback: 0xada08c, fixture: 'street',
+    opts: { scale: 0.5, tint: 0xada08c, emissive: 0xff8a24, emissiveIntensity: 0.95 },
+  },
+  lampWarm: {
+    archetype: 'plastic', surface: 'plastic', fallback: 0xd8ccb4, fixture: 'interior',
+    opts: { scale: 0.5, tint: 0xd8ccb4, emissive: 0xffc27a, emissiveIntensity: 0.95 },
+  },
+  fluoro: {
+    archetype: 'fluorescent', surface: 'plastic', fallback: 0xe2e8dc, fixture: 'interior',
+    opts: { emissiveIntensity: 1.15 },
+  },
+  beacon: {
+    archetype: 'plastic', surface: 'plastic', fallback: 0xa8321a, fixture: 'beacon',
+    opts: { scale: 0.4, tint: 0x8e3320, emissive: 0xff4a10, emissiveIntensity: 0.85 },
+  },
+  /* Burnt-out coachwork and the contents of a fire barrel share this key. A
+   * wreck that has been cold for a week is charred paint over soot, not a bar
+   * heater — the glow only exists so the barrel reads at night. */
+  ember: {
+    archetype: 'metal', surface: 'metal', fallback: 0x3c322e, fixture: 'ember',
+    opts: { scale: 1.0, tint: 0x413632, saturation: 0.5, roughness: 1.0, wear: 1.0, emissive: 0xff3c0c, emissiveIntensity: 0.12 },
+  },
+  /* Backlit sign stock — also the "ink" on fly-posted hoardings, which is why
+   * this must be dead in daylight: a glowing cyan poster in a warm 16:00 frame
+   * is the single loudest artificial note on the whole map. */
+  signGlow: {
+    archetype: 'plastic', surface: 'plastic', fallback: 0xcbd9e2, fixture: 'signage',
+    opts: { scale: 0.5, tint: 0xc6d6e0, saturation: 0.7, emissive: 0xbcd2de, emissiveIntensity: 0.22 },
+  },
 
   /* ----------------------------------------------------------- backdrop
    * Three ridge bands, each a step further into the haze. Aerial perspective is
@@ -184,6 +249,63 @@ const D: Record<MatKey, MatDef> = {
   ridgeMid: { archetype: '', surface: 'stone', fallback: 0x36404e, flat: { roughness: 1.0, metalness: 0 } },
   ridge: { archetype: '', surface: 'stone', fallback: 0x4b5769, flat: { roughness: 1.0, metalness: 0 } },
 };
+
+/* ------------------------------------------------------------- fixtures -- */
+
+/**
+ * Fraction of peak emissive a fixture class still shows in full daylight.
+ *
+ * Street lighting and signage go to zero — a photocell has switched them off,
+ * and even if it had not, a 70 W lamp against 100 klx of sun is invisible.
+ * Room lighting stays near full because a room is dark whatever the hour, and
+ * embers keep a trace so a fire barrel is not a dead prop at noon.
+ */
+const DAY_FLOOR: Record<FixtureClass, number> = {
+  street: 0.0,
+  signage: 0.0,
+  interior: 0.85,
+  ember: 0.09,
+  beacon: 0.30,
+};
+
+interface Fixture {
+  mat: THREE.MeshStandardMaterial;
+  cls: FixtureClass;
+  /** `emissiveIntensity` with the fixture fully on. */
+  peak: number;
+}
+
+const FIXTURES: Fixture[] = [];
+const REGISTERED = new WeakSet<THREE.Material>();
+
+function registerFixture(mat: THREE.Material, cls: FixtureClass): void {
+  const std = mat as THREE.MeshStandardMaterial;
+  if (!std.isMeshStandardMaterial || REGISTERED.has(mat)) return;
+  REGISTERED.add(mat);
+  FIXTURES.push({ mat: std, cls, peak: std.emissiveIntensity });
+}
+
+/**
+ * Drives every registered fixture from one 0..1 "how dark is it outside".
+ *
+ * `PracticalLights` owns the value (it is the only system that knows the sun's
+ * illuminance) and calls this once a frame; `emissiveIntensity` is re-uploaded
+ * by three every draw, so this costs nothing and never recompiles.
+ */
+export function setPracticalNight(night: number): void {
+  const n = night < 0 ? 0 : night > 1 ? 1 : night;
+  for (const f of FIXTURES) {
+    const floor = DAY_FLOOR[f.cls];
+    f.mat.emissiveIntensity = f.peak * (floor + (1 - floor) * n);
+  }
+}
+
+/** Daylight fraction for a fixture class — used to gate the point lights too. */
+export function fixtureGain(cls: FixtureClass, night: number): number {
+  const n = night < 0 ? 0 : night > 1 ? 1 : night;
+  const floor = DAY_FLOOR[cls];
+  return floor + (1 - floor) * n;
+}
 
 export class MatCatalog {
   private cache = new Map<MatKey, THREE.Material>();
@@ -211,6 +333,8 @@ export class MatCatalog {
         color: def.fallback,
         roughness: def.flat?.roughness ?? 0.9,
         metalness: def.flat?.metalness ?? 0,
+        emissive: def.opts?.emissive ?? 0x000000,
+        emissiveIntensity: def.opts?.emissiveIntensity ?? 1,
       });
       flat.name = `world:${key}`;
       flat.userData.surface = def.surface;
@@ -219,6 +343,7 @@ export class MatCatalog {
     } else {
       mat = this.mats.material(def.archetype, def.opts ?? {}, def.surface);
     }
+    if (def.fixture) registerFixture(mat, def.fixture);
     this.cache.set(key, mat);
     return mat;
   }

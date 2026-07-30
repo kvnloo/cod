@@ -134,6 +134,28 @@ export const FAMILY_TINT: Record<SurfaceFamily, [number, number, number]> = {
  * What the FX module needs from the renderer. Everything beyond `RenderAPI` is
  * optional and probed at runtime, so FX still works against a bare renderer.
  */
+/**
+ * The post module's transient screen-effect state, duck-typed.
+ *
+ * It is *not* part of `RenderAPI`: the post library both accepts requests and
+ * subscribes to the event bus itself, so the same flashbang is counted twice and
+ * nobody owns clearing it. FX probes for it so a staged shot can start from a
+ * clean frame and so a distant stun grenade can dial the white-out down instead
+ * of erasing the image. Every field is optional — a renderer without a post
+ * library simply yields `null` and everything still works.
+ */
+export interface FxScreenFxState {
+  blind: number;
+  blindTime: number;
+  flash: THREE.Vector3;
+  damage: number;
+  concussion: number;
+  concussionTime: number;
+  blood: number;
+  water: number;
+  dirt: number;
+}
+
 export interface FxRenderHost extends RenderAPI {
   uniforms?: { shared(): Record<string, THREE.IUniform> };
   sky?: { wind?: number; rain?: number; fogAmount?: number };
@@ -144,6 +166,17 @@ export interface FxRenderHost extends RenderAPI {
       target: { textures: THREE.Texture[] };
     };
   };
+  /** Loaded post passes; each carries a handle to the shared post resources. */
+  passes?: Array<{ res?: { fx?: unknown } }>;
+}
+
+/** Recognises the post library's screen-effect state without importing it. */
+export function asScreenFxState(value: unknown): FxScreenFxState | null {
+  const s = value as Partial<FxScreenFxState> | null | undefined;
+  if (!s || typeof s !== 'object') return null;
+  if (typeof s.blind !== 'number' || typeof s.blindTime !== 'number') return null;
+  if (!s.flash || typeof (s.flash as THREE.Vector3).setScalar !== 'function') return null;
+  return s as FxScreenFxState;
 }
 
 export interface FxPhysicsHost {

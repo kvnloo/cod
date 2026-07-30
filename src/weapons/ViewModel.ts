@@ -138,9 +138,31 @@ export class ViewModel {
   private readonly _eye = new THREE.Vector3();
   private readonly _inv = new THREE.Matrix4();
 
+  /**
+   * The weapon's own muzzle flash, in view space.
+   *
+   * The world light pool mirrors a flash into the view-model scene, but it is a
+   * shared, budgeted resource: the flash competes with explosions and burning
+   * debris for a slot, and when it loses one the weapon is the only thing on
+   * screen that does not react to its own shot. So the view model keeps a
+   * private emitter, created once and never added or removed — a changing light
+   * count recompiles every shader in the scene — and simply modulates it.
+   *
+   * It lights the receiver, the optic *and* the hands, which is the whole
+   * point: the flash washing over a gloved hand is one of the most recognisable
+   * images in the genre.
+   */
+  private flash = new THREE.PointLight(0xffc27a, 0, 2.6, 2);
+  private flashT = 0;
+  private flashPeak = 0;
+  private static readonly FLASH_LIFE = 0.085;
+
   constructor(private mats: WeaponMaterials) {
     this.root.name = 'viewmodel';
     this.root.matrixAutoUpdate = true;
+    this.flash.name = 'vm-muzzle-flash';
+    this.flash.castShadow = false;
+    this.root.add(this.flash);
   }
 
   /* ------------------------------------------------------------- equipping */
@@ -151,6 +173,11 @@ export class ViewModel {
     this.root.clear();
     const rig = buildWeaponMesh(def, attachments, this.mats);
     this.root.add(rig.root);
+    // `clear()` took the emitter with everything else; put it back and sit it
+    // just ahead of the crown, where the fireball actually is.
+    this.root.add(this.flash);
+    const mz = rig.point('muzzle');
+    this.flash.position.set(0, 0, (mz?.z ?? -0.6) - 0.045);
     this.rig = rig;
     this.def = def;
     this.stats = stats;
@@ -263,6 +290,11 @@ export class ViewModel {
     this.dustCover = 1;
 
     // Back along the bore, up and rolled — magnitudes come from the weapon.
+    // The flash is a genuine light source, not a decal: it has to wash the
+    // barrel, the handguard and the support hand from *in front*.
+    this.flashPeak = 26 + Math.min(18, def.rpm * 0.012);
+    this.flashT = ViewModel.FLASH_LIFE;
+
     const back = r.viewKickBack * (1 - this.ads * 0.45);
     const up = r.viewKickUp * DEG * (1 - this.ads * 0.55);
     const roll = r.viewKickRoll * DEG * (1 - this.ads * 0.6);
@@ -278,6 +310,20 @@ export class ViewModel {
       horizontalDeg * 1.4 + jitter * up * 3,
       roll * 22 * (jitter > 0 ? 1 : -1),
     );
+  }
+
+  /** Suppressed shots make almost no light; the caller knows, the rig does not. */
+  setFlashScale(k: number): void { this.flashPeak *= Math.max(0, k); }
+
+  /**
+   * Holds the emitter at a fixed brightness for a still. The capture harness
+   * settles a shot for the best part of a second, which is ten times a flash's
+   * life — so a photograph of a muzzle flash has to be staged, not simulated.
+   */
+  holdFlash(peak: number): void {
+    this.flashPeak = peak;
+    this.flashT = ViewModel.FLASH_LIFE;
+    this.flash.intensity = peak;
   }
 
   /** Landing compression; `force` is the impact speed in m/s. */
@@ -374,6 +420,16 @@ export class ViewModel {
     this.moveTilt.x = approach(this.moveTilt.x, -s.forward * 0.9 * DEG * tiltScale, 7, dt);
     this.moveTilt.z = approach(this.moveTilt.z, -s.strafe * 2.4 * DEG * tiltScale, 7, dt);
     this.moveTilt.y = approach(this.moveTilt.y, s.strafe * 1.2 * DEG * tiltScale, 7, dt);
+
+    /* --- muzzle flash ---------------------------------------------------- */
+    if (this.flashT > 0) {
+      this.flashT = Math.max(0, this.flashT - dt);
+      // Instant attack, quadratic fall: the shape of a real powder flash.
+      const u = this.flashT / ViewModel.FLASH_LIFE;
+      this.flash.intensity = this.flashPeak * u * u;
+    } else if (this.flash.intensity !== 0) {
+      this.flash.intensity = 0;
+    }
 
     /* --- springs -------------------------------------------------------- */
     this.kickPos.step(ZERO, dt);
@@ -511,6 +567,34 @@ export class ViewModel {
     // Shell held mid-reload — hidden unless a shell reload is running.
     const shell = rig.node('shell');
     if (shell && this.action.kind !== 'reloadShell') shell.visible = false;
+
+    // The support hand leaves the handguard to fetch a magazine and comes back
+    // with it. A hand welded to the forend through a magazine change is the
+    // loudest possible statement that the arms are a prop bolted to the gun.
+    const left = rig.node('handLeft');
+    if (left) {
+      const rest = rig.rest.get('handLeft');
+      if (rest) left.position.copy(rest);
+      left.rotation.set(0, 0, 0);
+      let reach = 0;
+      if (this.action.kind === 'reload') {
+        const t = clamp01(this.action.t / this.action.duration);
+        const r = def.reload;
+        reach = curve(t, [
+          [r.magOut - 0.06, 0], [r.magOut + 0.10, 1], [r.magSeat - 0.06, 1], [r.magSeat + 0.12, 0],
+        ]);
+      } else if (this.action.kind === 'reloadShell') {
+        reach = curve(this.action.t / Math.max(0.01, def.reload.shellIn ?? 0.34), [[0, 0], [1, 1]]);
+      }
+      if (reach > 0.001) {
+        // Down and back toward the magwell, rolling the wrist as it goes.
+        left.position.x -= reach * 0.055;
+        left.position.y -= reach * 0.135;
+        left.position.z += reach * 0.150;
+        left.rotation.x = reach * 0.55;
+        left.rotation.z = -reach * 0.42;
+      }
+    }
   }
 
   private actionTravel(def: WeaponDef): number {

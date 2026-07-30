@@ -250,7 +250,9 @@ export interface ViewProfile {
 
 export type MaterialKey =
   | 'phosphate' | 'blued' | 'polymer' | 'polymerTan' | 'rubber'
-  | 'alu' | 'wood' | 'brass' | 'glass' | 'lens' | 'black';
+  | 'alu' | 'wood' | 'brass' | 'glass' | 'lens' | 'black'
+  /** Gloved hands and the sleeve/forearm wrap of the first-person arms. */
+  | 'glove' | 'gloveKnuckle' | 'sleeve';
 
 /** Style/dimension inputs to the procedural mesh builder. */
 export interface ModelProfile {

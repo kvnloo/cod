@@ -13,7 +13,8 @@ import { clamp01, Ease, lerp, motion, motionTime, Spring, SPRING } from '../Anim
 import { hairWidth, measureText, plate, text, wash } from '../Draw';
 import type { DrawCtx } from '../Draw';
 import type { HudModel } from '../Model';
-import { lift, rgba, type Palette, type RGB } from '../Theme';
+import { sightRadius } from '../Sight';
+import { ADS_FADE, adsFade, lift, rgba, type Palette, type RGB } from '../Theme';
 import { MARGIN } from '../Theme';
 import type { Widget } from './Widget';
 
@@ -110,7 +111,9 @@ export class ScorePopups implements Widget {
     // XP lands in its own column right of centre and stacks downward — the same
     // separation shipped titles use so a capture prompt and a kill reward can
     // coexist in one frame without piling up on each other.
-    const stackX = cx + 172 * s;
+    // Held at least a sight radius clear of centre so the column never creeps
+    // onto the optic when the player aims (the exclusion widens with ADS).
+    const stackX = cx + Math.max(172 * s, sightRadius(d, m) + 46 * s);
     const stackY = d.h * 0.565;
     // Rows must clear the 22px type with room to breathe; at 19 they collided
     // whenever two events landed inside the spring's settle time.
@@ -158,7 +161,11 @@ export class ScorePopups implements Widget {
       const alpha = (flying ? 1 - Ease.inQuad(ft) : Ease.outQuad(appear)) * d.alpha;
       if (alpha <= 0.005) continue;
 
-      const tint: RGB = q.reward ? p.accent : lift(p.accent, 0.25);
+      // Score is the loudest thing on a busy frame precisely because it is the
+      // least urgent — it costs nothing to miss one. Ordinary awards run in the
+      // neutral ramp; only a killstreak-tier reward is worth the accent, and
+      // that is one popup every few minutes rather than three per firefight.
+      const tint: RGB = q.reward ? p.accent : lift(p.ink, 0.2);
       c.save();
       c.globalAlpha = alpha;
       c.translate(x, y);
@@ -169,18 +176,18 @@ export class ScorePopups implements Widget {
       // a stack of "+25 HIT / +150 HEADSHOT" lines up on the digits the way a
       // shipped feed does instead of centring each row independently.
       const amountStr = `+${q.amount}`;
-      const aOpts = { size: 22 * s, weight: 700, family: 'cond' as const, tracking: 0.4 * s };
-      const lOpts = { size: 12 * s, weight: 600, family: 'cond' as const, tracking: 2.6 * s };
+      const aOpts = { size: 20 * s, weight: 700, family: 'cond' as const, tracking: 0.4 * s };
+      const lOpts = { size: 11 * s, weight: 600, family: 'cond' as const, tracking: 2.6 * s };
       const hinge = 6 * s;
 
       text(c, amountStr, -hinge, 0, {
-        ...aOpts, align: 'right', color: rgba(tint, 1),
+        ...aOpts, align: 'right', color: rgba(tint, q.reward ? 1 : 0.92),
         shadow: Math.max(1, 1.3 * s), outline: 2.6 * s,
         glow: q.reward ? 14 * s : 0, glowColor: rgba(tint, 0.5),
       });
       if (q.label) {
         text(c, q.label, hinge, -1.5 * s, {
-          ...lOpts, color: rgba(p.ink, 0.9),
+          ...lOpts, color: rgba(p.inkDim, 0.86),
           shadow: Math.max(1, 1 * s), outline: 2.2 * s,
         });
       }
@@ -191,7 +198,7 @@ export class ScorePopups implements Widget {
     /* -------------------------------------------------------- tally --- */
     const punch = this.tallyPunch.value;
     c.save();
-    c.globalAlpha = d.alpha * (1 - m.ads * 0.45);
+    c.globalAlpha = adsFade(d.alpha, m.ads, ADS_FADE.ambient);
     c.translate(tallyX, tallyY);
     c.scale(1 + punch * 0.004, 1 + punch * 0.004);
 

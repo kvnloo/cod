@@ -24,7 +24,14 @@ import type { RenderUniforms } from './RenderUniforms';
 
 export type MaterialKind = 'standard' | 'lit' | 'unlit' | 'raw';
 
-const PATCH_VERSION = 8;
+const PATCH_VERSION = 9;
+
+/**
+ * Diagnostic: replaces the shaded colour with the sun-visibility term
+ * (red = cascaded shadow, green = N·L > 0). Flip to `true`, rebuild, capture.
+ * Never ship as `true`.
+ */
+const DEBUG_SHADOW = false;
 
 interface PatchState {
   version: number;
@@ -136,6 +143,8 @@ uniform vec3 boAmbientSH[ 9 ];
 uniform vec3 boAmbientTint;
 uniform float boAmbientIntensity;
 uniform mat4 projectionMatrix;
+float boDbgShadow = 1.0;
+float boDbgLit = 0.0;
 `,
 ].join('\n');
 
@@ -177,6 +186,8 @@ const SUN_INJECT = /* glsl */ `
 			boShadow = min( boShadow, boContactShadow(
 				vBoViewPos, normalize( normal ), boSunDirView, boNdotL, projectionMatrix, gl_FragCoord.xy ) );
 		}
+		boDbgShadow = boShadow;
+		boDbgLit = 1.0;
 		IncidentLight boSun;
 		boSun.direction = boSunDirView;
 		boSun.color = boSunColor * boShadow;
@@ -228,7 +239,20 @@ const MAPS_REPLACE = /* glsl */ `
 #endif
 `;
 
-function mrtWrite(kind: MaterialKind, hasVelocity: boolean, aerial: boolean): string {
+/**
+ * G-buffer normal encoding.
+ *
+ * `gbuffer:normalRoughness` is an RGBA16F attachment and every consumer —
+ * `GtaoPass`, `SsrPass` and the passes module's own reference writer in
+ * `LabMaterial` — reads `nr.xyz` as a *raw signed* view-space normal and uses
+ * `length(n) < 0.1` as the "nothing was written here" sentinel. Writing
+ * `n * 0.5 + 0.5` instead pushed every normal into the positive octant (a wall
+ * facing (-1,0,0) arrived as (0,0.5,0.5)), which made GTAO's horizon integral
+ * over-occlude by up to 5x on flat, unoccluded surfaces and made SSR's backface
+ * rejection meaningless. It also made the sentinel unreachable — the shortest
+ * encoded vector is 0.37 long. Raw it is.
+ */
+function mrtWrite(kind: MaterialKind, hasVelocity: boolean, aerial: boolean, sun = false): string {
   const vel = hasVelocity
     ? `vec2 boCur = vBoClipCur.xy / max( abs( vBoClipCur.w ), 1e-5 ) * sign( vBoClipCur.w );
        vec2 boPrv = vBoClipPrev.xy / max( abs( vBoClipPrev.w ), 1e-5 ) * sign( vBoClipPrev.w );
@@ -239,12 +263,13 @@ function mrtWrite(kind: MaterialKind, hasVelocity: boolean, aerial: boolean): st
     return /* glsl */ `
 {
 	${aerial ? `gl_FragColor.rgb = boAerialPerspective( gl_FragColor.rgb, vBoWorldPos, cameraPosition, boSunDirWorld );` : ''}
+	${sun && DEBUG_SHADOW ? `gl_FragColor.rgb = vec3( boDbgShadow, boDbgLit, 0.0 ) * 0.35;` : ''}
 	float boAO = 1.0;
 	#ifdef USE_AOMAP
 		boAO = ambientOcclusion;
 	#endif
 	float boEm = boSat( boLuma( totalEmissiveRadiance ) * 4.0 );
-	boGNormalRough = vec4( normalize( normal ) * 0.5 + 0.5, clamp( roughnessFactor, 0.0, 1.0 ) );
+	boGNormalRough = vec4( normalize( normal ), clamp( roughnessFactor, 0.0, 1.0 ) );
 	boGMaterial = vec4( clamp( metalnessFactor, 0.0, 1.0 ), boAO, boMatId, boEm );
 	${vel}
 }
@@ -253,16 +278,17 @@ function mrtWrite(kind: MaterialKind, hasVelocity: boolean, aerial: boolean): st
   if (kind === 'lit') {
     return /* glsl */ `
 {
-	boGNormalRough = vec4( normalize( normal ) * 0.5 + 0.5, 0.8 );
+	boGNormalRough = vec4( normalize( normal ), 0.8 );
 	boGMaterial = vec4( 0.0, 1.0, boMatId, 0.0 );
 	${vel}
 }
 `;
   }
-  // Unlit / unknown: neutral values so blending never corrupts the buffers.
+  // Unlit / unknown: the zero-length sentinel, so AO and SSR skip these pixels
+  // instead of occluding a sprite against itself.
   return /* glsl */ `
 {
-	boGNormalRough = vec4( 0.5, 0.5, 1.0, 1.0 );
+	boGNormalRough = vec4( 0.0, 0.0, 0.0, 1.0 );
 	boGMaterial = vec4( 0.0, 1.0, boMatId, 1.0 );
 	${vel}
 }
@@ -378,7 +404,7 @@ export class MaterialPatcher {
         frag = frag.replace('#include <lights_fragment_maps>', MAPS_REPLACE);
       }
 
-      const write = mrtWrite(kind, hasVertexAnchor, wantAerial && hasVertexAnchor);
+      const write = mrtWrite(kind, hasVertexAnchor, wantAerial && hasVertexAnchor, wantSun);
       if (frag.includes('#include <fog_fragment>')) {
         frag = frag.replace('#include <fog_fragment>', `#include <fog_fragment>\n${write}`);
       } else {

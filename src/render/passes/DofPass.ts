@@ -25,14 +25,46 @@ const MAX_SAMPLES = 96;
 
 const COC_GLSL = /* glsl */ `
 /* Signed circle of confusion in full-resolution pixels.
-   Negative = in front of the focal plane (near field). */
+   Negative = in front of the focal plane (near field).
+
+   The physical term alone is not enough to be *seen*. A 55-80 degree game FOV
+   against a 24 mm sensor works out at a 15-23 mm focal length, and the
+   hyperfocal distance of a 23 mm lens at f/2.4 is under ten metres: focus on a
+   subject at 30 m and every background in the level is inside one pixel of
+   circle of confusion. That is why a strictly physical model renders a
+   perfectly sharp frame and reads as "no depth of field at all".
+
+   Shipped titles solve this the same way a cinematographer does — by shooting
+   long. The two art terms below are the equivalent of swapping the 23 mm for a
+   portrait lens: they are anchored on the focus distance (so they follow
+   autofocus), ramp smoothly, and are scaled by the same ADS-driven uScale as
+   the physical term, so the hip-fire frame stays essentially sharp. */
 float computeCoc(float viewZ) {
   float f = uFocalLength;
   float s = max(uFocus, f + 1e-4);
   float a = f / max(uFStop, 0.5);
   float z = max(viewZ, f + 1e-4);
   float cocMetres = a * f * (z - s) / (z * (s - f));
-  return clamp(cocMetres * uSensorToPixels * uScale, -uMaxCoc, uMaxCoc);
+  float px = cocMetres * uSensorToPixels;
+
+  /* How much defocus this lens actually reaches: a*f/(s-f) is the CoC at
+     infinity, and by symmetry the same magnitude at half the focus distance.
+     Subtracting it is what makes the art terms a *floor* rather than a bonus —
+     focus close and the physics already delivers, so nothing is added; focus
+     down a street and the art term supplies the shortfall. Without this the
+     effect would double up whenever autofocus latched onto something near. */
+  float reach = a * f * uSensorToPixels / max(s - f, 1e-4);
+  float deficitFar = max(uFarCoc - reach, 0.0);
+  float deficitNear = max(uNearCoc - reach, 0.0);
+
+  // Depth expressed in focal distances: the curve is then FOV- and
+  // focus-independent, which is what keeps the look stable while autofocus
+  // walks from a wall at 3 m to a ridge at 600 m.
+  float ratio = z / s;
+  px += deficitFar * smoothstep(1.35, 3.6, ratio);
+  px -= deficitNear * (1.0 - smoothstep(0.30, 0.80, ratio));
+
+  return clamp(px * uScale, -uMaxCoc, uMaxCoc);
 }
 `;
 
@@ -49,6 +81,8 @@ uniform float uFStop;
 uniform float uSensorToPixels;
 uniform float uMaxCoc;
 uniform float uScale;
+uniform float uNearCoc;
+uniform float uFarCoc;
 layout(location = 0) out vec4 fragColor;
 
 ${COC_GLSL}
@@ -233,6 +267,8 @@ uniform float uFStop;
 uniform float uSensorToPixels;
 uniform float uMaxCoc;
 uniform float uScale;
+uniform float uNearCoc;
+uniform float uFarCoc;
 layout(location = 0) out vec4 fragColor;
 
 ${COC_GLSL}
@@ -300,13 +336,33 @@ export class DofPass extends BasePass {
   /** Aperture blade count — 6 gives the classic hexagonal highlight. */
   blades = 6;
   /** CoC multiplier at the hip; ADS ramps this to 1. */
-  hipStrength = 0.2;
+  hipStrength = 0.14;
   /** Global multiplier so a level can dial the whole effect back. */
   strength = 1;
+  /**
+   * Art-directed field sizes at 1080p, in full-resolution pixels, on top of the
+   * physical CoC. Near is the larger of the two on purpose: separating the
+   * weapon and the near foreground from the world is what aiming is *for*, and
+   * a mushy background reads worse than a soft foreground.
+   */
+  nearCoc = 9;
+  farCoc = 7;
+
+  /**
+   * Capture-mode tuning handle. The focus distance comes from autofocus, so the
+   * only way to know what the lens was actually doing in a given shot is to read
+   * it back; `pass` lets an A/B run sweep `nearCoc`/`farCoc` inside one build.
+   */
+  private tuning: { focus: number; scale: number; focal: number; pass: DofPass } | null = null;
 
   constructor(res: PostResources) {
     super(res);
     for (let i = 0; i < MAX_SAMPLES; i++) this.kernelVectors.push(new THREE.Vector2());
+    const params = new URLSearchParams(globalThis.location?.search ?? '');
+    if (params.get('capture') === '1') {
+      this.tuning = { focus: 0, scale: 0, focal: 0, pass: this };
+      (globalThis as unknown as Record<string, unknown>).__DOF__ = this.tuning;
+    }
   }
 
   private ensureKernel(rings: number): void {
@@ -326,6 +382,8 @@ export class DofPass extends BasePass {
       uSensorToPixels: { value: 45000 },
       uMaxCoc: { value: 24 },
       uScale: { value: 1 },
+      uNearCoc: { value: 8 },
+      uFarCoc: { value: 8 },
     };
 
     this.prepare = this.makeMaterial({
@@ -407,6 +465,12 @@ export class DofPass extends BasePass {
     const sensorToPixels = ctx.height / sensorH;
     const focus = Math.max(0.15, ctx.focusDistance || 6);
     const maxCoc = Math.max(6, ctx.height * 0.022);
+    if (this.tuning) { this.tuning.focus = focus; this.tuning.scale = scale; this.tuning.focal = focal; }
+
+    // The art terms are authored at 1080p and scale with the frame height so a
+    // 1440p capture defocuses by the same fraction of the image, not the same
+    // number of pixels.
+    const artScale = ctx.height / 1080;
 
     const setLens = (m: THREE.ShaderMaterial) => {
       const u = m.uniforms;
@@ -416,6 +480,8 @@ export class DofPass extends BasePass {
       u.uSensorToPixels.value = sensorToPixels;
       u.uMaxCoc.value = maxCoc;
       u.uScale.value = scale;
+      u.uNearCoc.value = this.nearCoc * artScale;
+      u.uFarCoc.value = this.farCoc * artScale;
     };
 
     /* 1 — prepare -----------------------------------------------------------*/

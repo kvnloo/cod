@@ -80,7 +80,10 @@ export const CSS = `
      square plate floating over the frame is the giveaway that this is a web
      page and not a game. */
   background: linear-gradient(90deg, rgba(4,7,12,.8) 0%, rgba(4,7,12,.74) 62%, rgba(4,7,12,0) 100%);
-  border-left: 2px solid var(--ob-accent);
+  /* Radio traffic is your own side talking, so it takes the friendly hue. It
+     used to wear the accent, which made a line of chatter shout as loudly as
+     the objective marker — and the accent has to mean exactly one thing. */
+  border-left: 2px solid var(--ob-friendly);
   font-family: var(--ob-sans);
   font-size: calc(var(--ob-u) * 17);
   font-weight: 500;
@@ -93,7 +96,7 @@ export const CSS = `
   font-family: var(--ob-cond);
   font-weight: 700;
   letter-spacing: .18em;
-  color: var(--ob-accent);
+  color: var(--ob-friendly);
   margin-right: calc(var(--ob-u) * 8);
 }
 
@@ -138,7 +141,10 @@ table.ob-sb td {
   border-bottom: 1px solid rgba(157,178,204,.08);
   letter-spacing: .06em;
 }
-table.ob-sb tr.is-me td { color: var(--ob-accent); background: rgba(255,194,75,.07); }
+/* "You" is a *friendly*, not an objective. Highlighting your own row in the
+   accent made a table row shout as loudly as the mission marker sitting behind
+   the scoreboard on the minimap. */
+table.ob-sb tr.is-me td { color: var(--ob-friendly); background: rgba(79,195,255,.09); }
 .ob-sb-bar { height: 2px; background: var(--ob-hair); margin: calc(var(--ob-u)*10) 0; }
 
 /* ---------------------------------------------------------------- menus -- */

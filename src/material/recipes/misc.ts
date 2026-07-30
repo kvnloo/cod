@@ -20,7 +20,7 @@ const glass: MaterialArchetype = {
   transparent: true,
   opacity: 1,
   doubleSided: true,
-  shader: { triplanar: false, pom: false, alphaFromMap: true, detailScale: 40 },
+  shader: { triplanar: false, pom: false, alphaFromMap: true, uvVariation: true, detailScale: 40 },
   recipe: {
     id: 'glass',
     seed: 401,
@@ -35,28 +35,45 @@ const glass: MaterialArchetype = {
 void obHeightFn(vec2 uv, out vec4 h0, out vec4 h1) {
   float h = 0.72 + (obFbm(uv * 6.0, vec2(6.0), 3, 0.5, uSeed) - 0.5) * 0.05;
 
-  // impact point with radial + concentric fracture
-  vec2 c = vec2(0.38, 0.56);
-  vec2 rv = uv - c;
-  float r = length(rv);
-  float a = atan(rv.y, rv.x) / OB_TAU + 0.5;
-  float radial = abs(fract(a * 14.0 + obValueP(vec2(a * 14.0, 0.0), vec2(14.0, 1.0), uSeed + 3.0) * 0.4) - 0.5) * 2.0;
-  float radialLine = smoothstep(0.86, 0.98, radial) * smoothstep(0.62, 0.03, r);
-  float ring = abs(fract(r * 9.0 + obFbm(uv * 8.0, vec2(8.0), 3, 0.5, uSeed + 5.0) * 0.9) - 0.5) * 2.0;
-  float ringLine = smoothstep(0.90, 1.0, ring) * smoothstep(0.55, 0.05, r);
-  float shatter = obSat(radialLine + ringLine);
+  // Four impact sites, not one.
+  //
+  // A single baked star means every pane in the level carries the same stamp in
+  // the same place — twelve tram windows with an identical fourteen-spoke
+  // rosette at the same uv is a pure procedural giveaway. Four sites with
+  // different spoke counts, radii and severities, combined with the per-pane uv
+  // roll the shader applies, means no two panes read alike.
+  float shatter = 0.0;
+  float hole = 0.0;
+  float rNear = 1.0;
+  for (int i = 0; i < 4; i++) {
+    float fi = float(i);
+    vec3 ir = obHash33(vec3(fi * 7.0 + 1.0, fi * 3.0 + 2.0, uSeed));
+    vec2 c = vec2(mix(0.14, 0.86, ir.x), mix(0.12, 0.88, ir.y));
+    float sev = mix(0.35, 1.0, ir.z);
+    // Only one or two of the four are full strikes; the rest are nicks.
+    sev *= step(0.34, obHash13(vec3(fi, 11.0, uSeed + 3.0)));
+    if (sev < 0.02) continue;
+    vec2 rv = uv - c;
+    float r = length(rv) / mix(0.55, 1.35, ir.x);
+    float a = atan(rv.y, rv.x) / OB_TAU + 0.5;
+    float spokes = floor(mix(7.0, 19.0, ir.y));
+    float radial = abs(fract(a * spokes + obValueP(vec2(a * spokes, fi), vec2(spokes, 4.0), uSeed + 3.0) * 0.5) - 0.5) * 2.0;
+    float radialLine = smoothstep(0.86, 0.98, radial) * smoothstep(0.62 * sev, 0.03, r);
+    float ring = abs(fract(r * mix(6.0, 13.0, ir.z) + obFbm(uv * 8.0, vec2(8.0), 3, 0.5, uSeed + 5.0) * 0.9) - 0.5) * 2.0;
+    float ringLine = smoothstep(0.90, 1.0, ring) * smoothstep(0.55 * sev, 0.05, r);
+    shatter = max(shatter, obSat(radialLine + ringLine) * sev);
+    hole = max(hole, smoothstep(0.052 * sev, 0.018 * sev, r) * step(0.72, sev));
+    rNear = min(rNear, r);
+  }
 
   // general spider cracking across the pane
   float web = obCracks(uv, vec2(1.0), 4.0, 0.016, uSeed + 7.0);
 
   float crack = obSat(shatter + web * 0.8);
   h -= crack * 0.5;
-
-  // the punched-out hole at the centre
-  float hole = smoothstep(0.055, 0.02, r);
   h -= hole * 0.7;
 
-  h0 = vec4(clamp(h, 0.0, 1.0), crack, hole, r);
+  h0 = vec4(clamp(h, 0.0, 1.0), crack, hole, rNear);
   h1 = vec4(shatter, web, 0.0, 0.0);
 }`,
     shade: /* glsl */ `

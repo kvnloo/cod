@@ -15,7 +15,7 @@ import type { DrawCtx } from '../Draw';
 import { headshotGlyph, weaponGlyph } from '../Glyphs';
 import type { HudModel, WeaponKind } from '../Model';
 import { classifyWeapon } from '../Model';
-import { lift, rgba, type Palette } from '../Theme';
+import { ADS_FADE, adsFade, lift, mixRGB, rgba, type Palette, type RGB } from '../Theme';
 import { MARGIN } from '../Theme';
 import { ui } from '../UiSettings';
 import type { Widget } from './Widget';
@@ -127,7 +127,7 @@ export class Killfeed implements Widget {
     const top = MARGIN * s * 0.72 + 4 * s;
     const rowH = 23 * s;
 
-    const alpha = d.alpha * (1 - m.ads * 0.4);
+    const alpha = adsFade(d.alpha, m.ads, ADS_FADE.ambient);
     if (alpha <= 0.01) return;
 
     c.save();
@@ -153,8 +153,17 @@ export class Killfeed implements Widget {
       const nameSize = 14.5 * s;
       const nameOpts = { size: nameSize, weight: 600, family: 'cond' as const, tracking: 1.5 * s };
 
-      const victimColor = r.victimIsPlayer ? p.friendly : p.hostile;
-      const killerColor = r.killerIsPlayer ? p.accent : r.friendlyKiller ? p.friendly : p.hostile;
+      // Two hues only, and they mean exactly one thing each: blue is your side,
+      // red is theirs. The player's own row is the *brightest, most saturated*
+      // blue and everyone else's row is pulled toward grey — hierarchy by value
+      // and saturation, so the feed reports without competing with the objective
+      // accent or with the player's own kill.
+      const mute = (col: RGB): RGB => (highlight ? col : mixRGB(col, p.inkDim, 0.36));
+      const victimColor = mute(r.victimIsPlayer ? lift(p.friendly, 0.4) : p.hostile);
+      const killerColor = mute(r.killerIsPlayer
+        ? lift(p.friendly, 0.5)
+        : r.friendlyKiller ? p.friendly : p.hostile);
+      const railColor = r.killerIsPlayer ? p.friendly : p.hostile;
 
       const victimW = measureText(c, r.victim, nameOpts);
       const glyphW = 30 * s;
@@ -175,11 +184,11 @@ export class Killfeed implements Widget {
 
       if (highlight) {
         const g = c.createLinearGradient(left - 10 * s, 0, right + 4 * s, 0);
-        g.addColorStop(0, rgba(r.killerIsPlayer ? p.accent : p.hostile, 0));
-        g.addColorStop(1, rgba(r.killerIsPlayer ? p.accent : p.hostile, 0.2));
+        g.addColorStop(0, rgba(railColor, 0));
+        g.addColorStop(1, rgba(railColor, 0.2));
         c.fillStyle = g;
         c.fillRect(left - 10 * s, y - rowH * 0.72, totalW + 14 * s, rowH * 0.9);
-        c.fillStyle = rgba(r.killerIsPlayer ? p.accent : p.hostile, 0.85);
+        c.fillStyle = rgba(railColor, 0.85);
         c.fillRect(right + 2 * s, y - rowH * 0.72, 2 * s, rowH * 0.9);
       }
 
@@ -193,10 +202,12 @@ export class Killfeed implements Widget {
       c.translate(1 * s, 1.2 * s);
       weaponGlyph(c, r.weapon, gx, y - nameSize * 0.32, glyphW, 'rgba(0,3,7,0.7)');
       c.restore();
-      weaponGlyph(c, r.weapon, gx, y - nameSize * 0.32, glyphW, rgba(lift(p.ink, 0.15), 0.95));
+      weaponGlyph(c, r.weapon, gx, y - nameSize * 0.32, glyphW,
+        rgba(highlight ? lift(p.ink, 0.15) : p.inkDim, highlight ? 0.95 : 0.82));
 
       if (r.headshot) {
-        headshotGlyph(c, gx + glyphW / 2 + hsW * 0.5, y - nameSize * 0.34, 7.4 * s, rgba(p.accent, 1));
+        headshotGlyph(c, gx + glyphW / 2 + hsW * 0.5, y - nameSize * 0.34, 7.4 * s,
+          rgba(lift(p.ink, 0.2), 1));
       }
 
       text(c, r.victim, right, y, {

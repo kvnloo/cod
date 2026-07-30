@@ -58,8 +58,11 @@ void main() {
   float glow = 0.0;
 
 #if OB_SHAPE == 0            /* 2 MOA dot */
-  m = aa(r - 0.30);
-  glow = exp(-r * 4.2) * 0.35;
+  // Hard edge plus a *tight* halo. A wide halo is what turns a collimated dot
+  // into an LED bulb sitting in the tube: the eye reads the glow envelope as
+  // the object, not the core.
+  m = aa(r - 0.26);
+  glow = exp(-r * 9.0) * 0.16;
 #elif OB_SHAPE == 1          /* 65 MOA ring + 1 MOA centre dot */
   m = ring(r, 0.86, 0.055) + aa(r - 0.115);
   // Four break marks at the cardinal points, as on a real holographic sight.
@@ -67,7 +70,7 @@ void main() {
   float cross = max(aa(a.x - 0.028) * step(0.55, a.y) * step(a.y, 0.98),
                     aa(a.y - 0.028) * step(0.55, a.x) * step(a.x, 0.98));
   m = max(m, cross * 0.7);
-  glow = exp(-r * 3.0) * 0.22;
+  glow = exp(-r * 5.5) * 0.12;
 #elif OB_SHAPE == 2          /* ACOG chevron */
   // The *tip* of the chevron is the aim point, so it sits at the origin and
   // the legs fall away below it, widening as they go.
@@ -111,8 +114,10 @@ void main() {
   // Emitters bloom into their own colour and clip toward white at the core;
   // that hot white centre is what makes a dot read as *illuminated* rather
   // than painted on.
+  // A little white in the very core reads as "illuminated"; too much and the
+  // dot desaturates to salmon and stops reading as red at all.
   vec3 c = uColor * uIntensity;
-  c += vec3(1.0) * pow(clamp(m, 0.0, 1.0), 3.0) * uIntensity * 0.30;
+  c += vec3(1.0) * pow(clamp(m, 0.0, 1.0), 4.0) * uIntensity * 0.10;
   gl_FragColor = vec4(c, k);
 #endif
 }`;

@@ -19,7 +19,7 @@ import * as THREE from 'three';
 import { Rand } from '../../core/Rand';
 import type { MatKey } from '../MatCatalog';
 import { Chunk } from '../geom/Chunk';
-import { FACE, V3, catenary } from '../geom/Mesher';
+import { FACE, V2, V3, catenary } from '../geom/Mesher';
 
 export interface PropDef {
   id: string;
@@ -342,26 +342,85 @@ def({
 
 /* ========================================================= fortification == */
 
+/**
+ * The moulded jersey profile, parameterised.
+ *
+ * Three barriers of identical mesh, identical tint and near-identical yaw in a
+ * straight line was the single strongest repeated-prop read on the map, and no
+ * amount of per-instance hue variation fixes a silhouette that repeats exactly.
+ * So the library carries three castings — a clean one, a chipped one with the
+ * rebar showing, and one that has been knocked flat — and the placement code
+ * mixes them.
+ */
+function jerseyProfile(c: Chunk, half: number, key: MatKey): void {
+  const m = c.m(key);
+  m.boxMinMax(-half, 0, -0.30, half, 0.10, 0.30, 1.4);
+  for (let i = 0; i < 5; i++) {
+    const t0 = i / 5, t1 = (i + 1) / 5;
+    const w0 = 0.30 - t0 * 0.16;
+    m.boxMinMax(-half, 0.10 + t0 * 0.34, -w0, half, 0.10 + t1 * 0.34, w0, 1.4);
+  }
+  m.boxMinMax(-half, 0.44, -0.115, half, 0.80, 0.115, 1.4);
+  m.boxMinMax(-half - 0.02, 0.80, -0.13, half + 0.02, 0.84, 0.13, 1.0);
+}
+
 def({
   id: 'jerseyBarrier', radius: 1.1, height: 0.82, collide: 'box',
   build(c) {
-    const m = c.m('concrete');
-    // Moulded profile: wide foot, battered lower face, slim top.
-    m.boxMinMax(-1.0, 0, -0.30, 1.0, 0.10, 0.30, 1.4);
-    for (let i = 0; i < 5; i++) {
-      const t0 = i / 5, t1 = (i + 1) / 5;
-      const w0 = 0.30 - t0 * 0.16, w1 = 0.30 - t1 * 0.16;
-      m.boxMinMax(-1.0, 0.10 + t0 * 0.34, -w0, 1.0, 0.10 + t1 * 0.34, w0, 1.4);
-      void w1;
-    }
-    m.boxMinMax(-1.0, 0.44, -0.115, 1.0, 0.80, 0.115, 1.4);
-    m.boxMinMax(-1.02, 0.80, -0.13, 1.02, 0.84, 0.13, 1.0);
+    jerseyProfile(c, 1.0, 'concrete');
     const s = c.m('rust');
     for (const sx of [-1, 1]) {
       s.pushTRS(sx * 0.45, 0.845, 0, 0, 0, Math.PI / 2);
       s.torus(0.05, 0.012, 8, 5, 0.2, Math.PI);
       s.pop();
     }
+  },
+});
+
+def({
+  id: 'jerseyBarrierWorn', radius: 0.95, height: 0.82, collide: 'box',
+  build(c, rand) {
+    // Shorter casting, one end corner knocked off, reinforcement showing.
+    jerseyProfile(c, 0.84, 'concreteDark');
+    const m = c.m('concreteDark');
+    // Spalled top corner: a stepped bite rather than a clean chamfer.
+    for (let i = 0; i < 4; i++) {
+      const t = i / 4;
+      m.boxMinMax(-0.86 - 0.02, 0.80 - t * 0.22, -0.13, -0.86 + 0.06 + t * 0.12, 0.86 - t * 0.22, 0.13, 1.0);
+    }
+    const s = c.m('rust');
+    for (let i = 0; i < 3; i++) {
+      s.pushTRS(-0.84 + rand.range(-0.05, 0.05), 0.58 + i * 0.08, rand.range(-0.07, 0.07),
+        rand.range(-0.4, 0.4), rand.range(-0.3, 0.3));
+      s.cylinder(0.008, 0.008, rand.range(0.12, 0.3), 5, false, false, 0.2);
+      s.pop();
+    }
+    s.pushTRS(0.45, 0.845, 0, 0, 0, Math.PI / 2);
+    s.torus(0.05, 0.012, 8, 5, 0.2, Math.PI);
+    s.pop();
+  },
+});
+
+def({
+  id: 'jerseyBarrierDown', radius: 1.1, height: 0.62, collide: 'box',
+  build(c) {
+    // Knocked over on its face: the profile now reads as a wedge, and its top
+    // edge sits at knee height, so a run of barriers has a broken skyline.
+    const g = c.m('concrete');
+    g.pushTRS(0, 0.30, 0, 0.06, 0, Math.PI * 0.46);
+    const sub = new Chunk();
+    jerseyProfile(sub, 1.0, 'concrete');
+    const src = sub.m('concrete');
+    const base = g.vertexCount;
+    for (let v = 0; v < src.pos.length; v += 3) {
+      g.vertex(src.pos[v], src.pos[v + 1], src.pos[v + 2],
+        src.nor[v], src.nor[v + 1], src.nor[v + 2],
+        src.uv[(v / 3) * 2], src.uv[(v / 3) * 2 + 1]);
+    }
+    for (let k = 0; k < src.idx.length; k += 3) {
+      g.tri(base + src.idx[k], base + src.idx[k + 1], base + src.idx[k + 2]);
+    }
+    g.pop();
   },
 });
 
@@ -400,22 +459,64 @@ def({
   },
 });
 
+/**
+ * A sandbag emplacement.
+ *
+ * `sandbagRow` used to be built once from a fixed seed and instanced, so every
+ * emplacement on the map was the same thirteen bags in the same three courses —
+ * twelve identical sandbags in one stack is impossible to un-see. Three
+ * different courses patterns, three different spill states and a plank
+ * revetment on one of them break that without changing the cover volume.
+ */
+function sandbagStack(c: Chunk, rand: Rand, courses: number[], salt: number, spill: number): void {
+  const m = c.m('sandbag');
+  for (let r = 0; r < courses.length; r++) {
+    const y = 0.16 + r * 0.28;
+    const n = courses[r];
+    const off = (r % 2) * 0.11 + (r === 2 ? -0.07 : 0);
+    for (let i = 0; i < n; i++) {
+      const x = (i - (n - 1) / 2) * 0.46 + off;
+      m.pushTRS(x, y, rand.range(-0.05, 0.05), rand.range(-0.22, 0.22), rand.range(-0.12, 0.12));
+      m.lump(0.25, 8, 5,
+        (k) => 0.66 + 0.5 * fract(Math.sin((k + r * 7 + i * 13 + salt * 37) * 12.9898) * 43758.5), 0.5);
+      m.pop();
+    }
+  }
+  for (let i = 0; i < spill; i++) {
+    const x = rand.range(-1.0, 1.0);
+    m.pushTRS(x, 0.12, rand.range(0.33, 0.6), rand.range(0, 6.28), rand.range(-0.6, 0.6), rand.range(-0.5, 0.5));
+    m.lump(0.24, 8, 5,
+      (k) => 0.66 + 0.5 * fract(Math.sin((k + i * 41 + salt * 11) * 12.9898) * 43758.5), 0.5);
+    m.pop();
+  }
+}
+
 def({
   id: 'sandbagRow', radius: 1.15, height: 0.95, collide: 'box',
+  build(c, rand) { sandbagStack(c, rand, [5, 5, 4], 0, 0); },
+});
+
+def({
+  id: 'sandbagRowLow', radius: 1.3, height: 0.7, collide: 'box',
   build(c, rand) {
-    const m = c.m('sandbag');
-    const rows = 3;
-    for (let r = 0; r < rows; r++) {
-      const y = 0.16 + r * 0.28;
-      const n = 5 - Math.floor(r / 2);
-      const off = (r % 2) * 0.11;
-      for (let i = 0; i < n; i++) {
-        const x = (i - (n - 1) / 2) * 0.46 + off;
-        m.pushTRS(x, y, rand.range(-0.04, 0.04), rand.range(-0.16, 0.16), rand.range(-0.1, 0.1));
-        m.lump(0.25, 8, 5, (k) => 0.66 + 0.5 * fract(Math.sin((k + r * 7 + i * 13) * 12.9898) * 43758.5), 0.5);
-        m.pop();
-      }
-    }
+    sandbagStack(c, rand, [6, 5], 3, 3);
+    // Plank and picket revetment holding the front course.
+    const w = c.m('plank');
+    w.box(0, 0.24, -0.34, 1.28, 0.1, 0.022, 0.6);
+    const p = c.m('wood');
+    for (const sx of [-1, 0, 1]) p.box(sx * 1.1, 0.3, -0.36, 0.035, 0.3, 0.035, 0.3);
+  },
+});
+
+def({
+  id: 'sandbagPost', radius: 0.95, height: 1.24, collide: 'box',
+  build(c, rand) {
+    sandbagStack(c, rand, [4, 4, 3, 2], 7, 2);
+    // Ammunition tin wedged into the top course.
+    const s = c.m('steelPaint');
+    s.pushTRS(0.34, 1.14, 0.02, 0.4);
+    s.chamferBox(0, 0.1, 0, 0.24, 0.1, 0.13, 0.012, 0.5);
+    s.pop();
   },
 });
 
@@ -904,9 +1005,41 @@ def({
 
 /* ================================================================ debris == */
 
+/**
+ * The silt collar every piece of ground debris grows within a week.
+ *
+ * Thin debris is the one thing screen-space occlusion cannot help with: a
+ * 4 mm glass shard has no cavity for AO to find, so it renders as a decal
+ * pasted on the pavement. The contact has to be *modelled* — an irregular
+ * millimetres-proud patch of silt washed up around the object plus a few grit
+ * fragments tucked into the angle at its base. That reads at 2 m and it is
+ * what the critic meant by "no contact darkening at all".
+ */
+function contactSkirt(c: Chunk, radius: number, rand: Rand, grit = 5): void {
+  const d = c.m('dirt');
+  const pts = [];
+  const n = 11;
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * Math.PI * 2;
+    const r = radius * (0.72 + 0.5 * fract(Math.sin(a * 3.7 + radius * 17) * 43758.5));
+    pts.push(V2(Math.cos(a) * r, Math.sin(a) * r));
+  }
+  d.extrude(pts, -0.03, 0.006, 1.4, true, false, false);
+  const g = c.m('gravel');
+  for (let i = 0; i < grit; i++) {
+    const a = rand.range(0, Math.PI * 2);
+    const r = radius * rand.range(0.45, 1.0);
+    const s = rand.range(0.02, 0.055);
+    g.pushTRS(Math.cos(a) * r, s * 0.35, Math.sin(a) * r, rand.range(0, 6.28), rand.range(-0.4, 0.4));
+    g.box(0, 0, 0, s, s * 0.5, s * rand.range(0.7, 1.4), 0.3);
+    g.pop();
+  }
+}
+
 def({
   id: 'rubbleSmall', radius: 0.6, height: 0.35, collide: 'box',
   build(c, rand) {
+    contactSkirt(c, 0.52, rand, 4);
     const keys: MatKey[] = ['brickSoot', 'concreteDark'];
     for (let i = 0; i < 12; i++) {
       const m = c.m(keys[i % 2]);
@@ -949,6 +1082,7 @@ def({
 def({
   id: 'brickPile', radius: 0.8, height: 0.5, collide: 'box',
   build(c, rand) {
+    contactSkirt(c, 0.66, rand, 5);
     const m = c.m('brick');
     for (let i = 0; i < 26; i++) {
       const a = rand.next() * Math.PI * 2;
@@ -968,6 +1102,7 @@ def({
     // A slab out of a wall, not a clean plate: the main piece is chamfered so
     // its broken edges catch the key, and two smaller fragments sit against it
     // so the silhouette is never a single rectangle.
+    contactSkirt(c, 0.42, rand, 4);
     const m = c.m('concreteDark');
     m.pushTRS(0, 0.17, 0, rand.next() * 3, rand.range(-0.28, 0.28), rand.range(-0.24, 0.24));
     m.chamferBox(0, 0, 0, rand.range(0.26, 0.4), rand.range(0.07, 0.13), rand.range(0.22, 0.34), 0.022, 0.7);
@@ -990,6 +1125,7 @@ def({
 def({
   id: 'plankPile', radius: 1.1, height: 0.4, collide: 'box',
   build(c, rand) {
+    contactSkirt(c, 0.62, rand, 4);
     const m = c.m('plank');
     for (let i = 0; i < 9; i++) {
       m.pushTRS(rand.range(-0.2, 0.2), 0.03 + i * 0.035, rand.range(-0.2, 0.2), rand.range(-0.5, 0.5));
@@ -1002,6 +1138,7 @@ def({
 def({
   id: 'rebarBundle', radius: 0.55, height: 0.3, collide: 'box',
   build(c, rand) {
+    contactSkirt(c, 0.34, rand, 3);
     const m = c.m('rust');
     for (let i = 0; i < 9; i++) {
       const y = 0.02 + Math.floor(i / 4) * 0.045;
@@ -1017,6 +1154,7 @@ def({
   build(c, rand) {
     // Alpha-tested window glass would punch holes in shards this small, so
     // scattered glass uses the wet, near-mirror puddle stack instead.
+    contactSkirt(c, 0.58, rand, 6);
     const m = c.m('alu');
     for (let i = 0; i < 14; i++) {
       m.pushTRS(rand.range(-0.6, 0.6), 0.012, rand.range(-0.6, 0.6), rand.next() * 3, rand.range(-0.1, 0.1));
@@ -1029,6 +1167,7 @@ def({
 def({
   id: 'paperDrift', radius: 0.6, height: 0.04, collide: 'none', noShadow: true, navIgnore: true,
   build(c, rand) {
+    contactSkirt(c, 0.5, rand, 3);
     const m = c.m('plywood');
     for (let i = 0; i < 12; i++) {
       m.pushTRS(rand.range(-0.55, 0.55), 0.006 + i * 0.002, rand.range(-0.55, 0.55), rand.next() * 3, rand.range(-0.06, 0.06));

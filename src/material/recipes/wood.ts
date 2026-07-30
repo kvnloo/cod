@@ -81,7 +81,7 @@ void obHeightFn(vec2 uv, out vec4 h0, out vec4 h1) {
   h += (rings * 0.5 + fibre * 0.5 - 0.5) * 0.10 * face;
 
   float knotCore;
-  float knot = obWoodKnot(c.local, c.rnd, knotCore) * step(0.45, c.rnd.z);
+  float knot = obWoodKnot(c.local, c.rnd, knotCore) * step(0.74, c.rnd.z);
   h -= knotCore * 0.16 * face;
   h += knot * 0.03 * face;
 
@@ -180,7 +180,7 @@ void obHeightFn(vec2 uv, out vec4 h0, out vec4 h1) {
   h += (fibre - 0.5) * 0.10 * face;
 
   float knotCore;
-  float knot = obWoodKnot(c.local, c.rnd, knotCore) * step(0.35, c.rnd.z);
+  float knot = obWoodKnot(c.local, c.rnd, knotCore) * step(0.70, c.rnd.z);
   h += knot * 0.05 * face;
   h -= knotCore * 0.24 * face;
 

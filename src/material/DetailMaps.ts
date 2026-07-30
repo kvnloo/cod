@@ -31,7 +31,13 @@ float obDetailH(vec2 uv) {
   float g2    = obValueP(uv * 150.0, vec2(150.0), 9.0);
   float drag  = obValueP(vec2(uv.x * 30.0, uv.y * 110.0), vec2(30.0, 110.0), 5.0);
   float pore  = smoothstep(0.93, 0.999, obValueP(uv * 110.0, vec2(110.0), 11.0));
-  return g1 * 0.36 + g2 * 0.30 + drag * 0.26 - pore * 0.14;
+  // Hairline crazing. A render or plaster pier seen from a metre and a half is
+  // never one value with three crack squiggles across it — it is a whole map of
+  // fine map-cracking that only resolves close up, and the base tile cannot
+  // carry it because it is stretched over four metres.
+  float craze = obCracks(uv, vec2(1.0), 4.0, 0.020, 27.0);
+  craze += obCracks(uv, vec2(1.0), 9.0, 0.012, 41.0) * 0.6;
+  return g1 * 0.32 + g2 * 0.26 + drag * 0.24 - pore * 0.12 - min(craze, 1.0) * 0.30;
 }`,
   grit: /* glsl */ `
 float obDetailH(vec2 uv) {
@@ -71,7 +77,7 @@ float obDetailH(vec2 uv) {
  * boiling cottage-cheese rash under a low sun; a roughness break-up of the
  * same amplitude reads as a real surface and never aliases. */
 const ALBEDO_GAIN: Record<Exclude<DetailKind, 'none'>, number> = {
-  micro: 0.11, grit: 0.16, fibre: 0.18, metal: 0.10, organic: 0.20,
+  micro: 0.08, grit: 0.09, fibre: 0.13, metal: 0.08, organic: 0.14,
 };
 const ROUGH_GAIN: Record<Exclude<DetailKind, 'none'>, number> = {
   micro: 0.28, grit: 0.30, fibre: 0.20, metal: 0.24, organic: 0.16,

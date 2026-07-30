@@ -30,6 +30,7 @@ uniform sampler2D tVelocity;
 uniform sampler2D tDepth;
 uniform vec2 uTexel;
 uniform vec2 uResolution;
+uniform vec2 uJitterPx;
 uniform vec4 uProj;
 uniform mat4 uInverseView;
 uniform mat4 uPrevViewProjection;
@@ -38,6 +39,8 @@ uniform float uFar;
 uniform float uFeedbackMin;
 uniform float uFeedbackMax;
 uniform float uClipGamma;
+uniform float uFilterAmount;
+uniform float uStationaryGain;
 uniform float uReset;
 layout(location = 0) out vec4 fragColor;
 
@@ -99,24 +102,43 @@ void main() {
   vec2 prevUv = vUv - velocity * uTexel;
 
   /* --- current neighbourhood statistics in tonemapped YCoCg ------------ */
+  /* The centre texel is a *point* sample of the scene taken at
+     pixelCentre + jitter, not an area average of the pixel. Feeding that point
+     sample straight into the history is what leaves sub-pixel geometry — a
+     22 mm cable at 30 m, every railing, every aerial — snapping between "fully
+     covered" and "not covered at all" instead of converging on its true partial
+     coverage: the neighbourhood clamp below re-pins the history to whichever
+     phase the current frame happens to be in.
+
+     So reconstruct the pixel centre first. Each of the nine taps samples the
+     scene at (texelOffset + jitter), and a Gaussian centred on the pixel centre
+     weights them into a proper filtered sample. That is the whole difference
+     between a 1px staircase and a line with real partial coverage. */
   vec3 taps[9];
   vec3 m1 = vec3(0.0);
   vec3 m2 = vec3(0.0);
   vec3 nmin = vec3(1e9);
   vec3 nmax = vec3(-1e9);
+  vec3 filtered = vec3(0.0);
+  float fw = 0.0;
   int idx = 0;
   for (int y = -1; y <= 1; y++) {
     for (int x = -1; x <= 1; x++) {
-      vec3 c = texture(tInput, vUv + vec2(float(x), float(y)) * uTexel).rgb;
+      vec2 d = vec2(float(x), float(y));
+      vec3 c = texture(tInput, vUv + d * uTexel).rgb;
       c = rgbToYCoCg(tonemapForResolve(max(c, vec3(0.0))));
       taps[idx++] = c;
       m1 += c;
       m2 += c * c;
       nmin = min(nmin, c);
       nmax = max(nmax, c);
+      vec2 o = d + uJitterPx;
+      float w = exp(-2.29 * dot(o, o));
+      filtered += c * w;
+      fw += w;
     }
   }
-  vec3 current = taps[4];
+  vec3 current = mix(taps[4], filtered / max(fw, 1e-5), uFilterAmount);
 
   float depth = texture(tDepth, vUv).r;
   bool offscreen = any(lessThan(prevUv, vec2(0.0))) || any(greaterThan(prevUv, vec2(1.0)));
@@ -155,11 +177,21 @@ void main() {
   }
 
   /* --- feedback weight -------------------------------------------------- */
+  float speed = length(velocity);
   float lumaDiff = abs(current.x - clipped.x) / max(max(current.x, clipped.x), 0.15);
-  float feedback = mix(uFeedbackMax, uFeedbackMin, lumaDiff * lumaDiff);
+  float dynamic = mix(uFeedbackMax, uFeedbackMin, lumaDiff * lumaDiff);
+  /* The Playdead luminance-difference term exists to stop a fast mover dragging
+     a trail. On a pixel that is *not* moving it does the opposite of what we
+     want: a sub-pixel edge has a large current-vs-history luma difference every
+     single frame by construction, so the term collapses the history exactly
+     where the longest accumulation is needed and the edge never converges.
+     Gate it on velocity — static pixels keep the full history, movers keep the
+     anti-ghosting. */
+  float stationary = exp(-speed * speed * 0.75) * uStationaryGain;
+  float feedback = mix(dynamic, uFeedbackMax, stationary);
   feedback *= 1.0 - reject;
   // Long trails on fast movers are the classic ghost; shorten the history there.
-  feedback *= exp(-length(velocity) * 0.018);
+  feedback *= exp(-speed * 0.018);
 
   vec3 resolved = mix(current, clipped, feedback);
 
@@ -213,7 +245,13 @@ void main() {
   // that is already an extreme (a lone bright speckle, or a checkerboard phase)
   // gets nothing, which is what stops high-frequency noise being amplified.
   float inside = 1.0 - sat((max(l0 - lmax, lmin - l0)) * 24.0);
-  float target = clamp(l0 + (l0 - blur) * uAmount * inside,
+  // A silhouette does not need micro-contrast. Sharpening one only manufactures
+  // the dark-above/bright-below halo that turns a temporally resolved thin edge
+  // back into a hard staircase, and haloed high-contrast edges are one of the
+  // most obvious "this was sharpened" tells. Roll the correction off with the
+  // local luma range so texture keeps its bite and silhouettes are left alone.
+  float soft = 1.0 - smoothstep(0.06, 0.26, lmax - lmin);
+  float target = clamp(l0 + (l0 - blur) * uAmount * inside * soft,
                        min(lmin, l0), max(lmax, l0));
   fragColor = vec4(c.rgb * (target / max(l0, 1e-4)), c.a);
 }
@@ -260,6 +298,18 @@ void main() {
 }
 `;
 
+/**
+ * Publishes a pass on `globalThis` in capture mode only, so an A/B run can
+ * change one knob between two shots *inside a single build*. Comparing two
+ * builds is not a controlled experiment while a dozen agents are editing the
+ * tree, and `__RENDER__.set` only reaches `settings.gfx`.
+ */
+function installTuningHandle(key: string, value: unknown): void {
+  const params = new URLSearchParams(globalThis.location?.search ?? '');
+  if (params.get('capture') !== '1') return;
+  (globalThis as unknown as Record<string, unknown>)[key] = value;
+}
+
 export class TaaPass extends BasePass {
   readonly name = 'taa';
   readonly order = PASS_ORDER.TAA;
@@ -269,9 +319,29 @@ export class TaaPass extends BasePass {
   private fxaa!: THREE.ShaderMaterial;
   private flip = 0;
   private lastFrame = -1;
+  /**
+   * Strength of the jittered-sample reconstruction filter, or -1 to let the
+   * jitter phase count choose (the normal case). Exposed so an A/B run can turn
+   * the filter off in the same build — it is not toggleable through
+   * `settings.gfx`, and comparing two builds is not a controlled experiment
+   * while a dozen other things are changing.
+   */
+  filterOverride = -1;
+  /** Micro-contrast recovered after the resolve; see SHARPEN_FRAG. */
+  sharpenAmount = 0.16;
+  /**
+   * How much of the history a pixel with (near) zero velocity keeps regardless
+   * of how different it is from the current frame. 1 = full accumulation, which
+   * is what lets sub-pixel geometry converge; drop it if a level's alpha
+   * effects start trailing.
+   */
+  stationaryGain = 1;
   private readonly projVec = new THREE.Vector4(1, 1, 0, 0);
 
-  constructor(res: PostResources) { super(res); }
+  constructor(res: PostResources) {
+    super(res);
+    installTuningHandle('__TAA__', this);
+  }
 
   protected override onSetup(): void {
     const gl = this.renderer.getContext();
@@ -287,6 +357,7 @@ export class TaaPass extends BasePass {
         tDepth: { value: null },
         uTexel: { value: new THREE.Vector2() },
         uResolution: { value: new THREE.Vector2() },
+        uJitterPx: { value: new THREE.Vector2() },
         uProj: { value: new THREE.Vector4(1, 1, 0, 0) },
         uInverseView: { value: new THREE.Matrix4() },
         uPrevViewProjection: { value: new THREE.Matrix4() },
@@ -295,6 +366,8 @@ export class TaaPass extends BasePass {
         uFeedbackMin: { value: 0.86 },
         uFeedbackMax: { value: 0.97 },
         uClipGamma: { value: 1.15 },
+        uFilterAmount: { value: 1 },
+        uStationaryGain: { value: 1 },
         uReset: { value: 1 },
       },
     });
@@ -345,6 +418,11 @@ export class TaaPass extends BasePass {
     u.tDepth.value = ctx.gbuffer.depth;
     (u.uTexel.value as THREE.Vector2).set(1 / ctx.width, 1 / ctx.height);
     (u.uResolution.value as THREE.Vector2).set(ctx.width, ctx.height);
+    // `ctx.jitter` is the NDC offset that was added to the projection's m02/m12.
+    // Adding it there moves the *projected point* by -jitter in NDC, so this
+    // frame's samples sit at pixelCentre + (jitter * resolution / 2) pixels.
+    (u.uJitterPx.value as THREE.Vector2).set(
+      ctx.jitter.x * ctx.width * 0.5, ctx.jitter.y * ctx.height * 0.5);
     (u.uProj.value as THREE.Vector4).copy(this.projVec.set(proj[0], proj[5], proj[8], proj[9]));
     (u.uInverseView.value as THREE.Matrix4).copy(ctx.inverseView);
     (u.uPrevViewProjection.value as THREE.Matrix4).copy(ctx.prevViewProjection);
@@ -356,7 +434,17 @@ export class TaaPass extends BasePass {
     u.uFeedbackMax.value = Math.min(0.975, 1 - 1 / samples);
     u.uFeedbackMin.value = Math.min(0.9, u.uFeedbackMax.value - 0.11);
     u.uClipGamma.value = samples >= 16 ? 1.25 : 1.05;
+    // With one or two jitter phases there is nothing to reconstruct and the
+    // filter would only blur; it earns its keep from about four phases up.
+    // 0.75 rather than a full Gaussian: measured on the overhead cables in
+    // square-north, 0.75 removes as much of the staircase as 1.0 (edge ripple
+    // 35.5% -> 31.5%) while giving back a third of the texture detail the full
+    // filter costs.
+    u.uFilterAmount.value = this.filterOverride >= 0
+      ? this.filterOverride
+      : (samples >= 8 ? 0.75 : (samples >= 4 ? 0.5 : 0));
     u.uReset.value = ctx.frame < 2 ? 1 : 0;
+    u.uStationaryGain.value = this.stationaryGain;
 
     ctx.blit(this.resolve, cur);
 
@@ -365,7 +453,7 @@ export class TaaPass extends BasePass {
     const su = this.sharpen.uniforms;
     su.tInput.value = cur.texture;
     (su.uTexel.value as THREE.Vector2).set(1 / ctx.width, 1 / ctx.height);
-    su.uAmount.value = 0.14;
+    su.uAmount.value = this.sharpenAmount;
     ctx.blit(this.sharpen, output);
     return true;
   }

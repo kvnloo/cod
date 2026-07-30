@@ -141,6 +141,10 @@ function holdMuzzleFlash(intensity = 190): void {
     render.addDynamicLight({
       position: p, color: 0xffc27a, intensity, radius: 5.0, lifetime: 0.26, decay: 'linear',
     });
+    // …and the view model's own emitter, which is the one that actually lights
+    // the barrel and the hands. The pooled world light is mirrored into view
+    // space at 85%, but it competes for a shared slot; this one cannot lose.
+    vm.holdFlash(34);
   };
 }
 

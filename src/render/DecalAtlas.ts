@@ -253,38 +253,78 @@ Decal holeSoft( vec2 p, float seed ) {
 }
 
 /* ------------------------------------------------------------------ blood -- */
+/**
+ * Blood is not a radial gradient.
+ *
+ * The previous splat was a centred lobe with an airbrushed falloff and evenly
+ * spaced spokes, which is the shape of a sun sprite, not of a fluid hitting a
+ * wall. Three things fix it and all three are geometric rather than tonal:
+ *
+ *  - **Direction.** Cast-off arrives travelling. The pool is offset downrange,
+ *    the fingers are longer downrange, and the satellite drops are thrown
+ *    forward in a cone rather than sprayed evenly around a circle.
+ *  - **A hard edge.** Surface tension gives blood a meniscus and then nothing.
+ *    The falloff is two or three texels wide, and the rim is *darker* than the
+ *    middle — the opposite of an airbrush.
+ *  - **Value flatness.** Inside the pool the value barely changes; what changes
+ *    is gloss. Wet blood is a mirror in the middle and matte where it has
+ *    started to dry at the perimeter.
+ */
 Decal bloodSplat( vec2 p, float seed ) {
 	Decal d = defaults();
-	float ang = atan( p.y, p.x );
-	vec2 dir = vec2( cos( ang ), sin( ang ) );
-	float r = length( p );
 
-	float lobe = 0.26 + 0.16 * fbm( dir * 2.6 + seed * 4.0, 5 );
-	float body = smoothstep( lobe, lobe * 0.72, r );
+	// Travel direction of the event.
+	float ba = hash12( vec2( seed, 3.7 ) ) * 2.0 * PI;
+	vec2 bdir = vec2( cos( ba ), sin( ba ) );
+	vec2 q = p - bdir * 0.11;
+	float rq = length( q );
+	vec2 qd = q / max( rq, 1e-4 );
+	float down = max( dot( qd, bdir ), 0.0 );
 
-	// Radiating fingers, then detached droplets.
-	float fingerD = spokes( p, 9.0, seed + 11.0, 12.0 );
-	float fingers = smoothstep( 0.42, 0.0, fingerD ) * smoothstep( 0.75, 0.18, r );
+	// Main pool: lopsided, irregular, and cut off hard.
+	float lobe = 0.20 + 0.12 * fbm( qd * 2.4 + seed * 4.0, 5 )
+	                  + 0.10 * down * down;
+	float body = smoothstep( lobe, lobe - 0.022, rq );
 
+	// Fingers: they run downrange, not evenly around the clock.
+	float fingerD = spokes( q, 11.0, seed + 11.0, 16.0 );
+	float fingers = smoothstep( 0.30, 0.0, fingerD )
+	              * smoothstep( 0.86, 0.16, rq )
+	              * mix( 0.15, 1.0, down );
+	fingers = smoothstep( 0.35, 0.55, fingers );
+
+	// Satellite droplets, thrown forward, with hard edges and a size spread.
 	float drops = 0.0;
-	for ( int i = 0; i < 10; i ++ ) {
+	for ( int i = 0; i < 22; i ++ ) {
 		vec2 h = hash22( vec2( float( i ), seed ) );
-		float a = h.x * 2.0 * PI;
-		float dist = 0.34 + h.y * 0.55;
-		vec2 c = vec2( cos( a ), sin( a ) ) * dist;
-		float rad = 0.018 + 0.045 * hash12( vec2( float( i ) + 3.0, seed ) );
-		drops = max( drops, smoothstep( rad, rad * 0.4, length( p - c ) ) );
+		float spread = 0.55 + 0.45 * hash12( vec2( float( i ) + 17.0, seed ) );
+		float a = ba + ( h.x - 0.5 ) * 2.4 * spread;
+		float dist = 0.30 + h.y * h.y * 0.72;
+		vec2 c = bdir * 0.06 + vec2( cos( a ), sin( a ) ) * dist;
+		float rad = 0.010 + 0.038 * pow( hash12( vec2( float( i ) + 3.0, seed ) ), 2.0 );
+		// Drops elongate along their flight path.
+		vec2 e = p - c;
+		vec2 el = vec2( dot( e, bdir ) * 0.62, dot( e, vec2( -bdir.y, bdir.x ) ) );
+		drops = max( drops, smoothstep( rad, rad * 0.55, length( el ) ) );
 	}
 
-	float mask = clamp( max( max( body, fingers * 0.9 ), drops ), 0.0, 1.0 );
-	float pooling = smoothstep( 0.28, 0.0, r );
+	float mask = clamp( max( max( body, fingers ), drops ), 0.0, 1.0 );
 
-	vec3 deep = vec3( 0.115, 0.0075, 0.006 );
-	vec3 edge = vec3( 0.235, 0.030, 0.018 );
-	d.albedo = mix( edge, deep, pooling * 0.85 + 0.15 );
+	// A rim of thin, part-dried blood around the perimeter of the pool.
+	float rim = clamp( body - smoothstep( lobe - 0.055, lobe - 0.085, rq ), 0.0, 1.0 );
+	float wet = smoothstep( lobe * 0.85, lobe * 0.25, rq ) * body;
+
+	// Kept genuinely dark. Blood has an albedo of a few percent; at 0.09 red
+	// with nothing in green or blue it clips the red channel the moment the sun
+	// hits it and reads as fluorescent spray paint rather than as fluid.
+	vec3 deep = vec3( 0.052, 0.0072, 0.0062 );
+	vec3 dried = vec3( 0.031, 0.0085, 0.0072 );
+	d.albedo = mix( deep, dried, clamp( rim * 0.9 + ( 1.0 - body ) * 0.6, 0.0, 1.0 ) );
+	// Flat inside, with only a little coagulation mottling.
+	d.albedo *= 0.82 + 0.30 * fbm( p * 9.0 + seed * 2.0, 4 );
 	d.alpha = mask;
-	d.height = mask * 0.22;
-	d.rough = mix( 0.55, 0.24, pooling );
+	d.height = body * 0.30 + rim * 0.10;
+	d.rough = mix( 0.62, 0.10, wet );
 	return d;
 }
 

@@ -116,6 +116,10 @@ function townHall(chunk: Chunk): BlockResult {
     windowHeight: 2.4,
     sill: 1.05,
     glazingDamage: 0.45,
+    // A run of seven identical panes at exact even spacing was the facade's
+    // loudest repeat. The rhythm is right — real windows are regular — so the
+    // variation goes into their state: roughly one in six is boarded over.
+    boardedChance: 0.17,
     openSides: ['n', 'w', 's', 'e'],
     entrances: [{ side: 'n', at: 0, width: 1.5, missing: true }],
     interior: 'full',
@@ -135,13 +139,49 @@ function townHall(chunk: Chunk): BlockResult {
   const res = buildBlock(chunk, spec);
 
   // --- south arcade: five arch rings on to the square, the hall's signature.
+  //
+  // Five identical rings on five identically spaced piers read as a stamped
+  // repeat — a stepped starburst repeated at mathematical intervals is the
+  // strongest "this was generated" tell in the whole facade. The bays are
+  // still structurally identical (they have to be), but each ring now has its
+  // own voussoir count and its own state: two are shelled, one has lost its
+  // keystone, one has been sandbagged up to springing level.
   const south = rectWalls(f.x0, f.z0, f.x1, f.z1)[2];
-  for (const u of bayCentreU) {
-    archOpening(chunk, south, 'stone', u, span, springY, archTop + 0.05, 0.55, 9, 'stoneTrim');
+  const arcRand = new Rand(2277);
+  const bayState: ('clean' | 'shelled' | 'noKey' | 'blocked')[] = ['shelled', 'clean', 'noKey', 'blocked', 'shelled'];
+  for (let i = 0; i < bayCentreU.length; i++) {
+    const u = bayCentreU[i];
+    archOpening(chunk, south, 'stone', u, span, springY, archTop + 0.05, 0.55, 7 + i * 2, 'stoneTrim');
+    const cx = f.x0 + u;
+    const st = bayState[i];
+    if (st === 'shelled') {
+      // Voussoirs blown out of the ring and the spandrel scarred above it.
+      const dbg = chunk.m('concreteDark');
+      const side = i === 0 ? -1 : 1;
+      for (let k = 0; k < 5; k++) {
+        const a = Math.PI * (0.14 + k * 0.07) * (side > 0 ? 1 : -1) + (side > 0 ? 0 : Math.PI);
+        const r = span * 0.5 + 0.28;
+        dbg.pushTRS(cx + Math.cos(a) * r, springY + Math.sin(a) * r, f.z1 + 0.18,
+          arcRand.range(0, 3), arcRand.range(-0.4, 0.4), arcRand.range(-0.4, 0.4));
+        dbg.box(0, 0, 0, arcRand.range(0.14, 0.25), arcRand.range(0.1, 0.2), 0.3, 0.6);
+        dbg.pop();
+      }
+    } else if (st === 'noKey') {
+      // Keystone gone: a wedge of sky through the top of the ring.
+      const gap = chunk.m('concreteDark');
+      gap.box(cx, archTop + 0.24, f.z1 + 0.16, 0.3, 0.22, 0.36, 0.5);
+    } else if (st === 'blocked') {
+      // Bricked up to springing with a firing slot left in it.
+      const b = chunk.m('brickPale');
+      b.boxMinMax(cx - span * 0.5 + 0.12, baseY, f.z1 - 0.34, cx - 0.28, springY - 0.2, f.z1 - 0.08, 1.0);
+      b.boxMinMax(cx + 0.28, baseY, f.z1 - 0.34, cx + span * 0.5 - 0.12, springY - 0.2, f.z1 - 0.08, 1.0);
+      b.boxMinMax(cx - 0.28, baseY, f.z1 - 0.34, cx + 0.28, baseY + 0.95, f.z1 - 0.08, 1.0);
+      b.boxMinMax(cx - 0.28, baseY + 1.35, f.z1 - 0.34, cx + 0.28, springY - 0.2, f.z1 - 0.08, 1.0);
+    }
   }
   // The terrace runs through the arcade so the hall floor and the terrace are
   // one continuous surface.
-  chunk.m('stone').boxMinMax(f.x0 + 0.2, -0.4, f.z1 - 1.2, f.x1 - 0.2, baseY, f.z1 + 0.2, 2.4);
+  chunk.m('stone').boxMinMax(f.x0 + 0.2, -0.4, f.z1 - 1.2, f.x1 - 0.2, baseY, f.z1 + 0.2, 1.1);
 
   // Vaulted soffit through the arcade so it reads as depth, not a painted arch.
   const soffit = chunk.m('stone');
@@ -162,22 +202,136 @@ function townHall(chunk: Chunk): BlockResult {
     }
   }
 
+  // --- arcade piers.
+  //
+  // The piers were bare 1.8 m boxes of wall: in the arcade shot the nearest one
+  // is nearly half the frame as a single flat plane with a razor 90° corner and
+  // nothing on it. Every real arcade pier has a plinth, an impost band at
+  // springing and a chamfer or an angle shaft on its arris — three horizontals
+  // and two highlights that turn a plane into architecture.
+  const pierU: number[] = [];
+  for (let i = 0; i <= bays; i++) pierU.push(pierW * (i + 0.5) + span * i);
+  const pierT = chunk.m('stoneTrim');
+  const zFace = f.z1;
+  for (let i = 0; i < pierU.length; i++) {
+    const cx = f.x0 + pierU[i];
+    const hwP = pierW * 0.5;
+    // Plinth and its weathered cap.
+    pierT.boxMinMax(cx - hwP - 0.09, baseY, zFace - 0.62, cx + hwP + 0.09, baseY + 0.62, zFace + 0.09, 1.0);
+    pierT.boxMinMax(cx - hwP - 0.12, baseY + 0.62, zFace - 0.64, cx + hwP + 0.12, baseY + 0.74, zFace + 0.12, 1.0);
+    // Impost band at springing.
+    pierT.boxMinMax(cx - hwP - 0.10, springY - 0.26, zFace - 0.64, cx + hwP + 0.10, springY - 0.06, zFace + 0.10, 1.0);
+    // Angle shafts on both arrises: the chamfer the corner never had.
+    for (const sx of [-1, 1]) {
+      pierT.pushTRS(cx + sx * hwP, baseY + 0.74, zFace + 0.02, Math.PI * 0.25);
+      pierT.cylinder(0.10, 0.09, springY - 1.06 - baseY, 6, false, false, 0.5);
+      pierT.pop();
+    }
+    // Iron lamp bracket on alternate piers.
+    if (i % 2 === 1) {
+      const br = chunk.m('rust');
+      br.boxMinMax(cx - 0.03, springY + 0.1, zFace - 0.02, cx + 0.03, springY + 0.16, zFace + 0.52, 0.4);
+      br.box(cx, springY - 0.02, zFace + 0.48, 0.11, 0.13, 0.11, 0.3);
+    } else {
+      // Cast-iron rainwater pipe with its hopper and two ears, hard against
+      // the arris — the vertical the pier face never had.
+      const dp = chunk.m('pipe');
+      dp.pushTRS(cx - hwP + 0.11, baseY + 0.74, zFace + 0.11);
+      dp.cylinder(0.055, 0.055, springY - 0.9 - baseY, 8, false, false, 0.4);
+      dp.pop();
+      dp.box(cx - hwP + 0.11, springY - 0.14, zFace + 0.11, 0.09, 0.14, 0.09, 0.3);
+      for (const hy of [baseY + 1.1, baseY + 2.0]) {
+        dp.box(cx - hwP + 0.11, hy, zFace + 0.06, 0.075, 0.03, 0.06, 0.2);
+      }
+    }
+    // Painted notice board or a stone dedication plaque, alternating: the pier
+    // face is 1.8 m wide and 3.5 m tall and needs *something* on it.
+    if (i === 1 || i === 4) {
+      const bd = chunk.m('plywood');
+      bd.box(cx + 0.06, baseY + 1.62, zFace + 0.055, 0.42, 0.56, 0.03, { unit: true });
+      const fr = chunk.m('wood');
+      for (const sy of [-1, 1]) bd.box(cx + 0.06, baseY + 1.62 + sy * 0.58, zFace + 0.05, 0.45, 0.025, 0.035, 0.2);
+      void fr;
+    } else if (i === 2 || i === 5) {
+      const pl = chunk.m('stoneTrim');
+      pl.box(cx, baseY + 1.9, zFace + 0.05, 0.34, 0.24, 0.035, 0.5);
+      pl.box(cx, baseY + 1.9, zFace + 0.06, 0.30, 0.20, 0.02, 0.4);
+    }
+    // Corbel under the soffit springing, breaking the top of the plane.
+    pierT.pushTRS(cx, springY + 0.02, zFace + 0.02);
+    pierT.box(0, 0.10, 0.09, hwP * 0.42, 0.10, 0.11, 0.4);
+    pierT.box(0, 0.24, 0.13, hwP * 0.52, 0.055, 0.16, 0.4);
+    pierT.pop();
+
+    // --- inner face -----------------------------------------------------
+    // The arcade vantage looks *out* from under the vault, so what fills that
+    // frame is the north face of the pier, not the south one. It gets the same
+    // treatment: a hand rail, a notice, conduit, and a bench where the arcade
+    // was used as a shelter.
+    const zIn = zFace - 0.55;
+    if (i % 2 === 0) {
+      // Mobilisation notices: a small framed board with two bills pasted on.
+      const bd = chunk.m('canvasCream');
+      bd.box(cx - 0.28, baseY + 1.78, zIn - 0.045, 0.21, 0.29, 0.02, { unit: true });
+      bd.box(cx + 0.16, baseY + 1.62, zIn - 0.045, 0.16, 0.22, 0.02, { unit: true });
+      const fr = chunk.m('wood');
+      for (const sy of [-1, 1]) fr.box(cx - 0.06, baseY + 1.74 + sy * 0.42, zIn - 0.038, 0.44, 0.026, 0.032, 0.2);
+      for (const sx of [-1, 1]) fr.box(cx - 0.06 + sx * 0.44, baseY + 1.74, zIn - 0.038, 0.026, 0.42, 0.032, 0.2);
+    } else {
+      const pl = chunk.m('stoneTrim');
+      pl.box(cx, baseY + 2.05, zIn - 0.04, 0.38, 0.28, 0.04, 0.5);
+      pl.box(cx, baseY + 2.05, zIn - 0.06, 0.33, 0.23, 0.02, 0.4);
+    }
+    // Conduit drop with two saddles and a switch box, hard against one arris.
+    const cd = chunk.m('pipe');
+    cd.pushTRS(cx + hwP - 0.13, baseY + 0.78, zIn - 0.06);
+    cd.cylinder(0.026, 0.026, springY - 1.1 - baseY, 6, false, false, 0.3);
+    cd.pop();
+    cd.box(cx + hwP - 0.13, baseY + 1.25, zIn - 0.075, 0.075, 0.11, 0.045, 0.2);
+    // Hand rail bolted across the pier at 0.95 m, the way a shelter gets used.
+    const rl = chunk.m('rust');
+    rl.pushTRS(cx, baseY + 0.98, zIn - 0.12, 0, 0, Math.PI / 2);
+    rl.cylinder(0.024, 0.024, pierW + 0.24, 7, false, false, 0.3);
+    rl.pop();
+    for (const sx of [-1, 1]) {
+      rl.box(cx + sx * (hwP - 0.05), baseY + 0.98, zIn - 0.06, 0.03, 0.03, 0.07, 0.2);
+    }
+    // Plinth return so the base wraps on to the inner face as well.
+    pierT.boxMinMax(cx - hwP - 0.09, baseY, zIn - 0.10, cx + hwP + 0.09, baseY + 0.5, zIn + 0.02, 1.0);
+  }
+
   // --- raised terrace in front, with balustrade and two flights of steps.
   const t = chunk.m('stone');
-  t.boxMinMax(f.x0 - 1.5, -0.4, SQUARE.terraceZ0, f.x1 + 1.5, SQUARE.terraceY, SQUARE.terraceZ1, 2.4);
+  // 1.1 m per texture repeat, not 2.4: at 2.4 the terrace slabs were 2 m across
+  // and the whole deck read as one featureless plane in the north-street shot.
+  t.boxMinMax(f.x0 - 1.5, -0.4, SQUARE.terraceZ0, f.x1 + 1.5, SQUARE.terraceY, SQUARE.terraceZ1, 1.1);
   const bal = chunk.m('stoneTrim');
-  // balustrade along the square edge, with two gaps for the steps
-  const gaps = [[-9.5, -5.5], [5.5, 9.5]];
+  // Balustrade along the square edge, with gaps for the steps and one bay
+  // blown out — a continuous run of identical turned balusters was a repeat in
+  // its own right, and the gap gives the terrace a story.
+  const gaps = [[-9.5, -5.5], [5.5, 9.5], [-16.4, -13.1]];
   const seg = 0.55;
+  const balRand = new Rand(2299);
   for (let x = f.x0 - 1.5; x < f.x1 + 1.5; x += seg) {
     if (gaps.some((g) => x > g[0] - 0.3 && x < g[1] + 0.3)) continue;
-    bal.pushTRS(x + seg * 0.5, SQUARE.terraceY + 0.42, SQUARE.terraceZ1 - 0.22);
+    const lean = balRand.bool(0.12) ? balRand.range(-0.2, 0.2) : 0;
+    bal.pushTRS(x + seg * 0.5, SQUARE.terraceY + 0.42, SQUARE.terraceZ1 - 0.22, 0, 0, lean);
     bal.cylinder(0.09, 0.075, 0.72, 8, false, false, 0.4);
     bal.pop();
   }
-  for (const [gx0, gx1] of [[f.x0 - 1.5, -9.5], [-5.5, 5.5], [9.5, f.x1 + 1.5]]) {
+  for (const [gx0, gx1] of [[f.x0 - 1.5, -16.4], [-13.1, -9.5], [-5.5, 5.5], [9.5, f.x1 + 1.5]]) {
     bal.boxMinMax(gx0, SQUARE.terraceY + 0.78, SQUARE.terraceZ1 - 0.36, gx1, SQUARE.terraceY + 0.92, SQUARE.terraceZ1 - 0.06, 1.2);
     bal.boxMinMax(gx0, SQUARE.terraceY, SQUARE.terraceZ1 - 0.36, gx1, SQUARE.terraceY + 0.12, SQUARE.terraceZ1 - 0.06, 1.2);
+  }
+  // The blown-out bay: coping fallen on to the terrace deck, a bent rail stub.
+  const fall = chunk.m('stoneTrim');
+  for (let i = 0; i < 5; i++) {
+    const px = -15.9 + i * 0.62 + balRand.range(-0.2, 0.2);
+    const pz = SQUARE.terraceZ1 - balRand.range(0.5, 1.5);
+    fall.pushTRS(px, SQUARE.terraceY + 0.08, pz,
+      balRand.range(0, 6.28), balRand.range(-0.35, 0.35), balRand.range(-0.4, 0.4));
+    fall.box(0, 0, 0, balRand.range(0.16, 0.4), 0.07, balRand.range(0.1, 0.18), 0.6);
+    fall.pop();
   }
   for (const cx of [-7.5, 7.5]) {
     stairs(chunk, {
@@ -315,6 +469,10 @@ function westTerrace(set: ChunkSet): Record<string, BlockResult> {
     omitSides: ['s'],
     blindSides: ['s'],
     glazingDamage: 0.35,
+    // A run of seven identical panes at exact even spacing was the facade's
+    // loudest repeat. The rhythm is right — real windows are regular — so the
+    // variation goes into their state: roughly one in six is boarded over.
+    boardedChance: 0.17,
     entrances: [{ side: 'e', at: -47, width: 1.3, open: 1.5 }],
     balconies: [
       { side: 'e', at: -50, width: 2.4, level: 1 },
@@ -357,6 +515,10 @@ function westTerrace(set: ChunkSet): Record<string, BlockResult> {
     omitSides: ['n'],
     blindSides: ['n'],
     glazingDamage: 0.45,
+    // A run of seven identical panes at exact even spacing was the facade's
+    // loudest repeat. The rhythm is right — real windows are regular — so the
+    // variation goes into their state: roughly one in six is boarded over.
+    boardedChance: 0.17,
     entrances: [{ side: 'e', at: -12, width: 1.3, open: 1.1 }],
     shopfronts: [{ side: 'e', at: -18, width: 4.2, broken: 0.55 }],
     balconies: [{ side: 'e', at: -9, width: 2.4, level: 2 }],
@@ -406,6 +568,10 @@ function cafe(chunk: Chunk): BlockResult {
     ridgeRise: 2.2,
     windowSpacing: 2.7,
     glazingDamage: 0.3,
+    // A run of seven identical panes at exact even spacing was the facade's
+    // loudest repeat. The rhythm is right — real windows are regular — so the
+    // variation goes into their state: roughly one in six is boarded over.
+    boardedChance: 0.17,
     openSides: ['n', 'w', 's', 'e'],
     shopfronts: [{ side: 'e', at: 3, width: 5.4, broken: 0.4, signKey: 'signGlow' }],
     entrances: [{ side: 'e', at: 9, width: 1.2, open: 1.4 }],
@@ -604,6 +770,10 @@ function warehouse(chunk: Chunk): BlockResult {
     windowHeight: 1.5,
     sill: 6.4,
     glazingDamage: 0.7,
+    // A run of seven identical panes at exact even spacing was the facade's
+    // loudest repeat. The rhythm is right — real windows are regular — so the
+    // variation goes into their state: roughly one in six is boarded over.
+    boardedChance: 0.17,
     openSides: ['n', 'w', 's', 'e'],
     entrances: [{ side: 'w', at: -12, width: 1.4, open: 1.8 }],
     extraOpenings: [
@@ -703,6 +873,10 @@ function offices(chunk: Chunk): BlockResult {
     windowHeight: 1.85,
     sill: 0.85,
     glazingDamage: 0.4,
+    // A run of seven identical panes at exact even spacing was the facade's
+    // loudest repeat. The rhythm is right — real windows are regular — so the
+    // variation goes into their state: roughly one in six is boarded over.
+    boardedChance: 0.17,
     openSides: ['n', 'w', 's', 'e'],
     entrances: [{ side: 'w', at: 12, width: 1.7, open: 1.6 }],
     interior: 'full',
@@ -745,6 +919,10 @@ function garage(chunk: Chunk): void {
     windowHeight: 1.1,
     sill: 2.6,
     glazingDamage: 0.9,
+    // A run of seven identical panes at exact even spacing was the facade's
+    // loudest repeat. The rhythm is right — real windows are regular — so the
+    // variation goes into their state: roughly one in six is boarded over.
+    boardedChance: 0.17,
     holes: [
       { side: 'w', at: 44, width: 4.4, level: 0, height: 3.4 },
       { side: 'n', at: 34, width: 3.2, level: 0, height: 3.2 },
@@ -782,6 +960,10 @@ function apartmentS(chunk: Chunk): BlockResult {
     windowSpacing: 3.0,
     windowWidth: 1.2,
     glazingDamage: 0.45,
+    // A run of seven identical panes at exact even spacing was the facade's
+    // loudest repeat. The rhythm is right — real windows are regular — so the
+    // variation goes into their state: roughly one in six is boarded over.
+    boardedChance: 0.17,
     openSides: ['n', 'w', 's', 'e'],
     entrances: [{ side: 'n', at: -9, width: 1.35, open: 1.2 }],
     balconies: [
@@ -827,15 +1009,47 @@ function apartmentS(chunk: Chunk): BlockResult {
     const cy = 2.4 + Math.sin(am) * (r + 0.14);
     const w = (Math.PI * r) / seg * 0.62;
     vault.pushTRS(cx, cy, (f.z0 + f.z1) * 0.5, 0, 0, am - Math.PI / 2);
-    vault.box(0, 0, 0, w, 0.14, (f.z1 - f.z0) * 0.5 - 0.4, 2.0);
+    vault.box(0, 0, 0, w, 0.14, (f.z1 - f.z0) * 0.5 - 0.4, 0.95);
     vault.pop();
   }
-  // passage side walls
+  // Passage side walls.
+  //
+  // The masonry module here used to run at 2.2 m per texture repeat, which put
+  // roughly 80 × 30 cm blocks on a 4 m passage — three courses across the whole
+  // opening, and the single clearest scale error on the map. At 0.95 m the
+  // module is about 35 × 13 cm: small ashlar, which is what a carriage arch in
+  // a provincial apartment block is actually built from, and it gives the eye
+  // ten units across the passage to measure against.
   for (const s of [-1, 1]) {
     vault.boxMinMax(
       passX + s * 2.0 - (s > 0 ? 0 : 0.35), -0.4, f.z0 + 0.35,
-      passX + s * 2.0 + (s > 0 ? 0.35 : 0), 2.6, f.z1 - 0.35, 2.2,
+      passX + s * 2.0 + (s > 0 ? 0.35 : 0), 2.6, f.z1 - 0.35, 0.95,
     );
+    // String course at springing level and a chamfered wheel guard at the foot:
+    // two more horizontals to read the passage's height against.
+    const trim = chunk.m('stoneTrim');
+    trim.boxMinMax(
+      passX + s * 2.0 - (s > 0 ? 0.06 : 0.4), 2.52, f.z0 + 0.3,
+      passX + s * 2.0 + (s > 0 ? 0.4 : 0.06), 2.68, f.z1 - 0.3, 0.8,
+    );
+    trim.boxMinMax(
+      passX + s * 2.0 - (s > 0 ? 0.02 : 0.44), 0.0, f.z0 + 0.3,
+      passX + s * 2.0 + (s > 0 ? 0.44 : 0.02), 0.34, f.z1 - 0.3, 0.8,
+    );
+    // Corner guard stones at both mouths, canted the way a cart would hit them.
+    for (const ez of [f.z0 + 0.42, f.z1 - 0.42]) {
+      trim.pushTRS(passX + s * 1.86, 0.0, ez, 0, 0, s * 0.10);
+      trim.box(0, 0.42, 0, 0.16, 0.42, 0.16, 0.5);
+      trim.pop();
+    }
+    // Conduit and a junction box along one wall, at a believable 1.9 m.
+    if (s > 0) {
+      const pipe = chunk.m('pipe');
+      pipe.boxMinMax(passX + 1.94, 1.88, f.z0 + 0.5, passX + 2.0, 1.96, f.z1 - 0.5, 0.6);
+      for (const ez of [f.z0 + 3.2, f.z0 + 9.4, f.z1 - 3.6]) {
+        pipe.box(passX + 1.9, 1.92, ez, 0.09, 0.13, 0.1, 0.3);
+      }
+    }
   }
   slab(chunk, 'cobble', passX - 2.0, f.z0, passX + 2.0, f.z1, 0.02, 0.3);
 

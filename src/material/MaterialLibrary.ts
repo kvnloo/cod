@@ -114,10 +114,10 @@ const GROUND_BAND: Record<string, number> = {
 
 /** Per-family macro variation: wavelengths in metres, albedo + roughness gain. */
 const MACRO_DEFAULT: Record<string, [number, number, number, number]> = {
-  plaster: [6.5, 19, 0.125, 0.07],
-  concrete: [7.5, 24, 0.105, 0.06],
-  brick: [8.5, 26, 0.100, 0.05],
-  stone: [7.0, 21, 0.110, 0.06],
+  plaster: [5.0, 16, 0.185, 0.10],
+  concrete: [6.0, 19, 0.150, 0.09],
+  brick: [7.0, 21, 0.135, 0.07],
+  stone: [6.0, 18, 0.140, 0.08],
   tile: [5.0, 15, 0.070, 0.05],
   asphalt: [9.0, 28, 0.115, 0.06],
   ceilingPanel: [4.0, 12, 0.060, 0.04],
@@ -127,8 +127,74 @@ const MACRO_DEFAULT: Record<string, [number, number, number, number]> = {
   grass: [5.0, 15, 0.140, 0.05],
   mud: [5.5, 17, 0.125, 0.05],
   snow: [8.0, 24, 0.055, 0.04],
+  // A 12 m tram body tiles its 1.4 m paint-and-rust map nine times, and the
+  // blotch that reads so well on one panel becomes a stripe pattern along the
+  // whole flank. A strong metre-scale drift is the only thing that hides it.
+  metal: [4.5, 13.0, 0.170, 0.10],
+  metalThin: [4.0, 12.0, 0.150, 0.09],
+  diamondPlate: [3.0, 9.0, 0.110, 0.08],
+  aluminium: [3.0, 9.0, 0.080, 0.06],
+  pipe: [3.0, 9.0, 0.120, 0.08],
+  grate: [3.0, 9.0, 0.090, 0.07],
+  // Same story for a floor tiling one plank layout every metre.
+  wood: [4.0, 12.0, 0.165, 0.09],
+  woodThin: [3.4, 10.0, 0.170, 0.09],
+  plywood: [3.6, 11.0, 0.140, 0.08],
+  crate: [2.4, 7.0, 0.120, 0.08],
+  fabric: [3.0, 9.0, 0.110, 0.06],
+  sandbag: [2.6, 8.0, 0.120, 0.06],
+  rubber: [3.0, 9.0, 0.080, 0.05],
+  plastic: [3.0, 9.0, 0.090, 0.06],
+  cardboard: [2.6, 8.0, 0.130, 0.07],
+  carpet: [3.6, 11.0, 0.110, 0.06],
 };
 const MACRO_FALLBACK: [number, number, number, number] = [6.0, 18, 0.075, 0.05];
+
+/**
+ * World-space story layers: [patch, damp, traffic, metalWash].
+ *
+ * A tiling base map physically cannot say "this bay was resurfaced", "this
+ * corner never dries out", "this is where the wheels run" — every one of those
+ * is a fact about *position in the world*, so it has to live in the shader.
+ * Without them the ground plane holds a single value for sixty metres, which is
+ * the first thing a stranger picks the real game out on.
+ *
+ * Ground families get the full set. Vertical families still get patches (a
+ * facade is rendered in bays and repaired in patches) but almost no damp,
+ * because the gravity terms are gated on an up-facing normal anyway.
+ */
+const SURF_LAYERS: Record<string, [number, number, number, number]> = {
+  concrete: [0.95, 0.48, 0.80, 0],
+  asphalt: [1.00, 0.55, 0.95, 0],
+  stone: [0.90, 0.48, 0.75, 0],
+  brick: [0.70, 0.45, 0.30, 0],
+  plaster: [0.90, 0.30, 0.15, 0],
+  tile: [0.55, 0.60, 0.55, 0],
+  ceilingPanel: [0.35, 0.10, 0.05, 0],
+  dirt: [0.70, 0.62, 0.70, 0],
+  sand: [0.55, 0.60, 0.55, 0],
+  gravel: [0.70, 0.60, 0.65, 0],
+  grass: [0.55, 0.60, 0.35, 0],
+  mud: [0.60, 0.85, 0.75, 0],
+  snow: [0.40, 0.45, 0.60, 0],
+  metal: [0.45, 0.35, 0.40, 0.95],
+  metalThin: [0.40, 0.30, 0.30, 0.80],
+  diamondPlate: [0.35, 0.30, 0.45, 0.85],
+  aluminium: [0.25, 0.20, 0.30, 0.55],
+  grate: [0.30, 0.25, 0.35, 0.70],
+  pipe: [0.35, 0.30, 0.25, 0.60],
+  wood: [0.55, 0.45, 0.35, 0],
+  woodThin: [0.55, 0.45, 0.35, 0],
+  plywood: [0.50, 0.45, 0.30, 0],
+  crate: [0.45, 0.35, 0.25, 0],
+  cardboard: [0.45, 0.40, 0.20, 0],
+  rubber: [0.30, 0.30, 0.35, 0],
+  plastic: [0.35, 0.30, 0.25, 0],
+  fabric: [0.40, 0.30, 0.20, 0],
+  sandbag: [0.40, 0.35, 0.20, 0],
+  carpet: [0.40, 0.30, 0.25, 0],
+};
+const SURF_FALLBACK: [number, number, number, number] = [0.35, 0.25, 0.20, 0];
 
 const EMISSIVE_DEFAULT: Record<EmissiveKind, { gain: number; rate: number; temp: number }> = {
   none: { gain: 1, rate: 1, temp: 1 },
@@ -375,6 +441,14 @@ export class MaterialSystem implements System {
       const g = GROUND_BAND[arch.id];
       if (g) groundBand = new THREE.Vector3(0, 0.85, g);
     }
+    // The story layers cost about a dozen extra 3D noise fetches per fragment,
+    // which is nothing on a discrete GPU and is not free on an integrated one,
+    // so the low preset keeps the macro drift and drops the rest.
+    let surfaceLayers: THREE.Vector4 | null = null;
+    if (worldLayers && settings.preset !== 'low') {
+      const s = SURF_LAYERS[arch.id] ?? SURF_FALLBACK;
+      surfaceLayers = new THREE.Vector4(s[0], s[1], s[2], s[3]);
+    }
 
     const cfg: ShaderExtensionConfig = {
       tile,
@@ -382,9 +456,17 @@ export class MaterialSystem implements System {
       triplanarSharpness: arch.shader?.triplanarSharpness ?? 6,
       detail: !!detailMap,
       detailMap,
-      detailScale: (arch.shader?.detailScale ?? 12) / Math.max(tile / set.tile, 0.05),
+      // The authored figures are repeats per metre of a 512 map whose own
+      // features sit at ~1/34 of a repeat, so a value of 30 asks for 1 mm
+      // grain — an order of magnitude below a pixel at any range the player
+      // ever sees, which is why gravel, tarmac and roofing all resolved as
+      // sensor noise rather than as a surface. Pulled back to a 2-3 mm grain.
+      detailScale: (arch.shader?.detailScale ?? 12) * 0.45 / Math.max(tile / set.tile, 0.05),
       detailStrength: arch.shader?.detailStrength,
-      detailFade: arch.shader?.detailFade ?? new THREE.Vector2(4, 14),
+      // A long, lazy cross-fade. The old 4-14 m window put the whole
+      // transition inside the part of the ground the player is looking at, so
+      // there was a readable arc on the street where the grain stopped.
+      detailFade: arch.shader?.detailFade ?? new THREE.Vector2(7, 26),
       pom: (opts.pom ?? arch.shader?.pom ?? false) && settings.preset !== 'low',
       pomDepth: arch.shader?.pomDepth ?? set.depth,
       pomShadow: (arch.shader?.pomShadow ?? false) && (settings.preset === 'ultra' || settings.preset === 'cinematic'),
@@ -397,8 +479,10 @@ export class MaterialSystem implements System {
       specularAA: true,
       normalFadeDistance: 9,
       macro,
+      surface: surfaceLayers,
       ground: groundBand,
       alphaFromMap,
+      uvVariation: arch.shader?.uvVariation ?? false,
       emissiveMode: EMISSIVE_MODES[emissiveKind],
     };
 

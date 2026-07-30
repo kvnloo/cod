@@ -70,6 +70,17 @@ export class CameraRig {
   /** Extra world-space offset applied by gameplay (e.g. hit reactions). */
   readonly externalOffset = new THREE.Vector3();
 
+  /**
+   * Smoothed prediction-error offset, written by the netcode's reconciler.
+   *
+   * When the server disagrees with a predicted position the *simulation* snaps
+   * immediately — anything else and every later step is computed from a
+   * position the server already rejected. The view must not snap with it, so
+   * the reconciler parks the difference here and decays it to zero over ~100 ms.
+   * Correct the error, not the player's eyes.
+   */
+  readonly predictionOffset = new THREE.Vector3();
+
   private readonly _q = new THREE.Quaternion();
   private readonly _e = new THREE.Euler(0, 0, 0, 'YXZ');
   private readonly _right = new THREE.Vector3();
@@ -224,6 +235,7 @@ export class CameraRig {
     const fwd = this._up.set(0, 0, -1).applyQuaternion(camera.quaternion);
     camera.position.addScaledVector(fwd, this.bobPos.z + this.shakeOffset.z);
     camera.position.add(this.externalOffset);
+    camera.position.add(this.predictionOffset);
 
     if (Math.abs(camera.fov - this.fovCurrent) > 0.001) {
       camera.fov = this.fovCurrent;
@@ -245,5 +257,6 @@ export class CameraRig {
     this.bobPos.set(0, 0, 0);
     this.landDip.set(0);
     this.externalOffset.set(0, 0, 0);
+    this.predictionOffset.set(0, 0, 0);
   }
 }

@@ -195,6 +195,10 @@ function stage(age: number, spawn: () => void, prepare?: () => void): () => void
     const fx = fxRef;
     if (!fx) return;
     fx.reset();
+    // Shafts are level dressing rather than a fired effect, so `reset()` leaves
+    // them alone — which means the shot that installs them has to be the shot
+    // that takes them away again.
+    fx.environment.clearShafts();
     // Ambient state is *not* part of reset(), so without this a shot that turns
     // the dust up leaks that setting into every shot captured after it.
     fx.environment.dust = STAGE_DUST;
@@ -214,6 +218,64 @@ function stage(age: number, spawn: () => void, prepare?: () => void): () => void
 }
 
 const V = (x: number, y: number, z: number): THREE.Vector3 => new THREE.Vector3(x, y, z);
+const UP = new THREE.Vector3(0, 1, 0);
+
+/**
+ * Installs a rank of volumetric shafts across the current sightline.
+ *
+ * Anchored to the shot camera and to the renderer's live sun rather than to any
+ * particular piece of level geometry, because the FX shots are captured against
+ * whatever level happens to be loaded — the `?debug=fx` colonnade only exists
+ * when someone asked for it explicitly. Each beam's "window" is parked upwind of
+ * the sightline so the beam crosses in front of the camera on its way down, and
+ * the shader ends it on whatever the depth buffer says is there.
+ */
+function installSunShafts(count = 7): void {
+  const fx = fxRef;
+  if (!fx) return;
+  const cam = fx.camera;
+  const travel = fx.sunDirection().negate().normalize();
+  // A beam that is not descending has nowhere to land; bail rather than lay a
+  // horizontal slab of haze across the whole frame.
+  if (travel.y > -0.12) return;
+
+  const fwd = new THREE.Vector3();
+  cam.getWorldDirection(fwd);
+  fwd.y = 0;
+  if (fwd.lengthSq() < 1e-6) fwd.set(0, 0, -1);
+  fwd.normalize();
+  const side = new THREE.Vector3().crossVectors(UP, fwd).normalize();
+
+  const rand = new Rand('fx:shafts');
+  const groundY = fx.floorUnder(cam.position.x, cam.position.y, cam.position.z);
+  // Height of the "window" the beam comes through — a roofline, near enough.
+  const drop = 8.0;
+  const run = drop / -travel.y;
+  for (let i = 0; i < count; i++) {
+    // Anchor each beam by where it *lands*, spread down the sightline. A shaft
+    // that ends on the ground in front of you reads as a beam; one that floats
+    // in mid-air reads as fog.
+    const land = cam.position.clone()
+      .addScaledVector(fwd, 6 + i * 2.9)
+      .addScaledVector(side, (i % 2 === 0 ? -1 : 1) * (0.8 + rand.next() * 3.0));
+    land.y = groundY;
+    const origin = land.clone().addScaledVector(travel, -run);
+    fx.addLightShaft(origin, travel, UP, {
+      width: 0.7 + rand.next() * 1.2,
+      height: 0.9 + rand.next() * 1.1,
+      // Stop just past the ground; the depth test trims the rest.
+      length: run + 2.5,
+      color: 0xffe0ab,
+      intensity: 0.16,
+      // Barely any axial decay: a beam this short is not losing much to
+      // extinction, and fading it out mid-air is what makes a shaft read as a
+      // smear of glare instead of light landing on the floor.
+      falloff: 0.35,
+      dust: 0.9,
+      followSun: true,
+    });
+  }
+}
 
 function impact(
   point: THREE.Vector3, normal: THREE.Vector3, surface: SurfaceType,
@@ -247,8 +309,14 @@ function burst(
 
 /* ----------------------------------------------------------------- scene -- */
 
-export function registerFxDebugScene(fx: FXSystem): void {
+export function registerFxDebugScene(fx: FXSystem, engine: EngineContext['engine']): void {
   fxRef = fx;
+  // Every FX shot is registered against whatever level is loaded, so the engine
+  // handle `stage()` needs to fast-forward an effect must be available even when
+  // the `?debug=fx` test bed was never built. Without it every shot captured at
+  // its 24-frame settle instead of the age it was authored for, which is why a
+  // five-second smoke screen used to read as a small puff.
+  engineRef = engine;
 
   registerDebugScene('fx', (ctx: EngineContext) => {
     engineRef = ctx.engine;
@@ -480,20 +548,8 @@ export function registerFxDebugScene(fx: FXSystem): void {
     render?.setTimeOfDay?.(15.2);
     render?.setWeather?.(0, 0.0, 0.3);
 
-    // Light shafts raking through the colonnade. The sun sits to the south
-    // (+Z) so a shaft heading +X and −Z lands on the open ground.
-    const shaftDir = new THREE.Vector3(1, -0.55, -0.32).normalize();
-    for (let i = 0; i < 4; i++) {
-      fx.addLightShaft(
-        V(colonnadeX + 0.6, 5.4, -5.5 + i * 5),
-        shaftDir,
-        V(0, 1, 0),
-        {
-          width: 3.4, height: 2.4, length: 20,
-          color: 0xffeccc, intensity: 0.9, falloff: 1.1, dust: 0.95,
-        },
-      );
-    }
+    // Shafts are installed per-shot (see `installSunShafts`), so they follow the
+    // camera and the sun instead of being nailed to this one colonnade.
   });
 
   /* ------------------------------------------------------------- shots -- */
@@ -579,8 +635,11 @@ export function registerFxDebugScene(fx: FXSystem): void {
         // A profile that tracers every round, 12 ms apart, so four of them sit
         // evenly down the firing line at capture instead of one blur. (An AR
         // tracers one round in four, which would put a single round off-frame.)
+        // A 340 m/s round crosses the visible width of the sightline in about
+        // 40 ms, so the firing point has to sit far enough off-frame that the
+        // rounds still in the air are the ones inside it.
         const dir = V(-1, 0.003, -0.028).normalize();
-        burst(V(15.5, 1.62, 2.1), dir, 4, false, 'sniper_test', 0.012, 0);
+        burst(V(21.0, 1.70, 2.1), dir, 6, false, 'sniper_test', 0.012, 0);
       }),
     },
     {
@@ -625,21 +684,30 @@ export function registerFxDebugScene(fx: FXSystem): void {
     {
       name: 'fx-smoke-grenade',
       description: 'Smoke screen at 5 s: a lit volume with a bright and a dark side that genuinely blocks the wall behind it',
-      position: [1.0, 1.70, 13.0], yaw: 5, pitch: 1, fov: 60, hour: HOUR, viewModel: false,
-      setup: stage(5.0, () => bus.emit('explosion', { point: V(0, 0.4, 2.0), radius: 5, power: 1, kind: 'smoke' })),
+      // The canister sits in open ground eight metres out, not up against the
+      // far side of the square: half a screen that has grown *into* a building
+      // is hidden behind it, and what is left reads as a veil.
+      position: [1.0, 1.62, 13.0], yaw: 5, pitch: -2, fov: 60, hour: HOUR, viewModel: false,
+      setup: stage(5.0, () => bus.emit('explosion', { point: V(0, 0.4, 5.2), radius: 5, power: 1, kind: 'smoke' })),
     },
     {
       name: 'fx-flashbang',
-      description: 'Flashbang bloom coordinated with the renderer screen white-out',
+      description: 'Flashbang at 100 ms seen from across the street: bloom, the light it throws, and a bleach on the frame that falls off with distance',
+      // The bloom disc and the flash light both live about 200 ms, so a frame
+      // sampled at 280 ms had nothing left to show but the white-out.
       position: [3.0, 1.70, 15.0], yaw: 11, pitch: -2, fov: 58, hour: HOUR, viewModel: false,
-      setup: stage(0.28, () => bus.emit('explosion', { point: V(0, 1.2, 2.0), radius: 4, power: 1, kind: 'flashbang' })),
+      setup: stage(0.10, () => bus.emit('explosion', { point: V(0, 1.2, 2.0), radius: 4, power: 1, kind: 'flashbang' })),
     },
     {
       name: 'fx-lightshafts',
-      description: 'Volumetric shafts through the colonnade with dust motes drifting in the beams',
-      position: [-12.0, 2.0, 8.0], yaw: 39, pitch: 5, fov: 65, hour: HOUR, viewModel: false,
+      description: 'Late-afternoon sun raking across the sightline in volumetric shafts, with dust drifting in the beams',
+      // A low sun is the whole point: shafts are additive, so they only read
+      // against a scene that has some shadow in it, and a near-horizontal beam
+      // crosses the frame instead of stabbing straight down out of shot.
+      position: [4.0, 1.80, 2.0], yaw: 105, pitch: 2, fov: 62, hour: 15.6, viewModel: false,
       setup: stage(4.0, () => { /* ambient dust only */ }, () => {
         if (fxRef) { fxRef.environment.dust = 1.0; fxRef.environment.litter = 0.35; }
+        installSunShafts();
       }),
     },
     {
@@ -647,6 +715,9 @@ export function registerFxDebugScene(fx: FXSystem): void {
       description: 'Rain: stretched streaks, splash rings on the deck and a wet, low-contrast sky',
       position: [4.0, 1.70, 8.0], yaw: 22, pitch: -3, fov: 62, hour: 16.5, viewModel: false,
       setup: stage(2.4, () => { /* steady state */ }, () => {
+        // Wet air does not carry dust or loose paper — and in this frame the
+        // ambient layers were the only thing you could see.
+        if (fxRef) { fxRef.environment.dust = 0.1; fxRef.environment.litter = 0; }
         fxRef?.setWeather(0.75, 0.35, 0.5);
       }),
     },

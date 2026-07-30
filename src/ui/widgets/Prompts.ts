@@ -18,6 +18,7 @@ import { clamp01, damp, Ease, Envelope, motion, Spring, SPRING } from '../Anim';
 import { chamferPath, hairWidth, measureText, text, wash } from '../Draw';
 import type { DrawCtx } from '../Draw';
 import type { HudModel } from '../Model';
+import { aboveSightY, belowSightY } from '../Sight';
 import { lift, rgba, type Palette } from '../Theme';
 import type { UiPromptRequest } from '../UiEvents';
 import type { Widget } from './Widget';
@@ -94,7 +95,11 @@ export class Prompts implements Widget {
     const vis = this.appear.value;
     if (vis > 0.004 && this.prompt) {
       const q = this.prompt;
-      const y = d.h * 0.605 + (1 - Ease.outBack(clamp01(vis))) * 12 * s * motion();
+      // Authored position at the hip, pushed clear of the optic as the player
+      // aims. A key cap and a hold ring painted on the glass of a sight is the
+      // loudest possible "laid out in screen percentages" tell.
+      const y = belowSightY(d, m, 26, d.h * 0.605)
+        + (1 - Ease.outBack(clamp01(vis))) * 12 * s * motion();
       const r = 17 * s;
 
       c.save();
@@ -126,7 +131,10 @@ export class Prompts implements Widget {
         c.stroke();
 
         if (this.progress > 0.001) {
-          c.strokeStyle = rgba(lift(p.accent, 0.25), 1);
+          // An interaction is not an objective. The ring runs in the neutral
+          // ink ramp; only the marker that says *where the objective is* keeps
+          // the accent.
+          c.strokeStyle = rgba(lift(p.ink, 0.4), 1);
           c.lineCap = 'round';
           c.beginPath();
           c.arc(cx, y, r, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * this.progress);
@@ -134,7 +142,7 @@ export class Prompts implements Widget {
           c.lineCap = 'butt';
           // Leading dot.
           const a = -Math.PI / 2 + Math.PI * 2 * this.progress;
-          c.fillStyle = rgba(lift(p.accent, 0.5), 1);
+          c.fillStyle = rgba(lift(p.ink, 0.7), 1);
           c.beginPath();
           c.arc(cx + Math.cos(a) * r, y + Math.sin(a) * r, 2.4 * s, 0, Math.PI * 2);
           c.fill();
@@ -160,40 +168,36 @@ export class Prompts implements Widget {
     if (done > 0.01) {
       c.save();
       c.globalAlpha = d.alpha * done;
-      c.strokeStyle = rgba(lift(p.accent, 0.4), 1);
+      c.strokeStyle = rgba(lift(p.ink, 0.5), 1);
       c.lineWidth = Math.max(1, 2 * s * done);
       c.beginPath();
-      c.arc(cx, d.h * 0.605, (17 + (1 - done) * 26) * s, 0, Math.PI * 2);
+      c.arc(cx, belowSightY(d, m, 26, d.h * 0.605), (17 + (1 - done) * 26) * s, 0, Math.PI * 2);
       c.stroke();
       c.restore();
     }
 
-    /* ------------------------------------------------- reload / ammo --- */
+    /* ------------------------------------------------------- reload ---- */
+    // Only the dry-magazine cue lives in the centre column, and it sits *above*
+    // the aperture rather than on it. The low-ammo warning has moved onto the
+    // ammunition readout itself, where the number it is talking about lives —
+    // it used to be painted across the middle of the sight picture during the
+    // exact seconds a player is most likely to be aiming.
     const w = m.weapon;
     if (w.ammo <= 0 && !w.reloading && m.alive) {
       const pulse = 0.65 + 0.35 * Math.sin(this.t * 8.5) * motion();
+      const ry = aboveSightY(d, m, 40);
       c.save();
       c.globalAlpha = d.alpha;
-      text(c, 'RELOAD', cx, d.h * 0.455, {
+      if (!d.cheap) wash(c, cx, ry - 4 * s, 180 * s, 30 * s, 0.4);
+      text(c, 'RELOAD', cx, ry, {
         size: 22 * s, weight: 700, family: 'cond', tracking: 7 * s, align: 'center',
         color: rgba(lift(p.hostile, 0.72), 0.75 + 0.25 * pulse),
         shadow: Math.max(1.4, 2 * s),
         glow: 18 * s, glowColor: rgba(p.hostile, 0.85 * pulse),
       });
-      text(c, '[ R ]', cx, d.h * 0.455 + 16 * s, {
+      text(c, '[ R ]', cx, ry + 16 * s, {
         size: 11 * s, weight: 600, family: 'mono', tracking: 2 * s, align: 'center',
         color: rgba(p.inkDim, 0.9),
-      });
-      c.restore();
-    } else if (w.magSize > 0 && w.ammo / w.magSize <= 0.25 && w.ammo > 0 && !w.reloading) {
-      c.save();
-      c.globalAlpha = d.alpha;
-      const y = d.h * 0.44;
-      if (!d.cheap) wash(c, cx, y - 5 * s, 190 * s, 26 * s, 0.42);
-      text(c, 'LOW AMMO', cx, y, {
-        size: 14 * s, weight: 700, family: 'cond', tracking: 5.5 * s, align: 'center',
-        color: rgba(p.warn, 0.78 + 0.22 * Math.sin(this.t * 5) * motion()),
-        shadow: Math.max(1, 1.2 * s), outline: 2.4 * s,
       });
       c.restore();
     }

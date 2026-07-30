@@ -22,6 +22,42 @@ import type { RenderUniforms } from './RenderUniforms';
 
 const DEG = Math.PI / 180;
 
+/**
+ * Angular radius of the sun disc, in radians.
+ *
+ * The real sun subtends 0.53° across, i.e. a radius of 0.0047 rad — which at
+ * 1080p is a seven-pixel dot that the tonemapper, TAA and bloom between them
+ * reduce to a smudge, and the reason a clipped-pixel census of this project
+ * came back at 0.0000%. Shipped games draw it roughly twice over-size for
+ * exactly that reason; this is 2.1×, which reads as a sun at 62–80° of field
+ * without becoming a cartoon.
+ */
+const SUN_ANGULAR_RADIUS = 0.0100;
+
+/**
+ * Radiance of the disc relative to the illuminance it delivers.
+ *
+ * Physically the ratio is ~1/Ω ≈ 1/6.8e-5, which no tonemapper can be given
+ * directly; what matters for the picture is that it sits far enough above
+ * display white that the core clips flat, the limb rolls off through orange
+ * over two or three stops, and a specular reflection of it in a window or a wet
+ * kerb also clips.
+ */
+const SUN_DISC_GAIN = 26;
+
+/**
+ * Brightness of the scattered sky, relative to the direct sun.
+ *
+ * Lowered from 22 in step with `SUN_BASE` going the other way. The camera and
+ * the ambient probe are fed by the same bake, so this is the sun-to-sky ratio
+ * knob: at 22 against a 16-strength sun the dome sat two and a half stops over
+ * mid-grey in every frame, which is where AgX and the highlight bleach in the
+ * grade strip out the last of its colour and hand back a milky white ceiling.
+ * The fill the sky used to provide is restored by the level's ambient
+ * intensity, which scales the probe without touching what the camera sees.
+ */
+const SKY_INTENSITY = 9.5;
+
 /* --------------------------------------------------- CPU-side atmosphere -- */
 
 const Rg = 6360000;
@@ -122,11 +158,34 @@ uniform vec4 uAtmo;       // x sunIntensity, y betaM, z mieG, w altitude
 uniform vec4 uNight;      // x nightAmount, y moonIntensity, z moonPhase, w airglow
 uniform vec4 uGround;     // xyz albedo, w bounce strength
 uniform vec4 uWeather;    // x greyness, y disc enable, z horizonHaze, w unused
+uniform vec4 uMs;         // x amount, y horizon falloff, z forward power, w disc gain
 uniform vec3 uFogTint;
 
 vec3 boSkyRadiance( vec3 dir ) {
 	vec3 transmittance;
 	vec3 col = boAtmosphere( dir, uAtmo.w, uSunDir, uAtmo.x, uAtmo.y, uAtmo.z, transmittance );
+
+	// --- multiple scattering, approximated.
+	//
+	// The integral above is single-scatter only: every photon that bounces more
+	// than once is thrown away. That is a fifth of the sky at midday and most of
+	// it near sunset, and because the missing light has already crossed the long
+	// slant path it is the *warm* part of the spectrum. Discarding it is exactly
+	// why a physical single-scatter sky measures bluer than a photograph at
+	// golden hour, at every hour we have ever shipped. Re-injecting it, tinted by
+	// the sun's own transmittance and piled up toward the horizon and toward the
+	// sun, is what turns 17:40 from a cold afternoon into an amber one.
+	{
+		float lum = max( boLuma( uSunLum ), 1e-4 );
+		vec3 tint = uSunLum / lum;
+		float horizon = exp( - max( dir.y, 0.0 ) * uMs.y );
+		float toward = pow( boSat( dot( dir, uSunDir ) * 0.5 + 0.5 ), uMs.z );
+		// Only near sunrise/sunset: a high sun has a short enough path that
+		// single scattering is already most of the answer. Full strength below
+		// 12 degrees of elevation, gone by 35.
+		float low = 1.0 - boSat( ( uSunDir.y - 0.21 ) * 2.7 );
+		col += tint * ( uMs.x * lum * low ) * ( 0.12 + 0.88 * horizon ) * ( 0.20 + 0.80 * toward );
+	}
 
 	// --- night: airglow gradient plus the moon's own scattered halo.
 	float night = uNight.x;
@@ -161,7 +220,7 @@ vec3 boSkyRadiance( vec3 dir ) {
 	col = mix( col, vec3( boLuma( col ) ) * uFogTint, uWeather.x );
 
 	if ( uWeather.y > 0.5 ) {
-		col += boSunDisc( dir, uSunDir, 0.0047, uSunDisc, 0.35 );
+		col += boSunDisc( dir, uSunDir, uMs.w, uSunDisc, 0.42 );
 	}
 
 	return max( col, vec3( 0.0 ) );
@@ -287,13 +346,25 @@ export interface SkyOptions {
 export class SkySystem {
   hours = 12;
   latitude = 34;
-  declination = 12;
+  /**
+   * Solar declination. Raised from 12° to 20° — high summer rather than late
+   * spring — which lifts the whole arc by four degrees and swings the afternoon
+   * azimuth nine degrees north of west. Both matter for what ends up on screen:
+   * the level's hero hour can sit at a genuine 11° golden hour and still clear
+   * the town's own rooflines on the way in, and the sun's own direction moves
+   * measurably closer to the cameras that look up the square. Noon goes to 76°,
+   * 18:06 to 10° and 23:12 to −35°, so midday, dusk and night stay firmly what
+   * they each are.
+   */
+  declination = 20;
   altitude = 40;
 
   /** Weather knobs, all 0..1. */
   rain = 0;
   fogAmount = 0;
   wind = 0.25;
+  /** Strength of the multiple-scattering warm-up applied at low sun. */
+  msAmount = 0.032;
 
   readonly sun: SunState = { direction: new THREE.Vector3(0, 1, 0), elevation: Math.PI / 2, azimuth: 0 };
   readonly moon: SunState = { direction: new THREE.Vector3(0, -1, 0), elevation: -Math.PI / 2, azimuth: 0 };
@@ -364,10 +435,11 @@ export class SkySystem {
       uMoonDir: { value: new THREE.Vector3(0, -1, 0) },
       uSunLum: { value: new THREE.Color(1, 1, 1) },
       uSunDisc: { value: new THREE.Color(1, 1, 1) },
-      uAtmo: { value: new THREE.Vector4(22, 21e-6, 0.76, this.altitude) },
+      uAtmo: { value: new THREE.Vector4(SKY_INTENSITY, 13e-6, 0.76, this.altitude) },
       uNight: { value: new THREE.Vector4(0, 0, 0, 1) },
       uGround: { value: new THREE.Vector4(0.21, 0.19, 0.16, 1) },
       uWeather: { value: new THREE.Vector4(0, disc, 0.05, 0) },
+      uMs: { value: new THREE.Vector4(0.032, 3.2, 4.0, SUN_ANGULAR_RADIUS) },
       uFogTint: { value: new THREE.Color(0.72, 0.74, 0.78) },
     });
 
@@ -461,8 +533,13 @@ export class SkySystem {
   }
 
   private get betaM(): number {
-    // Mie scattering coefficient rises with haze/rain (turbidity).
-    return 21e-6 * (1 + this.fogAmount * 2.6 + this.rain * 1.8);
+    // Mie scattering coefficient rises with haze/rain (turbidity). The clear-air
+    // base was 21e-6 — a hazy-city value that whitened the entire dome, so the
+    // sky measured near-neutral at every hour and read as overcast no matter
+    // what the sun was doing. 13e-6 is a clean continental atmosphere: deep blue
+    // at the zenith, and the warmth near the horizon then comes from the
+    // multiple-scattering term rather than from a uniform white veil.
+    return 13e-6 * (1 + this.fogAmount * 3.2 + this.rain * 2.2);
   }
 
   /** Cheap per-call update: directions, sun colour, night blend. */
@@ -480,7 +557,12 @@ export class SkySystem {
     this.nightFactor = 1 - THREE.MathUtils.smoothstep(sinEl, -0.14, 0.02);
 
     const weatherDim = 1 - 0.55 * this.rain - 0.35 * this.fogAmount;
-    const SUN_BASE = 16.0;
+    // Direct sun, relative to the sky's own scattered radiance. Raised from 16:
+    // the key-to-fill ratio is what makes a frame read as *sunlit* rather than
+    // as an overcast day with a warm filter, and with the meter anchored to the
+    // subject a stronger key also pushes the sky further down the tone curve,
+    // where it keeps its colour instead of bleaching toward white.
+    const SUN_BASE = 26.0;
 
     if (dayMask > 0.001) {
       this.sunIlluminance.copy(this.scratchColor).multiplyScalar(SUN_BASE * dayMask * Math.max(weatherDim, 0.12));
@@ -504,7 +586,7 @@ export class SkySystem {
     // Disc radiance: far brighter than the illuminance so it blows out on
     // camera the way a real sun does, but still tonemappable.
     if (dayMask > 0.001) {
-      this.sunDiscColor.copy(this.sunIlluminance).multiplyScalar(220 / Math.max(SUN_BASE, 1e-3));
+      this.sunDiscColor.copy(this.sunIlluminance).multiplyScalar(SUN_DISC_GAIN);
     } else {
       this.sunDiscColor.setRGB(0, 0, 0);
     }
@@ -544,7 +626,7 @@ export class SkySystem {
       (u.uSunLum.value as THREE.Color).copy(this.sunIlluminance);
       (u.uSunDisc.value as THREE.Color).copy(this.sunDiscColor);
       (u.uAtmo.value as THREE.Vector4).set(
-        22 * (1 - 0.35 * this.rain),
+        SKY_INTENSITY * (1 - 0.35 * this.rain),
         this.betaM,
         0.76 + 0.06 * this.fogAmount,
         this.altitude,
@@ -556,6 +638,14 @@ export class SkySystem {
       const w = u.uWeather.value as THREE.Vector4;
       w.x = this.rain * 0.55 + this.fogAmount * 0.35;
       w.z = 0.045 + this.fogAmount * 0.55 + this.rain * 0.3;
+      // Aerosol load feeds the multiple-scattering term: haze and smoke are what
+      // make a low sun paint the whole western sky rather than just its halo.
+      (u.uMs.value as THREE.Vector4).set(
+        this.msAmount * (1 + this.fogAmount * 1.4 + this.rain * 0.6),
+        3.2,
+        4.0,
+        SUN_ANGULAR_RADIUS,
+      );
       (u.uFogTint.value as THREE.Color).copy(this.uniforms.boFogTint.value);
     }
   }
@@ -687,8 +777,15 @@ export class SkySystem {
     const moonUp = THREE.MathUtils.smoothstep(this.moon.direction.y, -0.04, 0.2);
     const moonPhase = ((this.hours / 24) * 0.7 + 2.1) % (Math.PI * 2);
     (u.uSunParams.value as THREE.Vector4).set(
-      0.0047,
-      1 - 0.45 * this.rain,
+      SUN_ANGULAR_RADIUS,
+      // Circumsolar glare. At 1.0 against a disc this bright the widest term
+      // alone clears display white across twenty degrees of sky, which is how
+      // "sun disc" turned into "the top half of the frame is paper"; at 0.45
+      // the core and the first few degrees clip and it rolls off through orange
+      // from there. That rolloff is what still reads as a sun on the days the
+      // disc itself is behind the ridge, which at 11 degrees of elevation is
+      // most of them.
+      0.45 * (1 - 0.45 * this.rain),
       this.nightFactor * moonUp * 3.2,
       moonPhase,
     );

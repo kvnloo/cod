@@ -7,7 +7,8 @@
  *  - grain is Gaussian, animated with a golden-ratio-rotated blue-noise mask, and
  *    weighted toward the shadows the way silver-halide grain actually behaves
  *    (visible grain in the highlights is the classic wrong-looking version)
- *  - the vignette is the physical cos⁴ falloff plus a small artistic term
+ *  - the vignette is a shallow corner falloff, flat across the middle of the
+ *    frame — a lens, not a painted-on border
  *  - aberration is lateral: zero at the optical centre, growing with r², sampled
  *    as a short spectral smear rather than three hard fringes
  *  - an ordered dither breaks up the banding an 8-bit backbuffer would show in
@@ -20,6 +21,19 @@ import { BasePass } from './PassBase';
 import type { PostResources } from './Shared';
 
 const GRAIN_FRAG = /* glsl */ `
+// Field height at which the vignette starts to bite, and its depth at the very
+// corner when uVignette = 1. At the shipped default (0.4) the corner loses
+// 0.30 * 0.4 = 12%, about a fifth of a stop, and frame centre-top loses 1%.
+#define VIGNETTE_START 0.38
+#define VIGNETTE_DEPTH 0.30
+
+// Peak-to-peak scale of the grain variate. At the shipped default
+// (settings.filmGrain = 0.35) this lands around 2 levels of standard deviation
+// in the mid-shadows and half a level in the highlights, measured on a flat
+// patch of an 8-bit frame. The old 0.055 produced 0.4 levels, i.e. less than
+// the output dither, which is why every gradient read as clean CG.
+#define GRAIN_GAIN 0.080
+
 in vec2 vUv;
 uniform sampler2D tInput;
 uniform vec2 uTexel;
@@ -65,32 +79,47 @@ vec3 sampleAberrated(vec2 uv, float amount) {
 void main() {
   vec3 color = sampleAberrated(vUv, uAberration);
 
-  /* --- vignette: physical cos^4 plus a gentle artistic falloff ------------ */
+  /* --- vignette ------------------------------------------------------------
+     Normalised field height: 0 at the optical centre, exactly 1 in the corner,
+     whatever the aspect ratio. The falloff is flat across the middle of the
+     frame and reaches its full (small) depth only in the corner.
+
+     The cos^4 law this used to implement is physically true of an *uncorrected*
+     optic and costs about 1.4 stops in the corner of a 70-degree frame. No lens
+     a camera actually ships with looks like that, because the design and the
+     body's digital correction take most of it out; measure a shipped game frame
+     and the corner is a fifth of a stop down, not two thirds. Anything more
+     stops being a lens and starts being a dark border painted over the image,
+     eating the scene information in the corners. */
   if (uVignette > 0.0) {
-    vec2 d = (vUv - 0.5) * vec2(uResolution.x / uResolution.y, 1.0);
-    float r = length(d) * 1.32;
-    float cosTheta = 1.0 / sqrt(1.0 + r * r);
-    float natural = cosTheta * cosTheta * cosTheta * cosTheta;
-    float artistic = smoothstep(1.15, 0.32, r);
-    color *= mix(1.0, natural * mix(1.0, artistic, 0.65), uVignette);
+    vec2 aspect = vec2(uResolution.x / max(uResolution.y, 1.0), 1.0);
+    vec2 d = (vUv - 0.5) * aspect;
+    float rn = length(d) / max(length(aspect) * 0.5, 1e-4);
+    float falloff = smoothstep(VIGNETTE_START, 1.02, rn);
+    color *= 1.0 - uVignette * VIGNETTE_DEPTH * falloff;
   }
 
   /* --- grain -------------------------------------------------------------- */
   vec4 n = blueNoise4T(gl_FragCoord.xy, uFrame);
   if (uGrain > 0.0) {
     // Two decorrelated blue-noise taps make an approximately Gaussian variate.
-    float g1 = n.x + n.y - 1.0;
+    // A white-noise tap is mixed in on top: the mask is a 64x64 tile, and at an
+    // amplitude you can actually see, pure blue noise repeats visibly and reads
+    // as a screen-door pattern rather than as film.
+    float g1 = (n.x + n.y - 1.0) * 0.72
+             + (hash12(gl_FragCoord.xy + uFrame * 37.19) - 0.5) * 0.95;
     float g2 = n.z + n.w - 1.0;
     float lum = luma(color);
-    // Silver-halide response: grain peaks in the mid-shadows, vanishes in the
-    // highlights, and scales down as exposure (and therefore signal) rises.
-    float response = pow(1.0 - lum, 2.2) * (0.30 + 0.70 * smoothstep(0.0, 0.20, lum));
+    // Silver-halide response: grain is strongest in the mid-shadows and fades
+    // out of the highlights (visible grain in a bright sky is the wrong-looking
+    // version), with a small toe so crushed blacks are not lifted by it.
+    float response = pow(1.0 - lum, 1.3) * (0.55 + 0.45 * smoothstep(0.0, 0.12, lum));
     float amount = uGrain * response * uExposureScale;
     // Grain is overwhelmingly a luminance phenomenon. Giving R and B fully
     // decorrelated noise (which is what independent g1/g2 does) reads as
     // magenta/green chroma speckle in the shadows, not as film.
     vec3 chroma = vec3(g2, -0.5 * g2, 0.35 * g2) * 0.16;
-    color += (vec3(g1) + chroma) * amount * 0.055;
+    color += (vec3(g1) + chroma) * amount * GRAIN_GAIN;
   }
 
   /* --- dither ------------------------------------------------------------- */

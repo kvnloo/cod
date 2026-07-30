@@ -48,9 +48,45 @@ export interface BuildCtx {
   upperMidY: number;
   /** Optical axis height of the fitted sight, or 0 when there is no optic. */
   opticAxisY: number;
+  /**
+   * True for the first-person build only. Hands, forearms and anything else
+   * that exists solely because someone is holding the weapon key off this; the
+   * catalogue and third-person builds share every other line of the builder.
+   */
+  viewSpace: boolean;
+  /** Where the firing hand goes — filled in by `pistolGrip`. */
+  grip: GripAnchor | null;
+  /** Where the support hand goes — filled in by `handguard` (or an assembly). */
+  support: SupportAnchor | null;
+  /** Face of the trigger, so the index finger can land on it. */
+  triggerFace: THREE.Vector3 | null;
 }
 
-export function makeCtx(b: RigBuilder, def: WeaponDef, attachments: readonly AttachmentDef[]): BuildCtx {
+/** Pose of the pistol grip, recorded so the firing hand can be wrapped on it. */
+export interface GripAnchor {
+  /** Top of the grip, on its centre line. */
+  top: THREE.Vector3;
+  /** Unit vector down the grip. */
+  down: THREE.Vector3;
+  length: number;
+  /** Effective radius of the grip section. */
+  radius: number;
+}
+
+/** Pose of whatever the support hand holds. */
+export interface SupportAnchor {
+  /** Point on the axis, at the middle of the hand. */
+  at: THREE.Vector3;
+  /** Unit vector along the held object; the hand wraps around this. */
+  axis: THREE.Vector3;
+  radius: number;
+  /** Rig part the hand rides — `pump` on a shotgun, `receiver` otherwise. */
+  node: string;
+}
+
+export function makeCtx(
+  b: RigBuilder, def: WeaponDef, attachments: readonly AttachmentDef[], viewSpace = true,
+): BuildCtx {
   const slot = new Map<AttachmentSlot, AttachmentDef>();
   for (const a of attachments) slot.set(a.slot, a);
   const m = def.model;
@@ -72,6 +108,10 @@ export function makeCtx(b: RigBuilder, def: WeaponDef, attachments: readonly Att
     lowerTop: topY - upperH,
     upperMidY: topY - upperH * 0.5,
     opticAxisY: 0,
+    viewSpace,
+    grip: null,
+    support: null,
+    triggerFace: null,
   };
 }
 
@@ -130,6 +170,9 @@ export function upperReceiver(ctx: BuildCtx): void {
   // Ejection port: a recessed rectangular well on the right side.
   const portZ = m.ejectPort[2];
   const portY = m.ejectPort[1];
+  // Brass leaves the gun over this lip a few hundred times a magazine: the
+  // finish is polished off it, and carbon collects in the well behind.
+  ctx.b.wearZone([w * 0.5, portY, portZ], 0.040, 2.2, 1.9);
   b.add(xf(chamferBox(0.006, 0.026, 0.062, 0.0012), { pos: [w * 0.5 - 0.001, portY, portZ] }), ctx.body);
   // Deflector wedge just behind the port.
   b.add(xf(loft([
@@ -194,6 +237,10 @@ export function lowerReceiver(ctx: BuildCtx, magWellZ: number, magWellDepth = 0.
     { at: [0, lowerTop - magWellDepth * 0.6, magWellZ], w: mw * 0.62, h: 0.019, sq: 7 },
     { at: [0, lowerTop - magWellDepth, magWellZ], w: mw * 0.66, h: 0.021, sq: 7 },
   ], 14, true, false), ctx.body);
+  // Grit and carbon pool at the throat of the magwell, and the flare gets
+  // scraped bright by every magazine that has ever been slammed into it.
+  b.wearZone([0, lowerTop - magWellDepth, magWellZ], 0.036, 1.9, 2.1);
+
   // Flared lip so the well does not end in a raw edge. Open at both ends: the
   // magazine passes through it.
   b.add(loft([
@@ -234,7 +281,9 @@ export function lowerReceiver(ctx: BuildCtx, magWellZ: number, magWellDepth = 0.
   b.add(xf(chamferBox(0.0035, 0.0055, 0.019, 0.0007),
     { pos: [-w * 0.47 - 0.0035, lowerTop - 0.006, -0.038] }), ctx.body);
 
-  // Trigger — animated on every shot.
+  // Trigger — animated on every shot. The finger pad rides the *forward* face
+  // of the blade, because a trigger is pulled rearward, not pushed.
+  ctx.triggerFace = new THREE.Vector3(0, guardY - 0.015, magWellZ + 0.026);
   b.part('trigger', [0, guardY - 0.006, magWellZ + 0.038]);
   b.add(xf(prismX([
     [0.004, 0.000], [0.006, -0.006], [0.004, -0.017], [-0.002, -0.019], [-0.004, -0.010], [-0.003, 0.000],
@@ -268,6 +317,21 @@ export function pistolGrip(ctx: BuildCtx, o: GripOptions): void {
     o.top[1] + dy * o.length * t,
     o.top[2] + dz * o.length * t,
   ];
+
+  // Hand anchor: the firing hand wraps this, so record it before any geometry
+  // is emitted. Only the first grip on a weapon counts — a folding foregrip is
+  // not where the trigger is.
+  if (!ctx.grip) {
+    ctx.grip = {
+      top: new THREE.Vector3(o.top[0], o.top[1], o.top[2]),
+      down: new THREE.Vector3(0, dy, dz).normalize(),
+      length: o.length,
+      radius: (o.width * 0.5 + o.depth * 0.5) * 0.5,
+    };
+  }
+
+  // The palm polishes the grip; the web of the hand polishes the tang.
+  b.wearZone(at(0.5), 0.062, 1.45, 0.5);
 
   // The loft starts *above* the joint so its end cap is buried inside the
   // lower receiver. A cap left in the open is a flat plate hanging in mid-air,
@@ -505,6 +569,16 @@ export function handguard(ctx: BuildCtx): void {
 
   b.part('receiver');
 
+  // Support-hand anchor: two thirds of the way down the handguard, which is
+  // where a shooter's hand actually sits — far enough forward to control the
+  // muzzle, far enough back to clear the gas block.
+  ctx.support = {
+    at: new THREE.Vector3(0, 0, z0 - len * 0.46),
+    axis: new THREE.Vector3(0, 0, -1),
+    radius: R * 1.02,
+    node: 'receiver',
+  };
+
   // A free-float tube is narrower than the receiver, so it needs a riser web
   // to carry the top rail forward at exactly the receiver's rail height. This
   // is the single detail that makes a modern rifle silhouette read correctly.
@@ -572,6 +646,10 @@ export function handguard(ctx: BuildCtx): void {
     default:
       break;
   }
+
+  // Where the support hand sits the finish is burnished smooth rather than
+  // worn through, so the zone lifts the edge (polish) and suppresses grime.
+  b.wearZone([0, 0, z0 - len * 0.46], 0.075, 1.5, 0.45);
 
   // Handstop / sling socket underneath — always present so the hand has a home.
   b.add(xf(slingSocket(0.0055), { pos: [R * 0.72, -R * 0.62, z0 - len * 0.35], rot: [0, Math.PI / 2, 0] }), ctx.body);
@@ -769,10 +847,13 @@ export function optic(ctx: BuildCtx, att: AttachmentDef): void {
     });
   };
 
+  // Mounts are hard-anodised matte black, like the optic they carry — routing
+  // them through the bead-blasted `alu` recipe put a bright speckled block
+  // directly under the sight picture on every weapon in the game.
   const mount = (w: number, len: number, h: number, z: number): void => {
-    b.add(xf(chamferBox(w, h, len, 0.0012), { pos: [0, railTop + h / 2, z] }), 'alu');
-    b.add(xf(chamferBox(w * 0.42, h * 0.9, 0.008, 0.0008), { pos: [w * 0.62, railTop + h * 0.45, z] }), 'alu');
-    b.add(xf(hexHead(0.0028, 0.0020), { pos: [w * 0.62, railTop + h * 0.95, z], rot: [0, 0, 0] }), 'alu');
+    b.add(xf(chamferBox(w, h, len, 0.0012), { pos: [0, railTop + h / 2, z] }), 'black');
+    b.add(xf(chamferBox(w * 0.42, h * 0.9, 0.008, 0.0008), { pos: [w * 0.62, railTop + h * 0.45, z] }), 'black');
+    b.add(xf(hexHead(0.0028, 0.0020), { pos: [w * 0.62, railTop + h * 0.95, z], rot: [0, 0, 0] }), 'black');
   };
 
   switch (kind) {
@@ -806,10 +887,18 @@ export function optic(ctx: BuildCtx, att: AttachmentDef): void {
         { pos: [r * 0.84, cy, mountZ + len * 0.10], rot: [0, Math.PI / 2, 0] }), mat);
       b.add(xf(lathe([[0, 0.0074], [0.005, 0.0074], [0.006, 0.0060]], 12),
         { pos: [0, cy + r * 0.84, mountZ + len * 0.18], rot: [-Math.PI / 2, 0, 0] }), mat);
-      b.add(xf(chamferBox(0.020, h + r * 0.7, len * 0.42, 0.0010),
-        { pos: [0, railTop + (h + r * 0.7) * 0.5, mountZ + len * 0.02] }), 'alu');
+      // Support bridge. It has to stop at the *bottom of the tube*: any part of
+      // it that reaches higher stands inside the clear aperture, and the
+      // shooter then aims over an opaque grey shelf occupying the lower third
+      // of the sight picture. That shelf was the single worst defect on the
+      // most-photographed optic in the game.
+      b.add(xf(chamferBox(0.020, h, len * 0.42, 0.0010),
+        { pos: [0, railTop + h * 0.5, mountZ + len * 0.02] }), 'black');
       ctx.sight.set(0, cy, k - 0.004);
-      mark('dot', f + 0.004, cy, (r - wall) * 0.86, 44.0, 0xff3a12, 6.5);
+      // 26 MOA of quad with the mark at 0.26 of it puts the dot at ~7 MOA —
+      // a couple of times life size, which is what every shipped shooter does
+      // so the dot survives a screenshot, but a quarter of what was here.
+      mark('dot', f + 0.004, cy, (r - wall) * 0.86, 26.0, 0xff2d0c, 5.2);
       ctx.opticAxisY = cy;
       break;
     }
@@ -839,7 +928,7 @@ export function optic(ctx: BuildCtx, att: AttachmentDef): void {
       b.add(xf(chamferBox(hw * 2.0, r * 0.62, len * 0.40, 0.0014),
         { pos: [0, cy - hh - r * 0.30, mountZ - len * 0.26] }), mat);
       b.add(xf(chamferBox(hw * 1.5, r * 0.34, len * 0.16, 0.0010),
-        { pos: [0, cy - hh - r * 0.62, mountZ - len * 0.30] }), 'alu');
+        { pos: [0, cy - hh - r * 0.62, mountZ - len * 0.30] }), 'black');
       // Rear glass: what the hologram is projected onto.
       b.add(xf(chamferBox(hw * 1.9, hh * 1.85, 0.0022, 0.0005),
         { pos: [0, cy, mountZ + len * 0.28] }), 'lens');
@@ -849,7 +938,7 @@ export function optic(ctx: BuildCtx, att: AttachmentDef): void {
           { pos: [-hw - 0.004, cy - hh - r * 0.30, mountZ - len * 0.16 + s * 0.010] }), mat);
       }
       ctx.sight.set(0, cy, mountZ + len * 0.46);
-      mark('holoRing', mountZ + len * 0.26, cy, hh * 0.92, 38, 0xff2a10, 5.0);
+      mark('holoRing', mountZ + len * 0.26, cy, hh * 0.92, 34, 0xff2410, 4.2);
       ctx.opticAxisY = cy;
       break;
     }
@@ -894,9 +983,9 @@ export function optic(ctx: BuildCtx, att: AttachmentDef): void {
       // Two ring mounts.
       for (const z of [mountZ - len * 0.22, mountZ + len * 0.16]) {
         b.add(xf(chamferBox(0.024, Math.max(0.004, h), 0.020, 0.0012),
-          { pos: [0, railTop + Math.max(0.004, h) / 2, z] }), 'alu');
-        b.add(xf(torusZ(r * 0.72, 0.0042, 18, 8), { pos: [0, railTop + Math.max(0.004, h) + r * 0.72, z] }), 'alu');
-        b.add(xf(hexHead(0.0026, 0.0018), { pos: [r * 0.55, railTop + Math.max(0.004, h) + r * 1.10, z], rot: [0, 0, 0.5] }), 'alu');
+          { pos: [0, railTop + Math.max(0.004, h) / 2, z] }), 'black');
+        b.add(xf(torusZ(r * 0.72, 0.0042, 18, 8), { pos: [0, railTop + Math.max(0.004, h) + r * 0.72, z] }), 'black');
+        b.add(xf(hexHead(0.0026, 0.0018), { pos: [r * 0.55, railTop + Math.max(0.004, h) + r * 1.10, z], rot: [0, 0, 0.5] }), 'black');
       }
       const cy = railTop + Math.max(0.004, h) + r * 0.72;
       b.add(xf(lathe([
@@ -911,6 +1000,11 @@ export function optic(ctx: BuildCtx, att: AttachmentDef): void {
       }
       b.add(xf(disc(r * 0.94, 0, -1, 24), { pos: [0, cy, mountZ - len * 0.49] }), 'lens');
       b.add(xf(disc(r * 0.60, 0, 1, 20), { pos: [0, cy, mountZ + len * 0.485] }), 'lens');
+      // NOTE: no eyecup. A flared rubber cup is the correct part and it is what
+      // produces real "scope shadow", but at this eye relief it subtends most
+      // of the frame, and a screen-filling grey annulus is a worse defect than
+      // the one it fixes. Scope shadow wants a screen-space vignette keyed off
+      // the ADS blend, which lives in the post stack rather than in the mesh.
       // Turrets with click marks.
       b.add(xf(lathe([[0, 0.0090], [0.010, 0.0090], [0.011, 0.0074]], 14),
         { pos: [0, cy + r * 0.70, mountZ - len * 0.02], rot: [-Math.PI / 2, 0, 0] }), mat);

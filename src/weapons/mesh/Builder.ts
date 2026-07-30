@@ -20,8 +20,38 @@
 import * as THREE from 'three';
 import type { MaterialKey } from '../types';
 import type { MaterialSpace, WeaponMaterials } from '../WeaponMaterials';
-import { bakeWear, merge, projectUV, triangleCount } from './Geo';
-import { WEAPON_TEXEL_SCALE } from '../WeaponMaterials';
+import { bakeWear, merge, projectUV, triangleCount, type WearZone } from './Geo';
+import { weaponTexelScale } from '../WeaponMaterials';
+
+/**
+ * How hard a life each named part has.
+ *
+ * Wear is not uniform across a weapon and pretending it is produces the
+ * "sandpaper" look: one speckle field at one amplitude on every component. A
+ * charging handle is grabbed with a gloved fist several times a minute; a
+ * buttstock is only ever put on a shoulder. Two numbers per part buys the
+ * difference, and it costs nothing at runtime because it scales the baked
+ * vertex attribute rather than adding a uniform.
+ */
+const PART_WEAR: Record<string, { edge: number; cavity: number }> = {
+  charging: { edge: 2.0, cavity: 1.1 },
+  boltHandle: { edge: 2.1, cavity: 1.0 },
+  bolt: { edge: 1.5, cavity: 1.5 },
+  slide: { edge: 1.6, cavity: 1.2 },
+  pump: { edge: 1.7, cavity: 1.2 },
+  trigger: { edge: 1.8, cavity: 1.0 },
+  selector: { edge: 1.9, cavity: 1.0 },
+  dustCover: { edge: 1.5, cavity: 1.3 },
+  magazine: { edge: 1.4, cavity: 1.7 },
+  lifter: { edge: 1.5, cavity: 1.3 },
+  belt: { edge: 1.2, cavity: 1.5 },
+  stock: { edge: 0.85, cavity: 1.3 },
+  optic: { edge: 0.7, cavity: 1.1 },
+  // Cloth and leather do not wear like steel: the "edge" channel on a glove is
+  // the polish on a proud fold, and it wants to stay gentle.
+  handLeft: { edge: 0.8, cavity: 1.25 },
+  handRight: { edge: 0.8, cavity: 1.25 },
+};
 
 interface PartSpec {
   name: string;
@@ -77,6 +107,7 @@ export class RigBuilder {
   private current: PartSpec;
   private points = new Map<string, THREE.Vector3>();
   private reticleSpec: RigReticle | null = null;
+  private zones: WearZone[] = [];
 
   constructor(private mats: WeaponMaterials, private space: MaterialSpace = 'view') {
     this.current = this.declare('root', null, [0, 0, 0]);
@@ -144,7 +175,33 @@ export class RigBuilder {
     return this;
   }
 
+  /**
+   * Declares a localised wear hot spot in weapon-local space.
+   *
+   * This is what puts carbon in the magwell throat, bright rub on the lip of
+   * the ejection port and polish where a palm sits, instead of spreading the
+   * same statistical noise over the whole gun.
+   */
+  wearZone(at: readonly [number, number, number], r: number, edge: number, cavity: number): this {
+    this.zones.push({ x: at[0], y: at[1], z: at[2], r, edge, cavity });
+    return this;
+  }
+
   hasPart(name: string): boolean { return this.byName.has(name); }
+
+  /** Wear tuning for one part, with the hot spots rebased into part space. */
+  private tuningFor(spec: PartSpec): { edgeGain: number; cavityGain: number; zones: WearZone[]; gravity: number } {
+    const g = PART_WEAR[spec.name] ?? { edge: 1, cavity: 1 };
+    return {
+      edgeGain: g.edge,
+      cavityGain: g.cavity,
+      gravity: 0.30,
+      zones: this.zones.map((z) => ({
+        ...z,
+        x: z.x - spec.pivot.x, y: z.y - spec.pivot.y, z: z.z - spec.pivot.z,
+      })),
+    };
+  }
 
   build(name: string): WeaponRig {
     const root = new THREE.Group();
@@ -180,8 +237,8 @@ export class RigBuilder {
           for (let i = 0; i < list.length; i++) {
             const gi = merge([list[i]]);
             gi.translate(-spec.pivot.x, -spec.pivot.y, -spec.pivot.z);
-            projectUV(gi, WEAPON_TEXEL_SCALE);
-            bakeWear(gi);
+            projectUV(gi, weaponTexelScale(key));
+            bakeWear(gi, this.tuningFor(spec));
             gi.computeBoundingSphere();
             const mi = new THREE.Mesh(gi, this.mats.get(key, this.space));
             mi.name = `${spec.name}:${key}:${i}`;
@@ -195,8 +252,8 @@ export class RigBuilder {
         }
         const g = merge(list);
         g.translate(-spec.pivot.x, -spec.pivot.y, -spec.pivot.z);
-        projectUV(g, WEAPON_TEXEL_SCALE);
-        bakeWear(g);
+        projectUV(g, weaponTexelScale(key));
+        bakeWear(g, this.tuningFor(spec));
         g.computeBoundingSphere();
         const mesh = new THREE.Mesh(g, this.mats.get(key, this.space));
         mesh.name = `${spec.name}:${key}`;

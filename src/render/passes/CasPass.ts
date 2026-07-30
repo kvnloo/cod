@@ -2,9 +2,17 @@
  * AMD FidelityFX Contrast Adaptive Sharpening.
  *
  * CAS sharpens by an amount derived from local contrast, so flat regions are
- * left alone and high-contrast edges are not given the halo that a fixed
- * unsharp mask produces. It runs after tonemapping, on display-referred values,
- * which is where the filter is defined.
+ * left alone and high-contrast edges get less gain than a fixed unsharp mask
+ * would give them. It runs after tonemapping, on display-referred values, which
+ * is where the filter is defined.
+ *
+ * Stock CAS still overshoots on *thin* dark features: a cable one pixel wide
+ * against the sky leaves both flanking pixels brighter than the sky itself,
+ * which is the pale outline that gives a sharpening filter away instantly. The
+ * adaptive amplitude cannot prevent it, because from the flanking pixel's point
+ * of view the neighbourhood really does contain a strong dark sample. So the
+ * result is clamped to the local 3x3 range, with a few percent of the local
+ * range as slack so genuine micro-contrast still gains a little bite.
  */
 
 import * as THREE from 'three';
@@ -17,6 +25,7 @@ in vec2 vUv;
 uniform sampler2D tInput;
 uniform vec2 uTexel;
 uniform float uSharpness;
+uniform float uOvershoot;
 layout(location = 0) out vec4 fragColor;
 
 vec3 T(float x, float y) { return texture(tInput, vUv + vec2(x, y) * uTexel).rgb; }
@@ -25,6 +34,11 @@ void main() {
   vec3 a = T(-1.0, -1.0), b = T(0.0, -1.0), c = T(1.0, -1.0);
   vec3 d = T(-1.0,  0.0), e = T(0.0,  0.0), f = T(1.0,  0.0);
   vec3 g = T(-1.0,  1.0), h = T(0.0,  1.0), i = T(1.0,  1.0);
+
+  // True local range, kept separate from the doubled min/max CAS uses for its
+  // adaptive amplitude below.
+  vec3 lo = min(min(min(a, b), min(c, d)), min(min(e, f), min(min(g, h), i)));
+  vec3 hi = max(max(max(a, b), max(c, d)), max(max(e, f), max(max(g, h), i)));
 
   vec3 mn = min(min(min(d, e), min(f, b)), h);
   vec3 mn2 = min(mn, min(min(a, c), min(g, i)));
@@ -43,9 +57,24 @@ void main() {
   vec3 rcpW = 1.0 / (1.0 + 4.0 * w);
 
   vec3 result = ((b + d + f + h) * w + e) * rcpW;
+
+  // Ringing clamp. Slack scales with the local range, so flat texture (tiny
+  // range) is still free to gain contrast while a wire against the sky cannot
+  // push a pixel past the sky it sits in.
+  vec3 slack = (hi - lo) * uOvershoot;
+  result = clamp(result, lo - slack, hi + slack);
+
   fragColor = vec4(clamp(result, 0.0, 1.0), 1.0);
 }
 `;
+
+/**
+ * Overshoot allowed past the local 3x3 range, as a fraction of that range.
+ * 0 is a hard no-ring clamp and looks slightly flat-topped; 0.05 keeps the
+ * "crisper" impression without a measurable halo (a 116-level edge is allowed
+ * under 6 levels of overshoot, well below the ~19 levels stock CAS produced).
+ */
+const OVERSHOOT = 0.05;
 
 export class CasPass extends BasePass {
   readonly name = 'cas';
@@ -63,6 +92,7 @@ export class CasPass extends BasePass {
         tInput: { value: null },
         uTexel: { value: new THREE.Vector2() },
         uSharpness: { value: 0.35 },
+        uOvershoot: { value: OVERSHOOT },
       },
     });
   }
@@ -74,6 +104,7 @@ export class CasPass extends BasePass {
     u.tInput.value = input;
     (u.uTexel.value as THREE.Vector2).set(1 / ctx.width, 1 / ctx.height);
     u.uSharpness.value = Math.min(1, g.sharpen);
+    u.uOvershoot.value = OVERSHOOT;
     ctx.blit(this.cas, output);
     return true;
   }

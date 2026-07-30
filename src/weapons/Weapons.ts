@@ -617,6 +617,8 @@ export class WeaponSystem implements System {
       rig.addShake(def.recoil.shake * (1 - this.viewModel.adsBlend * 0.45), 30, 0.18);
     }
     this.viewModel.onFire(imp.pitch, imp.yaw);
+    // A can turns a fireball into a puff; the view-model emitter has to know.
+    if (stats.suppressed) this.viewModel.setFlashScale(0.16);
     input.rumble(Math.min(1, def.recoil.shake * 55), 0.25, 55);
 
     /* --- events ---------------------------------------------------------- */

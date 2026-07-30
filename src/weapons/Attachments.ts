@@ -22,7 +22,7 @@ const OPTICS: AttachmentDef[] = [
     classes: 'all',
     description: 'Compact enclosed red dot. Fast, unobtrusive, no magnification.',
     stats: { adsTimeScale: 1.03, adsSpreadScale: 0.92, magnification: 1.0 },
-    build: { kind: 'reddot', length: 0.062, radius: 0.0175, sightHeight: 0.036, material: 'alu' },
+    build: { kind: 'reddot', length: 0.062, radius: 0.0175, sightHeight: 0.036, material: 'black' },
   },
   {
     id: 'optic_holo',

@@ -6,14 +6,28 @@
  * control, momentum-preserving slides, and automatic mantling. Every constant
  * here is a design value — they are collected at the top so the feel can be
  * tuned in one place.
+ *
+ * ## One step function, three drivers
+ *
+ * `stepCommand(cmd)` is the *only* place movement is integrated. It is driven by
+ *   1. the local client, predicting its own freshly-sampled input;
+ *   2. the local client again, replaying unacked input after a correction;
+ *   3. the host, executing the commands a client sent it.
+ *
+ * There is deliberately no second copy of this logic for the server. Two copies
+ * drift, and drift is desync. Everything the step reads is either a `TUNING`
+ * constant, a field of the command, or a field of `MovementState` — never the
+ * global input singleton and never a user setting, both of which differ between
+ * the machine that predicted a step and the machine that authorises it.
  */
 
 import * as THREE from 'three';
-import { input } from '../core/Input';
 import { bus } from '../core/EventBus';
-import { settings } from '../core/Settings';
 import { readSurface, type SurfaceType } from '../core/Surfaces';
 import { MASK_MOVE, type CharacterController, type CharacterMoveResult, type PhysicsAPI, type RayHit } from '../physics/types';
+import { BTN, type MoveCommand } from './MoveCommand';
+import { copyMovementState, createMovementState, type MovementState } from './MovementState';
+import { CommandBuilder } from './CommandBuilder';
 
 export type MoveState =
   | 'idle' | 'walk' | 'run' | 'sprint' | 'tacSprint'
@@ -126,11 +140,21 @@ export class Movement {
   state: MoveState = 'idle';
   yaw = 0;
 
+  /**
+   * Gameplay events (footsteps, slide, mantle) are muted while a reconciliation
+   * replay is re-running already-heard steps, and on host-side simulations of
+   * remote players whose sounds are the host's to broadcast, not to play.
+   */
+  emitEvents = true;
+
   private controller: CharacterController | null = null;
   private physics: PhysicsAPI | null = null;
   private result = moveResult();
   private hit = rayHit();
   private hit2 = rayHit();
+  /** Buttons of the previous command — press edges are derived, not sent. */
+  private prevButtons = 0;
+  private legacyCommands: CommandBuilder | null = null;
 
   /* stance */
   private targetHeight = TUNING.standHeight;
@@ -183,48 +207,82 @@ export class Movement {
     this.yaw = yaw;
     this.state = 'idle';
     this.mantleT = 0;
+    this.prevButtons = 0;
+    this.jumpBuffer = 0;
+    this.slideTime = 0;
+    this.slideCooldown = 0;
+    this.sprintTime = 0;
+    this.controller?.teleport?.(p);
   }
 
   get height(): number { return this.currentHeight; }
   get grounded(): boolean { return this.out.grounded; }
 
-  step(dt: number, yaw: number): MovementOutput {
+  /**
+   * Single-player / legacy entry point: samples the global input singleton into
+   * a command and runs the one and only step. Kept so callers that do not care
+   * about networking never have to build a command themselves — it is a thin
+   * wrapper, not a second implementation.
+   */
+  step(dt: number, yaw: number, pitch = 0): MovementOutput {
+    this.legacyCommands ??= new CommandBuilder();
+    return this.stepCommand(this.legacyCommands.build(dt, yaw, pitch));
+  }
+
+  /**
+   * Advances the simulation by exactly one command. Deterministic given the
+   * command, this object's state and the collision world.
+   */
+  stepCommand(cmd: MoveCommand): MovementOutput {
+    const dt = cmd.dt;
+    const yaw = cmd.yaw;
+    const buttons = cmd.buttons;
+    const prev = this.prevButtons;
+    this.prevButtons = buttons;
+
     this.yaw = yaw;
     this.out.landImpact = 0;
     this.out.mantleStarted = false;
 
+    const jumpPressed = (buttons & BTN.JUMP) !== 0 && (prev & BTN.JUMP) === 0;
     this.jumpBuffer = Math.max(0, this.jumpBuffer - dt);
     this.slideCooldown = Math.max(0, this.slideCooldown - dt);
-    if (input.pressed('jump')) this.jumpBuffer = TUNING.jumpBufferTime;
+    if (jumpPressed) this.jumpBuffer = TUNING.jumpBufferTime;
 
     if (this.state === 'mantle') { this.stepMantle(dt); return this.out; }
 
-    this.updateStance(dt);
-    this.updateLean(dt);
+    const wantCrouch = (buttons & BTN.CROUCH) !== 0;
+    const wantProne = (buttons & BTN.PRONE) !== 0;
+    const adsHeld = (buttons & BTN.ADS) !== 0;
+    const leanIntent = ((buttons & BTN.LEAN_R) !== 0 ? 1 : 0) - ((buttons & BTN.LEAN_L) !== 0 ? 1 : 0);
+
+    this.updateStance(dt, wantCrouch, wantProne);
+    this.updateLean(dt, leanIntent);
 
     const wasGrounded = this.out.grounded;
     const grounded = this.out.grounded;
 
     // ---- desired direction in world space -------------------------------
-    const s = input.state;
+    const moveX = cmd.moveX;
+    const moveY = cmd.moveY;
     this._forward.set(-Math.sin(yaw), 0, -Math.cos(yaw));
     this._right.set(Math.cos(yaw), 0, -Math.sin(yaw));
     this._wish.set(0, 0, 0)
-      .addScaledVector(this._forward, s.moveY)
-      .addScaledVector(this._right, s.moveX);
+      .addScaledVector(this._forward, moveY)
+      .addScaledVector(this._right, moveX);
     const wishLen = this._wish.length();
     if (wishLen > 1) this._wish.multiplyScalar(1 / wishLen);
     const wishing = wishLen > 0.06;
 
     // ---- stance / sprint / slide decisions ------------------------------
-    const forwardIntent = s.moveY;
-    const wantsSprint = (input.held('sprint') || settings.game.autoSprint)
+    const forwardIntent = moveY;
+    const wantsSprint = (buttons & BTN.SPRINT) !== 0
       && forwardIntent > TUNING.sprintMinForward && grounded && !this.proneHeld;
 
     if (wantsSprint) this.sprintTime += dt; else this.sprintTime = 0;
 
     if (this.state === 'slide') {
-      this.stepSlide(dt);
+      this.stepSlide(dt, moveX);
     } else if (
       this.crouchHeld && grounded && this.slideCooldown <= 0
       && this.horizontalSpeed() >= TUNING.slideEntrySpeed
@@ -234,7 +292,7 @@ export class Movement {
     }
 
     // ---- acceleration ----------------------------------------------------
-    const maxSpeed = this.targetSpeed(s, wantsSprint);
+    const maxSpeed = this.targetSpeed(moveX, moveY, wantsSprint, adsHeld);
     if (this.state !== 'slide') {
       if (grounded) this.accelerateGround(this._wish, maxSpeed, dt, wishing);
       else this.accelerateAir(this._wish, maxSpeed, dt);
@@ -321,21 +379,24 @@ export class Movement {
   /* ------------------------------------------------------------- internals */
 
   private horizontalSpeed(): number {
-    return Math.hypot(this.velocity.x, this.velocity.z);
+    // Math.sqrt rather than Math.hypot: hypot is not specified to a fixed
+    // result across engines and this value feeds every speed threshold.
+    const x = this.velocity.x, z = this.velocity.z;
+    return Math.sqrt(x * x + z * z);
   }
 
-  private targetSpeed(s: { moveX: number; moveY: number }, sprinting: boolean): number {
+  private targetSpeed(moveX: number, moveY: number, sprinting: boolean, ads: boolean): number {
     let base: number;
     if (this.proneHeld) base = TUNING.proneSpeed;
     else if (this.crouchHeld) base = TUNING.crouchSpeed;
     else if (sprinting) {
       base = this.sprintTime > TUNING.tacSprintDelay ? TUNING.tacSprintSpeed : TUNING.sprintSpeed;
-    } else if (input.held('ads')) base = TUNING.walkSpeed;
+    } else if (ads) base = TUNING.walkSpeed;
     else base = TUNING.runSpeed;
 
     // Directional penalties: you are slower sideways and slowest backwards.
-    if (s.moveY < -0.1) base *= TUNING.backScale;
-    else if (Math.abs(s.moveX) > Math.abs(s.moveY)) base *= TUNING.strafeScale;
+    if (moveY < -0.1) base *= TUNING.backScale;
+    else if (Math.abs(moveX) > Math.abs(moveY)) base *= TUNING.strafeScale;
     return base;
   }
 
@@ -370,14 +431,11 @@ export class Movement {
     this.velocity.z += wish.z * accel;
   }
 
-  private updateStance(dt: number): void {
-    const g = settings.game;
-    if (g.toggleCrouch) {
-      if (input.pressed('crouch')) this.crouchHeld = !this.crouchHeld;
-    } else {
-      this.crouchHeld = input.held('crouch');
-    }
-    if (input.pressed('prone')) this.proneHeld = !this.proneHeld;
+  private updateStance(dt: number, wantCrouch: boolean, wantProne: boolean): void {
+    // Toggle-vs-hold was already resolved on the client (CommandBuilder); the
+    // simulation only ever sees the resolved stance intent.
+    this.crouchHeld = wantCrouch;
+    this.proneHeld = wantProne;
     if (this.proneHeld) this.crouchHeld = false;
 
     let want = TUNING.standHeight;
@@ -412,8 +470,7 @@ export class Movement {
     return !this.hit.hit;
   }
 
-  private updateLean(dt: number): void {
-    const want = (input.held('leanRight') ? 1 : 0) - (input.held('leanLeft') ? 1 : 0);
+  private updateLean(dt: number, want: number): void {
     const k = 1 - Math.exp(-TUNING.leanSpeed * dt);
     this.lean += (want - this.lean) * k;
     if (Math.abs(this.lean) < 0.001) this.lean = 0;
@@ -428,24 +485,23 @@ export class Movement {
       this.velocity.x *= boost;
       this.velocity.z *= boost;
     }
-    bus.emit('player:slide', { start: true });
+    if (this.emitEvents) bus.emit('player:slide', { start: true });
   }
 
   private exitSlide(): void {
     this.state = this.crouchHeld ? 'crouchIdle' : 'idle';
     this.slideCooldown = TUNING.slideCooldown;
-    bus.emit('player:slide', { start: false });
+    if (this.emitEvents) bus.emit('player:slide', { start: false });
   }
 
-  private stepSlide(dt: number): void {
+  private stepSlide(dt: number, moveX: number): void {
     this.slideTime += dt;
     const speed = this.horizontalSpeed();
 
     // Steering: rotate the velocity toward the look direction rather than
     // accelerating, so the slide keeps its momentum.
-    const s = input.state;
-    if (Math.abs(s.moveX) > 0.05 && speed > 0.1) {
-      const angle = -s.moveX * TUNING.slideSteer * dt;
+    if (Math.abs(moveX) > 0.05 && speed > 0.1) {
+      const angle = -moveX * TUNING.slideSteer * dt;
       const cos = Math.cos(angle), sin = Math.sin(angle);
       const vx = this.velocity.x, vz = this.velocity.z;
       this.velocity.x = vx * cos - vz * sin;
@@ -509,7 +565,7 @@ export class Movement {
     this.state = 'mantle';
     this.velocity.set(0, 0, 0);
     this.out.mantleStarted = true;
-    bus.emit('player:mantle', undefined);
+    if (this.emitEvents) bus.emit('player:mantle', undefined);
     return true;
   }
 
@@ -555,13 +611,105 @@ export class Movement {
     // Two footfalls per stride, at phase 0 and 0.5.
     const crossed = Math.floor(this.stepPhase * 2) !== Math.floor(prev * 2);
     if (this.stepPhase >= 1) this.stepPhase -= 1;
-    if (crossed) {
+    if (crossed && this.emitEvents) {
       bus.emit('player:footstep', {
         point: this.position.clone(),
         surface: this.out.groundSurface,
         sprinting: this.state === 'sprint' || this.state === 'tacSprint',
       });
     }
+  }
+
+  /* ------------------------------------------------- prediction / replay */
+
+  /**
+   * Writes every field a step can carry forward. Anything the simulation reads
+   * *and* writes must appear here, or restore+replay will not reproduce the
+   * original trajectory.
+   */
+  capture(out: MovementState = createMovementState()): MovementState {
+    out.px = this.position.x; out.py = this.position.y; out.pz = this.position.z;
+    out.vx = this.velocity.x; out.vy = this.velocity.y; out.vz = this.velocity.z;
+    out.yaw = this.yaw;
+    out.state = this.state;
+    out.targetHeight = this.targetHeight;
+    out.currentHeight = this.currentHeight;
+    out.eye = this.eye;
+    out.crouchHeld = this.crouchHeld;
+    out.proneHeld = this.proneHeld;
+    out.groundedTime = this.groundedTime;
+    out.airTime = this.airTime;
+    out.jumpBuffer = this.jumpBuffer;
+    out.slideTime = this.slideTime;
+    out.slideCooldown = this.slideCooldown;
+    out.sprintTime = this.sprintTime;
+    out.lean = this.lean;
+    out.stepAccum = this.stepAccum;
+    out.stepPhase = this.stepPhase;
+    out.mantleT = this.mantleT;
+    out.mantleDuration = this.mantleDuration;
+    out.msx = this.mantleStart.x; out.msy = this.mantleStart.y; out.msz = this.mantleStart.z;
+    out.mmx = this.mantleMid.x; out.mmy = this.mantleMid.y; out.mmz = this.mantleMid.z;
+    out.mex = this.mantleEnd.x; out.mey = this.mantleEnd.y; out.mez = this.mantleEnd.z;
+    out.grounded = this.out.grounded;
+    out.groundSurface = this.out.groundSurface;
+    out.prevButtons = this.prevButtons;
+    return out;
+  }
+
+  /** Inverse of `capture`. Leaves the object ready to step the next command. */
+  restore(s: MovementState): void {
+    this.position.set(s.px, s.py, s.pz);
+    this.velocity.set(s.vx, s.vy, s.vz);
+    this.yaw = s.yaw;
+    this.state = s.state;
+    this.targetHeight = s.targetHeight;
+    this.currentHeight = s.currentHeight;
+    this.eye = s.eye;
+    this.crouchHeld = s.crouchHeld;
+    this.proneHeld = s.proneHeld;
+    this.groundedTime = s.groundedTime;
+    this.airTime = s.airTime;
+    this.jumpBuffer = s.jumpBuffer;
+    this.slideTime = s.slideTime;
+    this.slideCooldown = s.slideCooldown;
+    this.sprintTime = s.sprintTime;
+    this.lean = s.lean;
+    this.stepAccum = s.stepAccum;
+    this.stepPhase = s.stepPhase;
+    this.mantleT = s.mantleT;
+    this.mantleDuration = s.mantleDuration;
+    this.mantleStart.set(s.msx, s.msy, s.msz);
+    this.mantleMid.set(s.mmx, s.mmy, s.mmz);
+    this.mantleEnd.set(s.mex, s.mey, s.mez);
+    this.prevButtons = s.prevButtons;
+
+    // Derived outputs, so a caller that reads `out` before the next step sees
+    // something coherent rather than the state we just threw away.
+    this.out.grounded = s.grounded;
+    this.out.groundSurface = s.groundSurface;
+    this.out.state = s.state;
+    this.out.lean = s.lean;
+    this.out.stepPhase = s.stepPhase;
+    this.out.eyeOffset = s.eye - s.currentHeight * 0.5;
+    this.out.speed01 = Math.min(1, Math.sqrt(s.vx * s.vx + s.vz * s.vz) / TUNING.tacSprintSpeed);
+    this.out.landImpact = 0;
+    this.out.mantleStarted = false;
+
+    // The controller keeps internal state we do not snapshot (ground collider,
+    // step debt, queued height shift). Teleporting first puts it in a known
+    // state, then the height is re-applied — otherwise the next
+    // collide-and-slide resolves against the wrong capsule.
+    this.controller?.teleport?.(this.position);
+    this.controller?.setHeight(this.currentHeight);
+  }
+
+  /** Convenience for callers that want a fresh state object of the right shape. */
+  static createState(): MovementState { return createMovementState(); }
+
+  /** Copies a state without touching the simulation. */
+  static copyState(dst: MovementState, src: MovementState): MovementState {
+    return copyMovementState(dst, src);
   }
 
   /** Reads the surface under the feet for footstep audio when the controller

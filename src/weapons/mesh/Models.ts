@@ -21,6 +21,7 @@ import {
   magazine, makeCtx, muzzleDevice, optic, pistolGrip, stock, topCover, topRail,
   underbarrel, upperReceiver, type BuildCtx,
 } from './Parts';
+import { hands } from './Hands';
 import {
   ball, chamferBox, disc, hexHead, lathe, loft, panelLines, picatinny, pipeZ,
   prismX, rod, screwHead, slingSocket, torusZ, xf, type Pt2,
@@ -263,11 +264,13 @@ function buildSniper(ctx: BuildCtx): void {
   magazine(ctx, -m.receiver[2] * 0.58, ctx.lowerTop - 0.024);
 
   // Bolt: a body sitting in the raceway plus a handle that rotates and pulls.
+  // Knob and stem are parkerised, not polished: a mirror-black sphere on the
+  // side of a rifle reads as a marble, and every field bolt gun is matte.
   b.part('boltHandle', [m.receiver[0] * 0.42, ctx.upperMidY, -m.receiver[2] * 0.24]);
   b.add(xf(lathe([[0, 0.0050], [0.020, 0.0050], [0.024, 0.0044]], 14),
-    { pos: [m.receiver[0] * 0.42, ctx.upperMidY, -m.receiver[2] * 0.24], rot: [0, Math.PI / 2, 0] }), 'blued');
+    { pos: [m.receiver[0] * 0.42, ctx.upperMidY, -m.receiver[2] * 0.24], rot: [0, Math.PI / 2, 0] }), 'phosphate');
   b.add(xf(ball(0.0092, 14),
-    { pos: [m.receiver[0] * 0.42 + 0.026, ctx.upperMidY, -m.receiver[2] * 0.24] }), 'blued');
+    { pos: [m.receiver[0] * 0.42 + 0.026, ctx.upperMidY, -m.receiver[2] * 0.24] }), 'phosphate');
   b.use('receiver');
 
   b.part('bolt', [0, ctx.upperMidY, -m.receiver[2] * 0.30]);
@@ -287,6 +290,15 @@ function buildSniper(ctx: BuildCtx): void {
     top: [0, ctx.lowerTop + 0.002, -m.receiver[2] * 0.20],
     length: 0.092, rake: 26, width: 0.034, depth: 0.044, beavertail: false,
   });
+
+  // No handguard on this rifle, so the support hand rides the free-floated
+  // barrel just forward of the bedding block.
+  ctx.support = {
+    at: new THREE.Vector3(0, 0, ctx.front - m.barrelLength * 0.30),
+    axis: new THREE.Vector3(0, 0, -1),
+    radius: m.barrelRadius * 1.9,
+    node: 'receiver',
+  };
 
   topRail(ctx);
   finishMuzzle(ctx);
@@ -370,6 +382,12 @@ function buildShotgun(ctx: BuildCtx): void {
     b.add(xf(chamferBox(m.handguardRadius * 2.1, 0.0022, 0.0055, 0.0006),
       { pos: [0, tubeY * 0.55 - m.handguardRadius * 1.4, fz + m.handguardLength * 0.34 - i * 0.014] }), 'rubber');
   }
+  ctx.support = {
+    at: new THREE.Vector3(0, tubeY * 0.55, fz),
+    axis: new THREE.Vector3(0, 0, -1),
+    radius: m.handguardRadius * 1.20,
+    node: 'pump',
+  };
   b.use('receiver');
 
   // Shell held during a shell-by-shell reload; hidden until then.
@@ -483,6 +501,16 @@ function buildPistol(ctx: BuildCtx): void {
   b.add(xf(chamferBox(0.0030, 0.0075, 0.011, 0.0006), { pos: [w * 0.5, frameTop - 0.006, -0.006] }), 'blued');
 
   magazine(ctx, -0.004, frameTop - 0.010);
+  // Two-handed: the support hand cups the firing hand rather than holding the
+  // weapon, so it wraps a notionally fatter grip, lower down.
+  if (ctx.grip) {
+    ctx.support = {
+      at: ctx.grip.top.clone().addScaledVector(ctx.grip.down, ctx.grip.length * 0.74),
+      axis: ctx.grip.down.clone(),
+      radius: ctx.grip.radius + 0.015,
+      node: 'receiver',
+    };
+  }
   ctx.sight.set(0, slideTop + 0.0055, -0.008);
   ctx.muzzleZ = muzzleDevice(ctx, ctx.slot.get('muzzle'), -m.receiver[2] - 0.024, m.barrelRadius);
   const pistolLaser = ctx.slot.get('laser');
@@ -593,9 +621,12 @@ export function buildWeaponMesh(
   space: MaterialSpace = 'view',
 ): WeaponRig {
   const b = new RigBuilder(mats, space);
-  const ctx = makeCtx(b, def, attachments);
+  const ctx = makeCtx(b, def, attachments, space === 'view');
   const build = BUILDERS[def.cls] ?? buildAssault;
   build(ctx);
+  // Hands last: they need the grip and support anchors the assembly recorded,
+  // and they are the one component that exists only in the first person.
+  hands(ctx);
   const rig = b.build(def.id);
 
   // Guarantee the points every consumer relies on.

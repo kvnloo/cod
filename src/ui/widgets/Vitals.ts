@@ -13,7 +13,7 @@ import { chamferPath, corners, hairWidth, meter, panel, text } from '../Draw';
 import type { DrawCtx } from '../Draw';
 import { equipmentGlyph, streakGlyph, type EquipmentGlyph, type StreakGlyph } from '../Glyphs';
 import type { HudModel } from '../Model';
-import { lift, mixRGB, rgba, type Palette, type RGB } from '../Theme';
+import { ADS_FADE, adsFade, lift, mixRGB, rgba, type Palette, type RGB } from '../Theme';
 import { MARGIN } from '../Theme';
 import type { Widget } from './Widget';
 
@@ -59,7 +59,11 @@ export class Vitals implements Widget {
     const s = d.s;
     const left = MARGIN * s;
     const bottom = d.h - MARGIN * s;
-    const alpha = d.alpha * (1 - m.ads * 0.5);
+    // Health is a vital read and stays put; killstreaks and equipment are the
+    // definition of "nothing you can act on while holding a sight picture" and
+    // step almost all the way back.
+    const alpha = adsFade(d.alpha, m.ads, ADS_FADE.vital);
+    const idleAlpha = adsFade(d.alpha, m.ads, ADS_FADE.idle);
     if (alpha <= 0.01) return;
 
     c.save();
@@ -71,13 +75,16 @@ export class Vitals implements Widget {
     const barH = 8 * s;
     const barY = bottom - barH;
     const frac = m.healthBar.value;
-    // Healthy is *neutral*, not green. A saturated green bar is the single
-    // loudest "browser game" tell in a HUD that otherwise runs one accent
-    // colour; shipped shooters keep full health near-white and spend colour
-    // only on the warning states.
-    const col: RGB = frac > 0.35
-      ? mixRGB(p.warn, p.ink, clamp01((frac - 0.35) / 0.65))
-      : mixRGB(p.hostile, p.warn, clamp01(frac / 0.35));
+    // Healthy is *neutral*, not green and not amber. The previous ramp started
+    // bending toward warn at 100% and was already visibly orange at 62%, which
+    // put a large saturated block of the objective hue in the corner of every
+    // frame. Colour now arrives only once there is something to warn about:
+    // near-white above 55%, amber through the middle band, red below a third.
+    const col: RGB = frac > 0.55
+      ? lift(p.ink, 0.25)
+      : frac > 0.3
+        ? mixRGB(p.warn, lift(p.ink, 0.25), clamp01((frac - 0.3) / 0.25))
+        : mixRGB(p.hostile, p.warn, clamp01(frac / 0.3));
 
     meter(c, left, barY, barW, barH, frac, col, {
       segments: 4, track: p.hair, glow: 8 * s, ghost: m.healthGhost,
@@ -106,7 +113,7 @@ export class Vitals implements Widget {
     // Health is a peripheral read: the number carries it, the bar qualifies it.
     text(c, String(Math.round(m.health)), left + barW + 11 * s, barY + barH + 1.5 * s, {
       size: 22 * s, weight: 700, family: 'cond', tracking: 0.4 * s,
-      color: rgba(frac < 0.35 ? p.hostile : p.ink, 0.98),
+      color: rgba(frac < 0.3 ? p.hostile : lift(p.ink, 0.3), 0.99),
       shadow: Math.max(1, 1.4 * s), outline: 3 * s,
     });
 
@@ -117,16 +124,20 @@ export class Vitals implements Widget {
     });
 
     /* --------------------------------------------------- equipment ----- */
-    const eqY = barY - 28 * s;
-    this.drawEquipment(d, m, left, eqY, p);
+    if (idleAlpha > 0.01) {
+      c.globalAlpha = idleAlpha;
+      const eqY = barY - 28 * s;
+      this.drawEquipment(d, m, left, eqY, p);
 
-    /* --------------------------------------------------- killstreaks --- */
-    // Tiles are 36 design-px tall and grow downward from ksY. The equipment
-    // glyphs above the health bar are drawn 32 px tall from `eqY - 31`, so the
-    // tile row has to end well clear of that or the two collide — which is
-    // exactly what the original 62 px offset did.
-    const ksY = eqY - 80 * s;
-    this.drawStreaks(d, m, left, ksY, p);
+      /* ------------------------------------------------- killstreaks --- */
+      // Tiles are 36 design-px tall and grow downward from ksY. The equipment
+      // glyphs above the health bar are drawn 32 px tall from `eqY - 31`, so the
+      // tile row has to end well clear of that or the two collide — which is
+      // exactly what the original 62 px offset did.
+      const ksY = eqY - 80 * s;
+      this.drawStreaks(d, m, left, ksY, p);
+      c.globalAlpha = alpha;
+    }
 
     c.restore();
   }
@@ -189,15 +200,19 @@ export class Vitals implements Widget {
       const ready = st.ready;
       const flare = st.flash;
 
-      const fill: RGB = ready ? p.accent : p.panel;
+      // A ready streak is announced by *value*, not by hue: the tile brightens,
+      // the glyph goes near-white and the bracket lights. Painting it in the
+      // accent put a permanent amber block in the corner that read exactly as
+      // loud as the objective marker it was competing with.
+      const hot: RGB = lift(p.ink, 0.3);
       c.save();
 
       // Tile
       chamferPath(c, tx, ty, tileW, tileH, 6 * s);
       const g = c.createLinearGradient(tx, ty, tx, ty + tileH);
       if (ready) {
-        g.addColorStop(0, rgba(fill, 0.22 + 0.16 * pulse));
-        g.addColorStop(1, rgba(fill, 0.06));
+        g.addColorStop(0, rgba(p.hair, 0.17 + 0.09 * pulse));
+        g.addColorStop(1, rgba(p.panel, 0.5));
       } else {
         g.addColorStop(0, rgba(p.panel, 0.6));
         g.addColorStop(1, rgba(p.panel, 0.34));
@@ -205,12 +220,12 @@ export class Vitals implements Widget {
       c.fillStyle = g;
       c.fill();
       c.lineWidth = hairWidth(d.dpr);
-      c.strokeStyle = rgba(ready ? p.accent : p.hair, ready ? 0.65 : 0.2);
+      c.strokeStyle = rgba(p.hair, ready ? 0.5 : 0.18);
       c.stroke();
 
       if (ready) {
         c.lineWidth = Math.max(1, 1.1 * s);
-        c.strokeStyle = rgba(lift(p.accent, 0.3), 0.5 + 0.4 * Math.sin(this.t * 3.4 + i));
+        c.strokeStyle = rgba(hot, 0.4 + 0.32 * Math.sin(this.t * 3.4 + i));
         corners(c, tx, ty, tileW, tileH, 7 * s);
       }
 
@@ -219,36 +234,38 @@ export class Vitals implements Widget {
       const gx = tx + tileW * 0.32;
       const gy = ty + tileH * 0.46;
       c.save();
-      c.globalAlpha *= ready ? 1 : 0.5;
-      streakGlyph(c, gl, gx, gy, 26 * s, rgba(ready ? lift(p.accent, 0.35) : p.ink, 1));
+      c.globalAlpha *= ready ? 1 : 0.42;
+      streakGlyph(c, gl, gx, gy, 26 * s, rgba(ready ? hot : p.inkDim, 1));
       c.restore();
 
       // Label + progress
       text(c, st.short, tx + tileW - 5 * s, ty + tileH - 5 * s, {
         size: 10.5 * s, weight: 700, family: 'cond', tracking: 1.4 * s, align: 'right',
-        color: rgba(ready ? p.accent : p.inkDim, ready ? 1 : 0.7),
+        color: rgba(ready ? hot : p.inkDim, ready ? 0.98 : 0.6),
       });
 
       if (!ready) {
         const pw = tileW - 10 * s;
         c.fillStyle = rgba(p.hair, 0.16);
         c.fillRect(tx + 5 * s, ty + tileH - 3.5 * s, pw, 1.8 * s);
-        c.fillStyle = rgba(p.ink, 0.55);
+        c.fillStyle = rgba(p.ink, 0.45);
         c.fillRect(tx + 5 * s, ty + tileH - 3.5 * s, pw * clamp01(st.progress), 1.8 * s);
       } else if (st.charges > 1) {
         text(c, `×${st.charges}`, tx + tileW - 5 * s, ty + 12 * s, {
           size: 11 * s, weight: 700, family: 'cond', align: 'right',
-          color: rgba(lift(p.accent, 0.4), 1),
+          color: rgba(hot, 1),
         });
       }
 
-      // Ready flare: an expanding outline that fires once on arrival.
+      // Ready flare: an expanding outline that fires once on arrival. This is
+      // the one moment a streak earns the accent — it is a reward beat, it
+      // lasts under two seconds, and then the tile goes back to being quiet.
       if (flare > 0.01) {
         const t = 1 - flare;
         const grow = Ease.outQuart(t) * 14 * s * motion();
         c.globalAlpha *= flare;
         c.lineWidth = Math.max(1, (2.2 - t * 1.4) * s);
-        c.strokeStyle = rgba(lift(p.accent, 0.5), 0.9);
+        c.strokeStyle = rgba(lift(p.accent, 0.35), 0.9);
         chamferPath(c, tx - grow, ty - grow, tileW + grow * 2, tileH + grow * 2, 6 * s + grow);
         c.stroke();
       }

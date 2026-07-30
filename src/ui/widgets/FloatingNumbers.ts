@@ -15,6 +15,7 @@ import { clamp01, Ease, motion, Spring, SPRING } from '../Anim';
 import { text } from '../Draw';
 import type { DrawCtx } from '../Draw';
 import type { HudModel } from '../Model';
+import { pushOutOfSight } from '../Sight';
 import { lift, rgba, type Palette, type RGB } from '../Theme';
 import { ui } from '../UiSettings';
 import type { Widget } from './Widget';
@@ -115,22 +116,37 @@ export class FloatingNumbers implements Widget {
 
       this.proj.copy(n.world).project(cam);
       if (this.proj.z > 1 || this.proj.z < -1) continue;
-      const x = (this.proj.x * 0.5 + 0.5) * d.w + n.jitterX * s;
-      const y = (1 - (this.proj.y * 0.5 + 0.5)) * d.h - Ease.outQuart(t) * 34 * s * motion();
+      const rawX = (this.proj.x * 0.5 + 0.5) * d.w + n.jitterX * s;
+      const rawY = (1 - (this.proj.y * 0.5 + 0.5)) * d.h - Ease.outQuart(t) * 34 * s * motion();
+      // A damage number is pinned to the target you are shooting, which is
+      // exactly the point the optic is covering. Slide it to the nearest point
+      // outside the aperture — outward, so it stays associated with the target —
+      // rather than painting it on the glass.
+      const out = pushOutOfSight(d, m, rawX, rawY, 12);
+      const x = out[0];
+      const y = out[1];
 
       const alpha = (1 - Ease.inQuad(clamp01((t - 0.45) / 0.55))) * d.alpha;
       if (alpha <= 0.01) continue;
 
-      const tint: RGB = n.killed ? p.hostile : n.headshot ? p.accent : p.ink;
+      // Damage you deal reads in the neutral ramp — a kill is the only state
+      // that earns a hue. Headshots are told apart by size and weight, not by
+      // borrowing the objective accent.
+      const tint: RGB = n.killed ? p.hostile : p.damage;
       const size = (n.killed ? 24 : n.headshot ? 21 : 17) * s * (1 + n.punch.value * 0.004);
 
       c.save();
       c.globalAlpha = alpha;
       text(c, String(Math.round(n.amount)), x, y, {
         size, weight: 700, family: 'cond', tracking: 0.6 * s, align: 'center',
-        color: rgba(lift(tint, 0.2), 1), shadow: Math.max(1, 1.5 * s),
-        glow: n.headshot || n.killed ? 10 * s : 0, glowColor: rgba(tint, 0.5),
+        color: rgba(lift(tint, n.headshot ? 0.45 : 0.15), 1), shadow: Math.max(1, 1.5 * s),
+        glow: n.killed ? 10 * s : 0, glowColor: rgba(tint, 0.5),
       });
+      if (n.headshot && !n.killed) {
+        // A short rule under a critical hit: the shape carries the read.
+        c.fillStyle = rgba(lift(p.ink, 0.45), 0.85);
+        c.fillRect(x - size * 0.36, y + 3.5 * s, size * 0.72, Math.max(1, 1.4 * s));
+      }
       c.restore();
     }
   }

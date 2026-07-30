@@ -86,7 +86,7 @@ void main() {
 
 	// March the segment: falloff along the shaft axis (local +z is "away from
 	// the window") plus a soft radial mask and slowly drifting dust density.
-	const int STEPS = 6;
+	const int STEPS = 10;
 	float seg = ( t1 - t0 ) / float( STEPS );
 	float acc = 0.0;
 	for ( int i = 0; i < STEPS; i ++ ) {
@@ -94,16 +94,22 @@ void main() {
 		float along = boSat( ( p.z + uHalf.z ) / ( 2.0 * uHalf.z ) );
 		float axial = exp( - along * uFalloff );
 		vec2 radial = abs( p.xy ) / uHalf.xy;
-		float mask = ( 1.0 - smoothstep( 0.55, 1.0, radial.x ) ) * ( 1.0 - smoothstep( 0.55, 1.0, radial.y ) );
+		// A beam is cast by a hard-edged gap, so it has a defined edge with a
+		// penumbra on it — not a gaussian blob. Feather the outer quarter only.
+		float mask = ( 1.0 - smoothstep( 0.70, 1.0, radial.x ) ) * ( 1.0 - smoothstep( 0.70, 1.0, radial.y ) );
 		// Slight spread with distance, as a real beam does.
 		mask *= mix( 1.0, 0.75, along );
 		float dust = mix( 1.0, 0.45 + 1.15 * boFbm( p * 0.55 + vec3( uTime * 0.09, uTime * 0.05, - uTime * 0.07 ), 3 ), uDust );
 		acc += axial * mask * dust * seg;
 	}
 
-	// Forward scattering: a shaft is far brighter when you look up it.
-	float mu = boSat( dot( - rdW, boSunDirWorld ) );
-	float phase = 0.55 + 1.9 * pow( mu, 4.0 );
+	// Forward scattering. Light propagates along -boSunDirWorld; the eye sees the
+	// part of it scattered through a small angle, which happens when the view ray
+	// points *at* the sun. Testing the view ray against the direction to the sun
+	// with the opposite sign gives backscatter and kills the beams in exactly the
+	// composition they exist for.
+	float mu = boSat( dot( rdW, boSunDirWorld ) );
+	float phase = 0.42 + 2.6 * pow( mu, 3.0 );
 
 	float amount = acc * uIntensity * phase;
 	if ( amount < 0.0004 ) discard;
@@ -122,6 +128,23 @@ export interface ShaftOptions {
   intensity?: number;
   falloff?: number;
   dust?: number;
+  /**
+   * Re-aim the beam down the current sun direction every frame.
+   *
+   * A shaft authored against one time of day points the wrong way at every
+   * other one, and a beam that disagrees with the shadows it is supposed to
+   * belong to is worse than no beam at all.
+   */
+  followSun?: boolean;
+}
+
+interface Shaft {
+  mesh: THREE.Mesh;
+  /** Window centre: the beam is anchored here and grows along the light. */
+  origin: THREE.Vector3;
+  up: THREE.Vector3;
+  length: number;
+  followSun: boolean;
 }
 
 interface Fire {
@@ -136,9 +159,11 @@ interface Fire {
 
 /* ------------------------------------------------------------------ system -- */
 
+const ORIGIN = new THREE.Vector3(0, 0, 0);
+
 export class EnvironmentFX {
   objects: THREE.Object3D[] = [];
-  private shafts: THREE.Mesh[] = [];
+  private shafts: Shaft[] = [];
   private shaftGeoms: THREE.BufferGeometry[] = [];
   private shared: Record<string, THREE.IUniform> = {};
 
@@ -171,6 +196,9 @@ export class EnvironmentFX {
   fogBanks = 0;
 
   private tmp = new THREE.Vector3();
+  private tmp2 = new THREE.Vector3();
+  private dirScratch = new THREE.Vector3();
+  private sunScratch = new THREE.Vector3();
   private quatScratch = new THREE.Quaternion();
   private matScratch = new THREE.Matrix4();
 
@@ -184,13 +212,33 @@ export class EnvironmentFX {
     }
   }
 
+  /**
+   * Drops every *transient* effect.
+   *
+   * Light shafts are deliberately exempt. They are level dressing installed once
+   * by whoever built the room, not a fired effect, and hiding them here (with
+   * nothing anywhere that ever showed them again) is what silently emptied the
+   * beams out of every frame after the first staged shot.
+   */
   clear(): void {
     for (const f of this.fires) f.active = false;
-    for (const m of this.shafts) m.visible = false;
     this.moteAcc = 0; this.rainAcc = 0; this.scrapAcc = 0;
     this.moteDeath.length = 0; this.scrapDeath.length = 0;
     this.fogBanks = 0;
     this.fogTimer = 0;
+  }
+
+  /** Removes every light shaft — a level teardown, not an effect reset. */
+  clearShafts(): void {
+    for (const s of this.shafts) {
+      s.mesh.removeFromParent();
+      (s.mesh.material as THREE.Material).dispose();
+      const i = this.objects.indexOf(s.mesh);
+      if (i >= 0) this.objects.splice(i, 1);
+    }
+    for (const g of this.shaftGeoms) g.dispose();
+    this.shaftGeoms.length = 0;
+    this.shafts.length = 0;
   }
 
   /** Drops expired entries and reports how many of a layer are still alive. */
@@ -239,7 +287,9 @@ export class EnvironmentFX {
       uInvModel: { value: new THREE.Matrix4() },
       uHalf: { value: new THREE.Vector3(o.width * 0.5, o.height * 0.5, o.length * 0.5) },
       uColor: { value: new THREE.Color(o.color ?? 0xfff0d8) },
-      uIntensity: { value: o.intensity ?? 0.16 },
+      // Per *metre* of beam traversed: `acc` below integrates in metres, so a
+      // 30 m shaft with the brightness of a 3 m one would be ten times as hot.
+      uIntensity: { value: o.intensity ?? 0.03 },
       uFalloff: { value: o.falloff ?? 1.6 },
       uTime: { value: 0 },
       uDust: { value: o.dust ?? 0.85 },
@@ -275,17 +325,31 @@ export class EnvironmentFX {
     mesh.name = 'fx:lightshaft';
     mesh.layers.set(FX_LAYER_TRANSPARENT);
 
-    // Point local +Z down the light direction.
-    this.matScratch.lookAt(new THREE.Vector3(0, 0, 0), d.clone().negate(), up);
-    this.quatScratch.setFromRotationMatrix(this.matScratch);
-    mesh.quaternion.copy(this.quatScratch);
-    mesh.position.copy(origin).addScaledVector(d, o.length * 0.5);
-    mesh.updateMatrixWorld(true);
-    (mesh.material as THREE.ShaderMaterial).uniforms.uInvModel.value.copy(mesh.matrixWorld).invert();
+    const shaft: Shaft = {
+      mesh,
+      origin: origin.clone(),
+      up: up.clone().normalize(),
+      length: o.length,
+      followSun: o.followSun ?? false,
+    };
+    this.aimShaft(shaft, d);
 
-    this.shafts.push(mesh);
+    this.shafts.push(shaft);
     this.objects.push(mesh);
     return mesh;
+  }
+
+  /** Points a shaft's local +Z down `dir` and re-centres the box on the beam. */
+  private aimShaft(s: Shaft, dir: THREE.Vector3): void {
+    const d = this.dirScratch.copy(dir).normalize();
+    // `lookAt` wants the +Z axis, so the target is *behind* the light.
+    this.matScratch.lookAt(ORIGIN, this.tmp2.copy(d).negate(), s.up);
+    this.quatScratch.setFromRotationMatrix(this.matScratch);
+    s.mesh.quaternion.copy(this.quatScratch);
+    s.mesh.position.copy(s.origin).addScaledVector(d, s.length * 0.5);
+    s.mesh.updateMatrixWorld(true);
+    (s.mesh.material as THREE.ShaderMaterial).uniforms.uInvModel.value
+      .copy(s.mesh.matrixWorld).invert();
   }
 
   /* ---------------------------------------------------------------- update */
@@ -295,9 +359,18 @@ export class EnvironmentFX {
     const rand = w.rand;
     const cam = w.camera.position;
 
-    for (const m of this.shafts) {
-      const u = (m.material as THREE.ShaderMaterial).uniforms;
+    // Sun direction, in world space, as the renderer currently has it. Null when
+    // there is no renderer to ask, in which case a shaft keeps its authored aim.
+    const sunU = this.shared.boSunDirWorld?.value as THREE.Vector3 | undefined;
+    for (const s of this.shafts) {
+      const u = (s.mesh.material as THREE.ShaderMaterial).uniforms;
       u.uTime.value = w.clock;
+      if (!s.followSun || !sunU || sunU.y <= 0.02) continue;
+      // The beam travels *away* from the sun.
+      this.sunScratch.copy(sunU).negate();
+      if (this.sunScratch.dot(this.dirScratch.setFromMatrixColumn(s.mesh.matrixWorld, 2)) < 0.9995) {
+        this.aimShaft(s, this.sunScratch);
+      }
     }
 
     /* --- ambient dust motes -------------------------------------------
@@ -631,6 +704,6 @@ export class EnvironmentFX {
 
   dispose(): void {
     for (const g of this.shaftGeoms) g.dispose();
-    for (const m of this.shafts) (m.material as THREE.Material).dispose();
+    for (const s of this.shafts) (s.mesh.material as THREE.Material).dispose();
   }
 }

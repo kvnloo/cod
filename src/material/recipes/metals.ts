@@ -98,7 +98,7 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
 
   // paint fails on convex edges first
   float edge = obSat(d.curv * 1.4);
-  paint = smoothstep(0.15, 0.55, obSat(paint - edge * 0.55));
+  paint = smoothstep(0.15, 0.55, obSat(paint - edge * 0.78));
 
   vec3 paintCol = obRGB(56, 70, 62);                       // faded industrial green
   paintCol = mix(paintCol, obRGB(78, 92, 84), obFbm(uv * 4.0, vec2(4.0), 4, 0.5, uSeed + 61.0) * 0.7);
@@ -116,17 +116,24 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
   col = mix(col, obRGB(48, 44, 38), grime * 0.45);
   col = mix(col, obRGB(38, 36, 34), joint * 0.5);
 
+  // Scratches are kept low-contrast on purpose: with the steel underneath now
+  // properly glossy they read hard, and a 1.4 m tile repeated nine times along
+  // a tram flank turns any high-contrast mark into a stripe pattern.
   float scratch = obScratches(uv, 26.0, 3.0, 26.0, 0.4, uSeed + 83.0);
-  col = mix(col, steel * 1.15, scratch * (1.0 - rustAmt) * 0.5);
+  col = mix(col, steel * 1.10, scratch * (1.0 - rustAmt) * 0.28);
 
   o.albedo = col;
   // bare + scratched steel is metallic; paint and rust are not
-  o.metal = obSat((1.0 - paint) * (1.0 - rustAmt) + scratch * 0.5 * (1.0 - rustAmt));
-  float rough = mix(0.60, 0.88, rustAmt);
-  rough = mix(rough, 0.74, paint);
-  rough = mix(rough, 0.38, scratch * (1.0 - rustAmt) * 0.8);
-  rough += grime * 0.12;
-  o.rough = clamp(rough, 0.12, 1.0);
+  o.metal = obSat((1.0 - paint) * (1.0 - rustAmt * 0.85) + scratch * 0.6 * (1.0 - rustAmt));
+  // Bare steel outdoors is not a 0.6-rough dielectric-looking slab: it is a
+  // blurry mirror. Anything above ~0.45 stops sampling the sky probe hard
+  // enough to read as metal at all, which is why nothing in the level takes
+  // its colour from the sky. Paint keeps a broad sheen for the same reason.
+  float rough = mix(0.34, 0.84, rustAmt);
+  rough = mix(rough, 0.56, paint);
+  rough = mix(rough, 0.22, scratch * (1.0 - rustAmt) * 0.8);
+  rough += grime * 0.10;
+  o.rough = clamp(rough, 0.08, 1.0);
 }`,
   },
 };
@@ -203,9 +210,9 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
 
   o.albedo = col;
   o.metal = obSat((1.0 - rust) * 0.95 + 0.05);
-  float rough = mix(0.34, 0.88, obSat(rust * 1.2));
-  rough += grime * 0.12 - rib * 0.03;
-  o.rough = clamp(rough, 0.16, 1.0);
+  float rough = mix(0.24, 0.86, obSat(rust * 1.2));
+  rough += grime * 0.10 - rib * 0.03;
+  o.rough = clamp(rough, 0.10, 1.0);
   o.ao = 1.0 - hole * 0.5;
 }`,
   },
@@ -394,7 +401,7 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
 
   o.albedo = col;
   o.metal = obSat(1.0 - rust * 0.8);
-  o.rough = clamp(mix(0.40, 0.88, rust) - edge * 0.14 + grime * 0.1, 0.14, 1.0);
+  o.rough = clamp(mix(0.28, 0.86, rust) - edge * 0.14 + grime * 0.1, 0.10, 1.0);
   o.alpha = smoothstep(0.35, 0.60, solid);
   o.ao = mix(0.55, 1.0, obSat(bar + h1.x));
 }`,
@@ -461,7 +468,7 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
 
   o.albedo = col;
   o.metal = obSat((1.0 - paint) * (1.0 - rust));
-  o.rough = clamp(mix(0.44, 0.88, rust) * (1.0 - paint * 0.2) + paint * 0.12 + grime * 0.1, 0.14, 1.0);
+  o.rough = clamp(mix(0.30, 0.86, rust) * (1.0 - paint * 0.2) + paint * 0.22 + grime * 0.1, 0.10, 1.0);
 }`,
   },
 };

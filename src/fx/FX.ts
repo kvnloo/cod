@@ -24,8 +24,8 @@ import { settings } from '../core/Settings';
 import { Rand } from '../core/Rand';
 import type { SurfaceType } from '../core/Surfaces';
 
-import { FxBlitter, clamp } from './Common';
-import type { FxRenderHost } from './Common';
+import { FxBlitter, asScreenFxState, clamp } from './Common';
+import type { FxRenderHost, FxScreenFxState } from './Common';
 import { bakeSpriteAtlas, type SpriteAtlas } from './SpriteAtlas';
 import { GpuParticles } from './GpuParticles';
 import { QuadFX } from './Quads';
@@ -115,6 +115,9 @@ export class FXSystem implements System, FxWorld {
   private tmpV2 = new THREE.Vector3();
   private floorCache: { x: number; z: number; y: number; t: number }[] = [];
 
+  /* --- the post module's screen-effect state, probed until found --------- */
+  private screenFx: FxScreenFxState | null = null;
+
   constructor() {
     this.rayHit = {
       hit: false, point: new THREE.Vector3(), normal: new THREE.Vector3(0, 1, 0),
@@ -177,7 +180,11 @@ export class FXSystem implements System, FxWorld {
 
     this.setupRefraction(renderer);
     this.subscribe();
-    registerFxDebugScene(this);
+    // The engine handle is what lets a staged shot fast-forward an effect to the
+    // age it reads best at. It has to come from here, not from the `?debug=fx`
+    // scene builder: the FX shots are registered unconditionally and are
+    // captured against whatever level is loaded.
+    registerFxDebugScene(this, ctx.engine);
   }
 
   private fxRoot: THREE.Group | null = null;
@@ -461,6 +468,77 @@ export class FXSystem implements System, FxWorld {
     this.renderHost?.screenEffect({ concussion: { intensity, duration } });
   }
 
+  /**
+   * The post library's screen-effect state, found once and cached.
+   *
+   * `RenderAPI` can only *add* to that state — there is no way to read it back
+   * or clear it — yet the same state also subscribes to the event bus on its
+   * own. FX therefore has to be able to reach it to (a) dial a flashbang's
+   * white-out down by distance and (b) leave a clean frame behind on `reset()`.
+   * Probed defensively: no post library, no handle, no behaviour change.
+   */
+  private screenFxState(): FxScreenFxState | null {
+    if (this.screenFx) return this.screenFx;
+    const passes = this.renderHost?.passes;
+    // The post library is loaded asynchronously, so an empty list means "not
+    // yet", not "never" — latching the miss on the first frame would switch
+    // this off for the whole session.
+    if (!Array.isArray(passes) || passes.length === 0) return null;
+    for (const p of passes) {
+      const found = asScreenFxState(p?.res?.fx);
+      if (found) { this.screenFx = found; break; }
+    }
+    return this.screenFx;
+  }
+
+  blind(amount: number): void {
+    this.blindCeiling = clamp(amount, 0, 1);
+    const s = this.screenFxState();
+    if (!s) return;
+    this.applyBlind(s, this.blindCeiling);
+    this.blindSolvedTime = s.blindTime;
+  }
+
+  /** Ceiling the white-out is held under, or −1 when nothing is blinding. */
+  private blindCeiling = -1;
+  private blindSolvedTime = 0;
+
+  /**
+   * Asks the post module for a *partial* white-out.
+   *
+   * Writing `blind` directly does nothing: the module recomputes it from
+   * `blindTime` on its own curve every frame, pinning it to 1.0 for the first
+   * 0.55 s no matter what anyone else wrote — which is why a flashbang thirty
+   * metres away used to erase the frame just as thoroughly as one at your feet.
+   * Starting the clock part-way down that curve is the one lever that survives.
+   * The constants are a best guess at the module's; `update()` corrects for them
+   * being wrong, so this only has to be close.
+   */
+  private applyBlind(s: FxScreenFxState, amount: number): void {
+    if (amount <= 0.002) { s.blind = 0; s.blindTime = 0; return; }
+    const HOLD = 0.55, RECOVER = 4.2, CURVE = 2.2;
+    s.blind = amount;
+    s.blindTime = amount >= 0.999 ? 0 : HOLD + RECOVER * (1 - Math.pow(amount, 1 / CURVE));
+  }
+
+  /**
+   * Zeroes every transient screen overlay.
+   *
+   * Without this a staged shot inherits the previous shot's flashbang: the
+   * white-out holds for 0.55 s and then recovers over 4.2 s, which is longer
+   * than any capture settles for, so the frame after a flashbang comes out a
+   * flat white rectangle.
+   */
+  private clearScreenFx(): void {
+    const s = this.screenFxState();
+    if (!s) return;
+    s.blind = 0; s.blindTime = 0;
+    s.flash.setScalar(0);
+    s.damage = 0;
+    s.concussion = 0; s.concussionTime = 0;
+    s.blood = 0; s.water = 0; s.dirt = 0;
+  }
+
   after(delay: number, fn: () => void): void {
     this.scheduled.push({ at: this.clock + delay, fn });
   }
@@ -472,6 +550,20 @@ export class FXSystem implements System, FxWorld {
     this.smoke.screen(this, point, radius, duration);
   }
 
+  /**
+   * Unit vector toward the sun, as the renderer currently has it.
+   *
+   * Effects that have to agree with the key light — shafts, god rays, the side
+   * a smoke column is lit from — read it here rather than hard-coding a
+   * direction that is only correct at one time of day.
+   */
+  sunDirection(out = new THREE.Vector3()): THREE.Vector3 {
+    const v = this.shared.boSunDirWorld?.value as THREE.Vector3 | undefined;
+    if (v && Number.isFinite(v.x)) out.copy(v);
+    else out.set(0.32, 0.78, 0.53);
+    return out.normalize();
+  }
+
   /** Adds a persistent fire that emits flame, embers, smoke and light. */
   addFire(point: THREE.Vector3, radius = 0.6, intensity = 1): number {
     return this.environment.addFire(this, point, radius, intensity);
@@ -480,7 +572,10 @@ export class FXSystem implements System, FxWorld {
   /** Adds a volumetric shaft; returns the mesh so callers can remove it. */
   addLightShaft(
     origin: THREE.Vector3, dir: THREE.Vector3, up: THREE.Vector3,
-    o: { width: number; height: number; length: number; color?: number; intensity?: number; falloff?: number; dust?: number },
+    o: {
+      width: number; height: number; length: number; color?: number;
+      intensity?: number; falloff?: number; dust?: number; followSun?: boolean;
+    },
   ): THREE.Mesh {
     const mesh = this.environment.addLightShaft(origin, dir, up, o);
     this.attach(mesh);
@@ -500,6 +595,7 @@ export class FXSystem implements System, FxWorld {
     // previous take's bullet holes as well.
     const decals = (this.renderHost as unknown as { decals?: { clear?(): void } } | null)?.decals;
     decals?.clear?.();
+    this.clearScreenFx();
     this.particles.clear();
     this.quads.clear();
     this.ribbons.clear();
@@ -509,6 +605,8 @@ export class FXSystem implements System, FxWorld {
     this.explosions.clear();
     this.smoke.clear();
     this.environment.clear();
+    this.blindCeiling = -1;
+    this.blindSolvedTime = 0;
     this.scheduled.length = 0;
     this.rand.seed('fx:main');
   }
@@ -537,6 +635,31 @@ export class FXSystem implements System, FxWorld {
 
     if (this.usingFallback) this.updateFallbackUniforms();
     this.ensureSceneCopy(renderer);
+
+    // The white-out's recovery curve raises a negative base to a fractional
+    // power once the effect is ~4.8 s old, which is NaN, and `Math.max(0, NaN)`
+    // is NaN — so the guard that would decay it back to zero never fires again
+    // and every later frame clamps to pure white. One comparison per frame is
+    // cheaper than living with a permanently blank screen.
+    const sfx = this.screenFxState();
+    if (sfx && !Number.isFinite(sfx.blind)) { sfx.blind = 0; sfx.blindTime = 0; }
+    if (sfx && this.blindCeiling >= 0) {
+      // Both this module and the post module listen to `explosion`, and whichever
+      // subscribed second wins, so the ceiling is re-asserted here rather than
+      // trusting subscription order. If the module's clock is where we last left
+      // it and the white-out is *still* over the ceiling, our model of its
+      // recovery curve is out of date — walk its clock forward until it agrees.
+      if (sfx.blind > this.blindCeiling + 0.01) {
+        if (sfx.blindTime < this.blindSolvedTime - 1e-3) {
+          this.applyBlind(sfx, this.blindCeiling);
+        } else {
+          sfx.blindTime += 0.35;
+        }
+        this.blindSolvedTime = sfx.blindTime;
+      } else if (sfx.blind <= 0.004) {
+        this.blindCeiling = -1;
+      }
+    }
 
     // Timed continuations (secondary fire, delayed debris, staged effects).
     if (this.scheduled.length) {

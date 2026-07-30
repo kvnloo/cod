@@ -38,6 +38,33 @@ import type { MaterialKey } from './types';
  */
 export const WEAPON_TEXEL_SCALE = 0.15;
 
+/**
+ * Per-surface override of that repeat.
+ *
+ * 0.15 m is right for a receiver, which is 40 cm long. It is completely wrong
+ * for a glove: a hand is 9 cm across, so at 0.15 m the whole hand shows *half*
+ * a texture repeat and the leather grain lands at roughly the size of a finger.
+ * Cloth and leather are the two surfaces on a first-person frame the eye can
+ * actually resolve the weave of, so they get their own, much tighter, repeat.
+ */
+const TEXEL_OVERRIDE: Partial<Record<MaterialKey, number>> = {
+  glove: 0.060,
+  gloveKnuckle: 0.060,
+  sleeve: 0.105,
+};
+
+/** Metres of surface covered by one texture repeat, for one material key. */
+export function weaponTexelScale(key: MaterialKey): number {
+  return TEXEL_OVERRIDE[key] ?? WEAPON_TEXEL_SCALE;
+}
+
+/**
+ * How much of the scene's environment probe a weapon surface reflects.
+ *
+ * Kept well under 1 deliberately — see the note in `get()`.
+ */
+export const WEAPON_ENV_INTENSITY = 0.5;
+
 /* ----------------------------------------------------------- shared GLSL */
 
 const COMMON = /* glsl */ `
@@ -215,10 +242,13 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
   // Parkerising is matte but not chalky; 0.78 killed every highlight the
   // three-point rig could have put on the receiver. Kept smooth at fine
   // scales for the reason spelled out in the aluminium recipe.
-  float rough = 0.55 + (form - 0.5) * 0.16;
-  rough = mix(rough, 0.62, worn * 0.30);
-  rough -= bare * 0.34;
-  o.rough = clamp(rough, 0.22, 0.82);
+  float rough = 0.64 + (form - 0.5) * 0.12;
+  rough = mix(rough, 0.70, worn * 0.30);
+  rough -= bare * 0.22;
+  // Floor of 0.44: below that a 96%-metal surface starts resolving the
+  // environment cube per texel, and a parkerised receiver ends up wearing the
+  // sky as blue-and-white speckle.
+  o.rough = clamp(rough, 0.44, 0.88);
 }`,
 };
 
@@ -276,10 +306,10 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
 
   o.albedo = col;
   o.metal = 1.0;
-  float rough = 0.26 + (form - 0.5) * 0.10;
-  rough = mix(rough, 0.40, worn * 0.4);
-  rough -= bare * 0.16;
-  o.rough = clamp(rough, 0.10, 0.62);
+  float rough = 0.34 + (form - 0.5) * 0.08;
+  rough = mix(rough, 0.46, worn * 0.4);
+  rough -= bare * 0.12;
+  o.rough = clamp(rough, 0.28, 0.70);
 }`,
 };
 
@@ -435,7 +465,7 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
   // of that probe for every texel — which is how a bead-blasted receiver ends
   // up wearing the colours of the room as speckled camouflage. Variation here
   // is macro (the 8-cycle form field) plus the scratches, and nothing finer.
-  o.rough = clamp(0.40 + (form - 0.5) * 0.13 - bare * 0.55, 0.16, 0.72);
+  o.rough = clamp(0.52 + (form - 0.5) * 0.10 - bare * 0.34, 0.34, 0.80);
 }`,
 };
 
@@ -491,8 +521,261 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
 }`,
 };
 
+/**
+ * Tactical glove — goatskin palm, nomex back, silicone print.
+ *
+ * The gloved hand is the single most recognisable shape in a first-person
+ * shooter and it sits at 25 cm from the eye, so it needs *more* surface
+ * information than the receiver, not less: leather pebble at two scales,
+ * stitched seams, knuckle-side weave, and the polished sheen a working glove
+ * gets across the fingers and the heel of the palm.
+ */
+const glove: ForgeRecipe = {
+  id: 'wpn_glove',
+  seed: 907,
+  size: 1024,
+  geometry: { tile: 0.060, depth: 0.00090 },
+  normalGain: 1.25,
+  normalWide: 0.45,
+  aoRadius: 0.030,
+  aoStrength: 0.80,
+  aoAlbedo: 0.24,
+  common: COMMON,
+  height: /* glsl */ `
+void obHeightFn(vec2 uv, out vec4 h0, out vec4 h1) {
+  // Macro softness first: a glove is a bag over a hand, so it creases.
+  float form = obFbm(uv * 4.5, vec2(4.5), 4, 0.55, uSeed + 5.0);
+  float h = 0.50 + (form - 0.5) * 0.20;
+
+  // Leather pebble grain: worley cells at two scales, the coarse one carrying
+  // most of the read at 25 cm and the fine one only surviving as roughness.
+  vec3 g1 = obWorleyP(uv * 46.0, vec2(46.0), 1.0, uSeed);
+  float pebble = 1.0 - smoothstep(0.0, 0.40, g1.x);
+  vec3 g2 = obWorleyP(uv * 118.0, vec2(118.0), 1.0, uSeed + 3.0);
+  float fine = 1.0 - smoothstep(0.0, 0.44, g2.x);
+  h += pebble * 0.20 + fine * 0.07;
+
+  // Creases: long soft folds running with the fingers.
+  float crease = obScratches(uv, 7.0, 0.9, 9.0, 0.34, uSeed + 11.0);
+  h -= crease * 0.24;
+
+  // Stitched seams: a sparse set of hard lines with the needle holes on them.
+  float seamBand = obScratches(vec2(uv.y, uv.x), 3.0, 0.15, 44.0, 0.055, uSeed + 17.0);
+  float stitch = seamBand * (0.55 + 0.45 * sin(uv.y * 640.0));
+  h -= seamBand * 0.16;
+  h += stitch * 0.10;
+
+  // Nomex weave on the back of the hand, kept fine.
+  vec2 wv = obWeave(uv, 210.0, uSeed + 23.0);
+  float weave = wv.x;
+  h += (weave - 0.5) * 0.045;
+
+  h0 = vec4(clamp(h, 0.0, 1.0), pebble, crease, seamBand);
+  h1 = vec4(weave, form, fine, 0.0);
+}`,
+  shade: /* glsl */ `
+void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
+  float pebble = h0.y, crease = h0.z, seam = h0.w;
+  float weave = h1.x, form = h1.y, fine = h1.z;
+
+  // Black leather is never actually black: it is a very dark warm brown that
+  // lifts on every raised pebble because that is where the light lands.
+  vec3 base = obRGB(50, 46, 43);
+  base = mix(base, obRGB(78, 72, 65), obSat(pebble * 1.25 - 0.10) * 0.75);
+  base = mix(base, obRGB(35, 32, 31), obSat(1.0 - pebble * 1.6) * 0.55);
+  base = mix(base, obRGB(62, 58, 53), obSat(form * 1.1 - 0.30) * 0.40);
+
+  // Creases go dark and dusty; the seam thread is a lighter grey.
+  vec3 col = mix(base, obRGB(21, 19, 18), obSat(crease * 1.2) * 0.55);
+  col = mix(col, obRGB(88, 84, 77), obSat(seam * 1.4) * 0.42);
+  col = mix(col, obRGB(48, 46, 45), obSat(weave - 0.55) * 0.30);
+
+  // Dust and concrete rub, by cavity — a glove that has been on the ground.
+  float grime = obSat(d.cavity * 0.9 + (1.0 - d.ao) * 0.7);
+  col = mix(col, obRGB(70, 65, 57), grime * 0.24);
+
+  o.albedo = col;
+  o.metal = 0.0;
+  // Worn leather is *polished* on the proud grain and dull in the valleys.
+  // That split is what makes it read as leather rather than as felt.
+  float rough = mix(0.88, 0.52, obSat(pebble * 1.1));
+  rough -= obSat(d.curv * 0.5) * 0.14;
+  rough += crease * 0.10 + fine * 0.05;
+  o.rough = clamp(rough, 0.34, 0.95);
+}`,
+};
+
+/** Reinforced knuckle / finger pad: moulded TPR, harder and shinier. */
+const gloveKnuckle: ForgeRecipe = {
+  id: 'wpn_glove_knuckle',
+  seed: 911,
+  size: 512,
+  geometry: { tile: 0.060, depth: 0.00095 },
+  normalGain: 1.2,
+  normalWide: 0.5,
+  aoRadius: 0.030,
+  aoStrength: 0.78,
+  aoAlbedo: 0.20,
+  common: COMMON,
+  height: /* glsl */ `
+void obHeightFn(vec2 uv, out vec4 h0, out vec4 h1) {
+  float form = obFbm(uv * 6.0, vec2(6.0), 4, 0.55, uSeed + 7.0);
+  float h = 0.50 + (form - 0.5) * 0.16;
+  // Moulded tread: chunky ribs with a fine spark-eroded tooth on them.
+  float rib = obRib(uv.y, 34.0, 0.42);
+  h += rib * 0.26;
+  vec3 peb = obWorleyP(uv * 150.0, vec2(150.0), 1.0, uSeed);
+  float tooth = 1.0 - smoothstep(0.0, 0.46, peb.x);
+  h += tooth * 0.08;
+  float scuff = obScratches(uv, 10.0, 1.4, 20.0, 0.22, uSeed + 13.0);
+  h -= scuff * 0.16;
+  h0 = vec4(clamp(h, 0.0, 1.0), rib, scuff, tooth);
+  h1 = vec4(form, 0.0, 0.0, 0.0);
+}`,
+  shade: /* glsl */ `
+void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
+  float rib = h0.y, scuff = h0.z, tooth = h0.w;
+  vec3 col = obRGB(36, 35, 35);
+  col = mix(col, obRGB(62, 61, 62), obSat(rib * 1.2) * 0.7);
+  // Rubber scuffs pale, never metallic.
+  col = mix(col, obRGB(72, 71, 70), smoothstep(0.30, 0.95, scuff) * 0.32);
+  float grime = obSat(d.cavity * 1.0 + (1.0 - d.ao) * 0.8);
+  col = mix(col, obRGB(13, 13, 13), grime * 0.40);
+  o.albedo = col;
+  o.metal = 0.0;
+  o.rough = clamp(0.72 - rib * 0.22 - obSat(d.curv) * 0.10 + tooth * 0.06, 0.30, 0.94);
+}`,
+};
+
+/**
+ * Uniform sleeve — ripstop combat shirt.
+ *
+ * The forearm runs out of the bottom of every first-person frame, so this is
+ * the largest single area of *cloth* on screen. It needs a real weave, a
+ * ripstop grid at a different frequency to the weave, and dust that collects
+ * where the arm rubs.
+ */
+const sleeve: ForgeRecipe = {
+  id: 'wpn_sleeve',
+  seed: 919,
+  size: 1024,
+  geometry: { tile: 0.105, depth: 0.00135 },
+  normalGain: 1.45,
+  normalWide: 0.45,
+  aoRadius: 0.032,
+  aoStrength: 0.82,
+  aoAlbedo: 0.26,
+  common: COMMON,
+  height: /* glsl */ `
+void obHeightFn(vec2 uv, out vec4 h0, out vec4 h1) {
+  // Fabric drape: broad soft folds, then the weave.
+  float drape = obFbm(obWarp(uv * 3.0, vec2(3.0), 0.55, uSeed + 3.0), vec2(3.0), 4, 0.58, uSeed);
+  float h = 0.50 + (drape - 0.5) * 0.44;
+
+  vec2 wv = obWeave(uv, 118.0, uSeed + 5.0);
+  float weave = wv.x;
+  h += (weave - 0.5) * 0.24;
+
+  // Ripstop: a coarse reinforcing grid every ~8 threads.
+  float gx = obRib(uv.x, 21.0, 0.12);
+  float gy = obRib(uv.y, 21.0, 0.12);
+  float rip = max(gx, gy);
+  h += rip * 0.14;
+
+  // Pilling and abrasion where the sleeve drags.
+  float fuzz = obFbm(uv * 240.0, vec2(240.0), 2, 0.5, uSeed + 11.0);
+  h += (fuzz - 0.5) * 0.05;
+  float wear = smoothstep(0.56, 0.90, obFbm(uv * 2.4, vec2(2.4), 4, 0.55, uSeed + 17.0));
+
+  h0 = vec4(clamp(h, 0.0, 1.0), weave, rip, wear);
+  h1 = vec4(drape, wv.y, fuzz, 0.0);
+}`,
+  shade: /* glsl */ `
+void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
+  float weave = h0.y, rip = h0.z, wear = h0.w;
+  float drape = h1.x, warp = h1.y;
+
+  // Desaturated field-grey/olive: the colour a uniform actually is after a
+  // fortnight, not the saturated green of a costume.
+  vec3 base = obRGB(84, 81, 70);
+  // Warp and weft catch light differently — that two-tone is what reads as
+  // woven rather than as painted canvas.
+  base = mix(base, obRGB(97, 93, 80), warp * 0.55);
+  base = mix(base, obRGB(64, 62, 55), obSat(1.0 - weave * 1.3) * 0.55);
+  base = mix(base, obRGB(93, 90, 78), obSat(drape * 1.15 - 0.25) * 0.35);
+  base = mix(base, obRGB(104, 100, 87), rip * 0.30);
+
+  // Sun-bleached on the proud folds, dusty in the creases.
+  vec3 col = mix(base, obRGB(120, 115, 100), wear * 0.28);
+  float grime = obSat(d.cavity * 1.0 + (1.0 - d.ao) * 0.85);
+  col = mix(col, obRGB(50, 47, 41), grime * 0.34);
+
+  o.albedo = col;
+  o.metal = 0.0;
+  // Cloth is rough everywhere; the only variation is the sheen on rubbed spots.
+  o.rough = clamp(0.94 - wear * 0.16 - obSat(d.curv * 0.4) * 0.06, 0.62, 0.99);
+}`,
+};
+
+/**
+ * Optic body — matte black hard-coat over aluminium.
+ *
+ * Routing this through the bead-blasted `alu` recipe was the mistake that made
+ * every sight in the armoury read as polished chrome. A combat optic is the
+ * *least* reflective object on a weapon by design — a scope that throws a
+ * specular arc gets its owner shot — and the finish is a thick matte hard-coat
+ * with almost no micro-normal at all. So: near-zero height detail, roughness
+ * that varies only over centimetres, and a metalness low enough that the body
+ * is coloured by its own paint rather than by whatever is behind the player.
+ */
+const opticBody: ForgeRecipe = {
+  id: 'wpn_optic',
+  seed: 929,
+  size: 512,
+  geometry: { tile: WEAPON_TEXEL_SCALE, depth: 0.00006 },
+  normalGain: 0.45,
+  normalWide: 0.70,
+  aoRadius: 0.024,
+  aoStrength: 0.30,
+  aoAlbedo: 0.10,
+  common: COMMON,
+  height: /* glsl */ `
+void obHeightFn(vec2 uv, out vec4 h0, out vec4 h1) {
+  // Macro only. Anything finer than a centimetre here becomes per-texel
+  // roughness on a metal, and per-texel roughness on a metal is speckle.
+  float form = obFbm(uv * 5.0, vec2(5.0), 3, 0.5, uSeed + 3.0);
+  float h = 0.52 + (form - 0.5) * 0.22;
+  // A very fine sand texture in the hard-coat, deliberately shallow.
+  float sand = obFbm(uv * 90.0, vec2(90.0), 2, 0.5, uSeed + 7.0);
+  h += (sand - 0.5) * 0.030;
+  // Handling wear: the coat rubs through on turret caps and mount edges only.
+  float scratch = obScratches(uv, 8.0, 1.2, 26.0, 0.10, uSeed + 13.0);
+  h -= scratch * 0.10;
+  h0 = vec4(clamp(h, 0.0, 1.0), scratch, sand, 0.0);
+  h1 = vec4(form, 0.0, 0.0, 0.0);
+}`,
+  shade: /* glsl */ `
+void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
+  float scratch = h0.y, sand = h0.z;
+  float form = h1.x;
+  vec3 base = obRGB(24, 24, 25);
+  base = mix(base, obRGB(29, 29, 30), obSat(sand * 1.1 - 0.20) * 0.45);
+  base = mix(base, obRGB(20, 20, 21), obSat(1.0 - form * 1.3) * 0.45);
+  // Grey aluminium showing where the coat is worn off an edge.
+  vec3 col = mix(base, obRGB(96, 97, 100), smoothstep(0.62, 0.98, obSat(scratch)) * 0.30);
+  float grime = obSat(d.cavity * 0.6 + (1.0 - d.ao) * 0.9);
+  col = mix(col, obRGB(16, 16, 16), grime * 0.30);
+  o.albedo = col;
+  // Deliberately low: a matte hard-coat is closer to paint than to bare metal,
+  // and full metalness is what turns a sight into a mirror of the sky.
+  o.metal = 0.18;
+  o.rough = clamp(0.62 + (form - 0.5) * 0.10 - scratch * 0.14, 0.42, 0.86);
+}`,
+};
+
 const RECIPES: Record<string, ForgeRecipe> = {
-  phosphate, blued, polymer, rubber, alu, wood,
+  phosphate, blued, polymer, rubber, alu, wood, glove, gloveKnuckle, sleeve,
+  optic: opticBody,
 };
 
 /** Flat stand-ins used before the GPU exists and on the `low` preset. */
@@ -507,7 +790,10 @@ const FALLBACK: Record<MaterialKey, { color: number; rough: number; metal: numbe
   brass: { color: 0x8f6b2c, rough: 0.28, metal: 1.0 },
   glass: { color: 0x0d1418, rough: 0.06, metal: 0.0 },
   lens: { color: 0x081418, rough: 0.03, metal: 0.0 },
-  black: { color: 0x1c1d1f, rough: 0.42, metal: 0.85 },
+  black: { color: 0x181819, rough: 0.62, metal: 0.18 },
+  glove: { color: 0x36322f, rough: 0.72, metal: 0.0 },
+  gloveKnuckle: { color: 0x211f1f, rough: 0.66, metal: 0.0 },
+  sleeve: { color: 0x504e45, rough: 0.92, metal: 0.0 },
 };
 
 /**
@@ -526,7 +812,10 @@ const SOURCE: Record<MaterialKey, { recipe: string | null; tint: number }> = {
   alu: { recipe: 'alu', tint: 0xffffff },
   wood: { recipe: 'wood', tint: 0xffffff },
   brass: { recipe: 'blued', tint: 0xe8ae52 },
-  black: { recipe: 'alu', tint: 0x9aa0a4 },
+  black: { recipe: 'optic', tint: 0xffffff },
+  glove: { recipe: 'glove', tint: 0xffffff },
+  gloveKnuckle: { recipe: 'gloveKnuckle', tint: 0xffffff },
+  sleeve: { recipe: 'sleeve', tint: 0xffffff },
   glass: { recipe: null, tint: 0xffffff },
   lens: { recipe: null, tint: 0xffffff },
 };
@@ -565,16 +854,22 @@ interface WearTune {
 
 const WEAR: Record<MaterialKey, WearTune> = {
   // Parkerising is thin and wears through on every handled corner.
-  phosphate: { edge: 0.62, edgeRough: 0.26, cavity: 0.34, cavityRough: 0.10, bare: 0xa9adb4, varAlbedo: 0.16, varRough: 0.10, edgeMetal: 0.08, normal: 0.80 },
-  blued: { edge: 0.50, edgeRough: 0.10, cavity: 0.32, cavityRough: 0.10, bare: 0x9fa4ad, varAlbedo: 0.14, varRough: 0.07, edgeMetal: 0.0, normal: 0.60 },
-  alu: { edge: 0.46, edgeRough: 0.16, cavity: 0.30, cavityRough: 0.10, bare: 0xa8acb2, varAlbedo: 0.14, varRough: 0.08, edgeMetal: 0.10, normal: 0.55 },
-  black: { edge: 0.34, edgeRough: 0.14, cavity: 0.34, cavityRough: 0.10, bare: 0x8e939a, varAlbedo: 0.12, varRough: 0.08, edgeMetal: 0.10, normal: 0.55 },
+  phosphate: { edge: 0.62, edgeRough: 0.14, cavity: 0.34, cavityRough: 0.10, bare: 0xa9adb4, varAlbedo: 0.16, varRough: 0.10, edgeMetal: 0.08, normal: 0.80 },
+  blued: { edge: 0.50, edgeRough: 0.07, cavity: 0.32, cavityRough: 0.10, bare: 0x9fa4ad, varAlbedo: 0.14, varRough: 0.07, edgeMetal: 0.0, normal: 0.60 },
+  alu: { edge: 0.46, edgeRough: 0.09, cavity: 0.30, cavityRough: 0.10, bare: 0xa8acb2, varAlbedo: 0.14, varRough: 0.08, edgeMetal: 0.10, normal: 0.55 },
+  black: { edge: 0.15, edgeRough: 0.05, cavity: 0.34, cavityRough: 0.08, bare: 0x63666b, varAlbedo: 0.09, varRough: 0.05, edgeMetal: 0.03, normal: 0.35 },
   // Polymer does not go metallic; it stress-whitens and polishes.
   polymer: { edge: 0.30, edgeRough: 0.20, cavity: 0.32, cavityRough: 0.08, bare: 0x6e6f72, varAlbedo: 0.14, varRough: 0.12, edgeMetal: 0.0, normal: 1.0 },
   polymerTan: { edge: 0.28, edgeRough: 0.20, cavity: 0.34, cavityRough: 0.08, bare: 0x8d8264, varAlbedo: 0.16, varRough: 0.12, edgeMetal: 0.0, normal: 1.0 },
   rubber: { edge: 0.22, edgeRough: 0.26, cavity: 0.38, cavityRough: 0.04, bare: 0x4a4a4b, varAlbedo: 0.10, varRough: 0.10, edgeMetal: 0.0, normal: 1.0 },
   wood: { edge: 0.34, edgeRough: 0.14, cavity: 0.38, cavityRough: 0.12, bare: 0xa07a4c, varAlbedo: 0.18, varRough: 0.12, edgeMetal: 0.0, normal: 0.95 },
   brass: { edge: 0.40, edgeRough: 0.14, cavity: 0.30, cavityRough: 0.10, bare: 0xf0d08a, varAlbedo: 0.10, varRough: 0.06, edgeMetal: 0.0, normal: 0.65 },
+  // Cloth and leather have no "bare metal" under them, but they *do* rub pale
+  // on every proud fold and darken in every crease — the same two masks, spent
+  // on a completely different look.
+  glove: { edge: 0.34, edgeRough: 0.22, cavity: 0.44, cavityRough: 0.06, bare: 0x4c4744, varAlbedo: 0.20, varRough: 0.14, edgeMetal: 0.0, normal: 1.0 },
+  gloveKnuckle: { edge: 0.26, edgeRough: 0.20, cavity: 0.42, cavityRough: 0.06, bare: 0x45464a, varAlbedo: 0.16, varRough: 0.12, edgeMetal: 0.0, normal: 1.0 },
+  sleeve: { edge: 0.30, edgeRough: 0.10, cavity: 0.46, cavityRough: 0.04, bare: 0x8b877a, varAlbedo: 0.22, varRough: 0.10, edgeMetal: 0.0, normal: 1.0 },
   glass: { edge: 0, edgeRough: 0, cavity: 0, cavityRough: 0, bare: 0xffffff, varAlbedo: 0, varRough: 0, edgeMetal: 0, normal: 1.0 },
   lens: { edge: 0, edgeRough: 0, cavity: 0, cavityRough: 0, bare: 0xffffff, varAlbedo: 0, varRough: 0, edgeMetal: 0, normal: 1.0 },
 };
@@ -614,10 +909,17 @@ export class WeaponMaterials {
         color: fb.color,
         roughness: fb.rough,
         metalness: fb.metal,
-        envMapIntensity: 1.0,
+        // The view model already has a three-point rig keyed off the sun. At
+        // full probe intensity the weapon *also* mirrors the whole sky cube,
+        // which is why a dark warehouse interior rendered the rifle brighter
+        // than its own floor and warmer than its own walls: it was not being
+        // lit by the room at all, it was reflecting the sky outside it.
+        envMapIntensity: WEAPON_ENV_INTENSITY,
       });
     mat.name = `weapon:${key}:${space}`;
-    mat.userData.surface = key === 'wood' ? 'wood' : key === 'polymer' || key === 'polymerTan' ? 'plastic' : 'metal';
+    mat.userData.surface = key === 'wood' ? 'wood'
+      : key === 'glove' || key === 'gloveKnuckle' || key === 'sleeve' ? 'cloth'
+        : key === 'polymer' || key === 'polymerTan' ? 'plastic' : 'metal';
     if (key !== 'glass' && key !== 'lens') this.installWear(key, mat);
     this.cache.set(id, mat);
     if (this.forge) this.upgradeOne(key, mat);
@@ -673,7 +975,7 @@ export class WeaponMaterials {
       depthWrite: false,
       side: THREE.FrontSide,
     });
-    m.envMapIntensity = key === 'lens' ? 2.6 : 1.8;
+    m.envMapIntensity = key === 'lens' ? 1.3 : 0.9;
     m.emissive = new THREE.Color(key === 'lens' ? 0x04141b : 0x000000);
     return m;
   }
@@ -733,7 +1035,7 @@ export class WeaponMaterials {
     if (key === 'polymer' || key === 'polymerTan' || key === 'rubber' || key === 'wood' || key === 'black') {
       // The ORM's metal channel is authored at 0 for these, but keep the
       // multiplier honest so a future recipe change cannot make furniture shiny.
-      mat.metalness = key === 'black' ? 0.35 : 1;
+      mat.metalness = 1;
     }
     mat.needsUpdate = true;
   }

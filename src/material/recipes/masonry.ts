@@ -393,7 +393,10 @@ void obHeightFn(vec2 uv, out vec4 h0, out vec4 h1) {
   // Rough-hewn face: chisel facets from ridged noise, at hand scale.
   float facet = obRidged(uv * 22.0, vec2(22.0), 4, 0.5, uSeed + 11.0);
   float pocks = obWorleyFbm(uv * 90.0, vec2(90.0), 3, 1.0, uSeed + 23.0);
-  float h = mix(0.20, mix(0.68, 0.94, c.rnd.x), face);
+  // Blocks sit at genuinely different depths. A 0.68-0.94 spread gives a wall
+  // of identical bricks; a setted street needs some stones pushed right down
+  // into the bedding and others standing proud enough to trip on.
+  float h = mix(0.20, mix(0.50, 1.00, c.rnd.x), face);
   h += (facet - 0.5) * 0.14 * face;
   h -= pocks * 0.07 * face;
   vec3 pit = obWorleyP(uv * 330.0, vec2(330.0), 1.0, uSeed + 27.0);
@@ -412,16 +415,29 @@ void obHeightFn(vec2 uv, out vec4 h0, out vec4 h1) {
 void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
   float face = h0.w;
   float facet = h1.x;
+  float r1 = h1.w;
 
-  // One quarry, one bed. Block-to-block variation in real ashlar is a hint of
-  // warmth, not a change of stone — a wall built of alternating light and dark
-  // blocks is the classic procedural giveaway.
+  // One quarry, one bed — but a *worn* one. Keeping block-to-block variation
+  // down to a hint of warmth is right for fresh ashlar and completely wrong for
+  // a setted street, where a handful of stones are near-black basalt, a handful
+  // are bleached, and the rest are somewhere between. Sixty metres of paving in
+  // one value is the single loudest tell in the build, and this is where the
+  // stone half of it lives.
   vec3 lime  = obRGB(147, 143, 133);
   vec3 grey  = obRGB(125, 123, 118);
   vec3 warm  = obRGB(146, 137, 121);
+  vec3 dark  = obRGB( 74,  72,  70);
+  vec3 bleach= obRGB(178, 174, 164);
 
   vec3 col = mix(grey, lime, obSat(h0.z * 0.85 + facet * 0.4));
   col = mix(col, warm, obFbm(uv * 6.0, vec2(6.0), 4, 0.5, uSeed + 61.0) * 0.42);
+  // A handful of the stones are a visibly different rock. Kept to a handful:
+  // at a third of the blocks it stops reading as a quarry mix and starts
+  // reading as a randomly coloured tile grid.
+  col = mix(col, dark, smoothstep(0.85, 0.97, r1) * 0.38 * face);
+  col = mix(col, bleach, smoothstep(0.93, 1.00, h0.z) * 0.30 * face);
+  // Per-block value drift on top, so no two adjacent stones match.
+  col *= mix(0.87, 1.13, fract(h0.z * 3.7 + r1 * 1.9));
 
   float vein = obRidged(uv * 9.0, vec2(9.0), 4, 0.5, uSeed + 71.0);
   col = mix(col, obRGB(165, 161, 152), smoothstep(0.74, 0.96, vein) * 0.28 * face);
@@ -445,10 +461,13 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
   o.albedo = col;
   o.metal = 0.0;
   // Chisel facets polish where hands and weather have touched them; the pocked
-  // hollows stay matte, so raking light picks out the tooling.
+  // hollows stay matte, so raking light picks out the tooling. Traffic has
+  // burnished a third of the stones nearly smooth, which is what makes a setted
+  // street glitter unevenly under a low sun instead of reading as one mat.
   float rough = mix(0.97, 0.80, face);
   rough += facet * 0.10 + grime * 0.06 - edge * 0.16 - vein * 0.05;
-  o.rough = clamp(rough, 0.34, 1.0);
+  rough -= smoothstep(0.60, 0.96, fract(r1 * 5.3 + h0.z * 2.1)) * 0.20 * face;
+  o.rough = clamp(rough, 0.18, 1.0);
 }`,
   },
 };

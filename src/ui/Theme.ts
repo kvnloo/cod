@@ -25,16 +25,32 @@ export interface Palette {
   inkDim: RGB;
   /** Tertiary / disabled. */
   inkFaint: RGB;
-  /** The single accent colour: objectives, streaks, emphasis, XP. */
+  /**
+   * The accent hue. **Objectives only** — the mission label, objective markers
+   * on the map / compass / world, and the reward beat that pays one off.
+   *
+   * It is deliberately the rarest colour on screen. Score, damage, hit markers,
+   * killstreak tiles and the health bar all used to share it, which left eleven
+   * clusters of the same amber competing and nothing receding. Those now read by
+   * *value* (near-white when they matter, grey when they do not) so the amber
+   * always means the same thing: "this is the objective".
+   */
   accent: RGB;
   /** Enemy, incoming damage, low health. */
   hostile: RGB;
-  /** Friendly / squad. */
+  /** Friendly / squad / the player's own kills. */
   friendly: RGB;
   /** Positive confirmation — armour break, regen. */
   good: RGB;
   /** Warning — low ammo, critical. */
   warn: RGB;
+  /**
+   * Damage the player deals. A *warm* off-white against the cool grey-blue of
+   * the rest of the interface: it separates from every other neutral at a
+   * glance without spending a saturated hue on a number that is on screen for
+   * under a second. Killing blows escalate to `hostile`.
+   */
+  damage: RGB;
   /** Panel fill. */
   panel: RGB;
   /** Hairline rules. */
@@ -54,6 +70,7 @@ const BASE: Palette = {
   friendly: [0x4f, 0xc3, 0xff],
   good: [0x5c, 0xdd, 0x9e],
   warn: [0xff, 0x8a, 0x2b],
+  damage: [0xff, 0xf0, 0xdb],
   panel: [0x08, 0x0c, 0x12],
   hair: [0xa8, 0xb8, 0xc8],
   shade: [0x00, 0x02, 0x05],
@@ -144,6 +161,41 @@ export const FONT_SANS =
   + "'DejaVu Sans',system-ui,sans-serif";
 export const FONT_MONO =
   "'JetBrains Mono','Fira Code','DejaVu Sans Mono','Liberation Mono',ui-monospace,monospace";
+
+/* ----------------------------------------------------------- hierarchy ---- */
+
+/**
+ * How far each tier of the interface steps back when the player aims.
+ *
+ * Aiming has to *simplify* the frame, and simplifying means promoting the two
+ * numbers a player parses without looking — ammunition and health — while the
+ * things they cannot act on while holding a sight picture get out of the way.
+ * The previous pass had this exactly inverted: the ammo count was faded to 58%
+ * while the minimap kept its whole corner at a ghostly 18%, which is the worst
+ * of both — unreadable *and* still occupying the pixel.
+ *
+ * A tier is a multiplier on `ads` subtracted from 1, so `gone` (>1) reaches
+ * zero before the aim blend finishes and the element is properly absent rather
+ * than a smudge.
+ */
+export const ADS_FADE = {
+  /** Ammunition, health: the peripheral reads. They never step back. */
+  vital: 0,
+  /** Reticle-adjacent feedback — damage numbers, hit markers. */
+  feedback: 0.2,
+  /** Killfeed, compass, running score. Legible but clearly secondary. */
+  ambient: 0.66,
+  /** Killstreaks, equipment: nothing you can act on mid-sight-picture. */
+  idle: 0.9,
+  /** Fully removed — the minimap. */
+  gone: 1.25,
+} as const;
+
+/** `base` faded by `tier` for the current aim blend, clamped to 0. */
+export function adsFade(base: number, ads: number, tier: number): number {
+  const v = base * (1 - ads * tier);
+  return v < 0 ? 0 : v > base ? base : v;
+}
 
 /* ------------------------------------------------------------- metrics ---- */
 

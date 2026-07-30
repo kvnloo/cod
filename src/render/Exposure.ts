@@ -48,8 +48,11 @@ void main() {
 
 const HISTOGRAM_VERT = /* glsl */ `
 uniform sampler2D tLum;
+uniform sampler2D tDepth;
 uniform vec2 uLumSize;
 uniform vec2 uRange;      // x minLog, y 1/(maxLog-minLog)
+uniform vec2 uMeter;      // x sky weight, y distant-geometry weight
+uniform vec2 uCamera;     // near, far
 out float vWeight;
 
 void main() {
@@ -65,6 +68,21 @@ void main() {
 	vec2 uv = ( vec2( texel ) + 0.5 ) / uLumSize;
 	vec2 d = ( uv - 0.5 ) * vec2( 1.0, 0.75 );
 	vWeight = mix( 1.0, 0.16, clamp( dot( d, d ) * 3.4, 0.0, 1.0 ) );
+
+	// Meter the subject, not the sky. Sky pixels sit exactly on the far plane
+	// and are two to three stops above anything the player is standing on;
+	// letting them into the average is what stops a plaza down to 3% grey the
+	// moment the camera tilts up. They keep a small weight so a frame that is
+	// nothing but sky still has something to meter, and everything within the
+	// far quarter of the depth range (the backdrop ridge, distant haze) is
+	// partially discounted for the same reason.
+	float depth = textureLod( tDepth, uv, 0.0 ).r;
+	float ndc = depth * 2.0 - 1.0;
+	float linear = ( 2.0 * uCamera.x * uCamera.y )
+		/ ( uCamera.y + uCamera.x - ndc * ( uCamera.y - uCamera.x ) );
+	vWeight *= mix( 1.0, uMeter.y, smoothstep( 55.0, 220.0, linear ) );
+	vWeight *= mix( 1.0, uMeter.x, step( 0.9999995, depth ) );
+
 	// Reject anything that is essentially black — it is usually a skybox hole
 	// or a fully occluded pixel and only biases the average down.
 	if ( lum < 1e-5 ) vWeight = 0.0;
@@ -112,14 +130,20 @@ uniform sampler2D tPartial;
 uniform sampler2D tHistogram;
 uniform sampler2D tDepth;
 uniform vec2 uRange;
-uniform vec4 uCamera;   // near, far
+uniform vec4 uCamera;   // near, far, lowCut, highCut
 
 void main() {
 	float total = 0.0;
 	for ( int g = 0; g < 16; g ++ ) total += texelFetch( tPartial, ivec2( g, 0 ), 0 ).r;
 
-	float lowCut = total * 0.45;
-	float highCut = total * 0.95;
+	// Trim window over the weighted distribution. The old 45%/95% pair threw
+	// away the darkest *half* of every frame, which in a street shot is the
+	// street: the subject the player is standing on was excluded from its own
+	// exposure by construction, and the average was set by the lit facades and
+	// the haze above them. Discarding rather less at the bottom and rather more
+	// at the top puts the median of what is actually on screen back in charge.
+	float lowCut = total * uCamera.z;
+	float highCut = total * uCamera.w;
 
 	float acc = 0.0;
 	float sumW = 0.0;
@@ -166,6 +190,24 @@ export interface ExposureSettings {
    * times of day while making all of them legible.
    */
   darkAdapt: number;
+  /**
+   * Partial adaptation above EV100 `brightPivot`. Same idea at the other end:
+   * a full meter renders midnight and midday at exactly the same grey, which is
+   * the single biggest reason a time-of-day cycle reads as a colour filter
+   * rather than as light. Below 1 the image keeps a share of the scene's own
+   * brightness, so noon is genuinely brighter than golden hour.
+   */
+  brightAdapt: number;
+  /** EV100 above which `brightAdapt` starts to apply. */
+  brightPivot: number;
+  /** Metering weight for pixels on the far plane (sky). */
+  skyWeight: number;
+  /** Metering weight for distant geometry (backdrop, far haze). */
+  distantWeight: number;
+  /** Fraction of the weighted histogram discarded from the dark end. */
+  lowCut: number;
+  /** Fraction of the weighted histogram kept from the bright end. */
+  highCut: number;
 }
 
 export class ExposureSystem {
@@ -181,7 +223,12 @@ export class ExposureSystem {
     // tonemap + grade, which is considerably more contrasty than a bare AgX)
     // lands mid-grey on a sunlit diffuse surface. `FrameGraph.present` scales
     // this back down when it has to tonemap by itself.
-    key: 0.42,
+    //
+    // 0.36 rather than 0.42: the trim window below no longer throws away the
+    // darkest half of the frame, so the same key now means something brighter
+    // than it used to — the number it was fitted against was the average of the
+    // *lit* part of the image, not of the image.
+    key: 0.36,
     compensation: 0,
     manual: 1,
     speedUp: 3.6,
@@ -193,7 +240,13 @@ export class ExposureSystem {
     // relationship between times of day comes from `darkAdapt`.
     minEV: -8,
     maxEV: 16,
-    darkAdapt: 0.70,
+    darkAdapt: 0.42,
+    brightAdapt: 0.72,
+    brightPivot: 1.5,
+    skyWeight: 0.10,
+    distantWeight: 0.35,
+    lowCut: 0.26,
+    highCut: 0.88,
   };
 
   private renderer!: THREE.WebGLRenderer;
@@ -216,6 +269,15 @@ export class ExposureSystem {
   private readback = new Uint8Array(4);
   private readbackPending = false;
   private useAsync = true;
+  /**
+   * Capture runs resolve the meter every frame instead of easing toward it.
+   * The harness only settles a shot for ~24 frames, which at a plausible
+   * gameplay adaptation rate leaves the eye somewhere between the *previous*
+   * shot and this one — so every screenshot in a contact sheet was exposed for
+   * whatever the camera happened to be looking at before it. Determinism beats
+   * simulated latency in a still.
+   */
+  private instant = false;
   private settled = 0;
   private haveSample = false;
   private far = 900;
@@ -224,6 +286,7 @@ export class ExposureSystem {
     this.renderer = renderer;
     this.blitter = blitter;
     this.useAsync = useAsync;
+    this.instant = !useAsync;
 
     const half = {
       type: THREE.HalfFloatType, format: THREE.RGBAFormat,
@@ -273,8 +336,11 @@ export class ExposureSystem {
       fragmentShader: HISTOGRAM_FRAG,
       uniforms: {
         tLum: { value: this.lumTarget.texture },
+        tDepth: { value: null },
         uLumSize: { value: new THREE.Vector2(LUM_W, LUM_H) },
         uRange: { value: range.clone() },
+        uMeter: { value: new THREE.Vector2(0.10, 0.35) },
+        uCamera: { value: new THREE.Vector2(0.02, 900) },
       },
       depthTest: false, depthWrite: false, toneMapped: false,
       blending: THREE.CustomBlending,
@@ -345,6 +411,9 @@ export class ExposureSystem {
     this.blitter.blit(r, this.downsampleMat, this.lumTarget);
 
     // 2 — scatter into the histogram
+    this.histMat.uniforms.tDepth.value = depth;
+    (this.histMat.uniforms.uMeter.value as THREE.Vector2).set(this.settings.skyWeight, this.settings.distantWeight);
+    (this.histMat.uniforms.uCamera.value as THREE.Vector2).set(near, far);
     r.setRenderTarget(this.histTarget);
     r.setClearColor(0x000000, 0);
     r.clear(true, false, false);
@@ -353,7 +422,8 @@ export class ExposureSystem {
     // 3 — reduce 256 → 16 → 1
     this.blitter.blit(r, this.reduceAMat, this.partialTarget);
     this.reduceBMat.uniforms.tDepth.value = depth;
-    (this.reduceBMat.uniforms.uCamera.value as THREE.Vector4).set(near, far, 0, 0);
+    (this.reduceBMat.uniforms.uCamera.value as THREE.Vector4)
+      .set(near, far, this.settings.lowCut, this.settings.highCut);
     this.blitter.blit(r, this.reduceBMat, this.resultTarget);
 
     r.autoClear = prevAutoClear;
@@ -387,7 +457,7 @@ export class ExposureSystem {
       const target = Math.pow(2, logLum);
 
       const ratio = Math.abs(Math.log2(Math.max(target, 1e-6) / Math.max(this.averageLuminance, 1e-6)));
-      if (this.settled < 2 || ratio > 3.2) {
+      if (this.instant || this.settled < 2 || ratio > 3.2) {
         // First frames, or a teleport/time-of-day jump: snap rather than crawl.
         this.averageLuminance = target;
       } else {
@@ -402,10 +472,12 @@ export class ExposureSystem {
     // Standard saturation-based metering: EV100 = log2(L * 100 / K), K = 12.5.
     const lum = Math.max(this.averageLuminance, 1e-6);
     let ev = Math.log2((lum * 100) / 12.5);
-    // Below EV100 0 the meter only partially opens up, so dusk reads warmer and
-    // a stop under noon, and night reads as night — rather than every hour of
-    // the day metering to the same grey.
+    // Partial adaptation at both ends. Below EV100 0 the meter only partially
+    // opens up, so dusk reads warmer and a stop under noon and night reads as
+    // night; above `brightPivot` it only partially stops down, so midday is
+    // genuinely brighter than golden hour instead of metering to the same grey.
     if (ev < 0) ev *= s.darkAdapt;
+    else if (ev > s.brightPivot) ev = s.brightPivot + (ev - s.brightPivot) * s.brightAdapt;
     ev = THREE.MathUtils.clamp(ev, s.minEV, s.maxEV);
     const effective = Math.pow(2, ev) * 12.5 / 100;
     this.exposure = (s.key / effective) * Math.pow(2, s.compensation) * s.manual;

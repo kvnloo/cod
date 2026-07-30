@@ -63,6 +63,12 @@ export interface FxWorld {
   shake(amount: number, frequency?: number, duration?: number): void;
   flash(intensity: number, color?: number, decay?: number): void;
   concussion(intensity: number, duration: number): void;
+  /**
+   * Retinal white-out, 0..1. Unlike `flash` this is *the* blinding overlay, so
+   * an effect must scale it by how close the charge went off — a stun grenade
+   * across the street should wash the frame, not erase it.
+   */
+  blind(amount: number): void;
   /** Schedules `fn` to run after `delay` seconds of FX clock. */
   after(delay: number, fn: () => void): void;
 }

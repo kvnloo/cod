@@ -13,6 +13,7 @@ import type { PhysicsAPI } from '../physics/types';
 import type { RenderAPI } from '../render/types';
 import { Movement, TUNING, type MoveState } from './Movement';
 import { CameraRig } from './CameraRig';
+import type { PlayerNetDriver } from './NetDriver';
 
 const HEALTH: Record<string, number> = {
   max: 100,
@@ -30,6 +31,13 @@ export class PlayerSystem implements System {
 
   readonly movement = new Movement();
   readonly camera = new CameraRig();
+
+  /**
+   * When set, the netcode owns the movement step: it builds the command, applies
+   * it locally for prediction, and replays it after a server correction. Null in
+   * single-player, where movement is stepped straight from local input.
+   */
+  netDriver: PlayerNetDriver | null = null;
 
   health = HEALTH.max;
   readonly maxHealth = HEALTH.max;
@@ -82,7 +90,9 @@ export class PlayerSystem implements System {
     if (!this.alive) return;
 
     const prevState = this.movement.out.state;
-    const out = this.movement.step(dt, this.camera.yaw);
+    const out = this.netDriver
+      ? this.netDriver.fixedStep(dt, this.camera.yaw, this.camera.pitch)
+      : this.movement.step(dt, this.camera.yaw, this.camera.pitch);
 
     if (out.landImpact > 0) {
       this.camera.land(out.landImpact);
@@ -123,6 +133,16 @@ export class PlayerSystem implements System {
 
     this.camera.look(s.mouseDX, s.mouseDY, dt, adsHeld);
     if (s.usingGamepad) this.camera.stick(s.lookX, s.lookY, dt, adsHeld);
+
+    // Decay any pending server correction and feed it to the rig, so the
+    // simulation can snap while the view slides.
+    if (this.netDriver) {
+      this.netDriver.updateVisual(dt);
+      const o = this.netDriver.visualOffset;
+      this.camera.predictionOffset.set(o.x, o.y, o.z);
+    } else if (this.camera.predictionOffset.lengthSq() > 0) {
+      this.camera.predictionOffset.set(0, 0, 0);
+    }
 
     // The capture harness owns the camera while a fixed shot is framed.
     if (!ctx.engine.cameraLockedByCapture) {

@@ -143,12 +143,24 @@ export function toppledTram(chunk: Chunk, x: number, z: number, yaw: number): vo
   // under — and puts the top of the shell at 3.8 m, which is what makes it the
   // sightline break the square is built around.
   const roll = -Math.PI * 0.28;
-  body.pushTRS(x, y + 0.85, z, yaw, 0, roll);
-  glass.push(body.matrix);
-  rustM.push(body.matrix);
-  cream.push(body.matrix);
+
+  // Jackknifed, and the two half-cars are *not* copies.
+  //
+  // Built as one transform with a mirrored loop, this read as two identical
+  // containers butted end to end with a seam down the middle — which is
+  // exactly what it was. A derailed articulated tram folds at the joint, and
+  // the leading car takes the damage: so each half now gets its own yaw and
+  // roll about the articulation point, its own bay count, its own door
+  // positions and its own state of repair.
+  const segYaw = { '-1': yaw - 0.115, '1': yaw + 0.10 } as Record<string, number>;
+  const segRoll = { '-1': roll - 0.055, '1': roll + 0.035 } as Record<string, number>;
 
   for (const seg of [-1, 1]) {
+    const lead = seg === -1;                          // the car that ploughed
+    body.pushTRS(x, y + 0.85, z, segYaw[String(seg)], 0, segRoll[String(seg)]);
+    glass.push(body.matrix);
+    rustM.push(body.matrix);
+    cream.push(body.matrix);
     const cz = seg * (L * 0.52);
     body.chamferBox(0, H, cz, W, H * 0.98, L * 0.5, 0.05, 2.0);
     // Cream livery band along the waist — the single strongest read at
@@ -165,10 +177,12 @@ export function toppledTram(chunk: Chunk, x: number, z: number, yaw: number): vo
     // the flank rendered as one unbroken sheet of paint. They belong on the
     // midpoints *between* the bays. This is the difference between the shell
     // reading as a tram and reading as a shipping container.
-    const bays = 6;
+    const bays = lead ? 5 : 6;
     const step = (L * 0.84) / (bays - 1);
     for (let i = 0; i < bays; i++) {
       const wz = cz - L * 0.42 + i * step;
+      // The leading car lost two panes and has one blown out of its frame.
+      if (lead && (i === 1 || i === 3)) continue;
       for (const sx of [-1, 1]) {
         glass.box(sx * (W + 0.006), H + 0.35, wz, 0.008, 0.4, step * 0.4, { unit: true });
       }
@@ -183,11 +197,16 @@ export function toppledTram(chunk: Chunk, x: number, z: number, yaw: number): vo
       rustM.box(sx * (W + 0.012), H + 0.79, cz, 0.014, 0.045, L * 0.48, 1.2);
       rustM.box(sx * (W + 0.012), H - 0.08, cz, 0.014, 0.045, L * 0.48, 1.2);
     }
-    // Passenger doors: a recessed leaf pair per segment, with the rubbing strip.
-    for (const sx of [-1, 1]) {
-      const dz = cz - seg * L * 0.22;
-      body.box(sx * (W - 0.035), H - 0.05, dz, 0.045, H * 0.86, 0.62, 1.2);
-      rustM.box(sx * (W + 0.006), H - 0.05, dz, 0.01, H * 0.86, 0.02, 0.6);
+    // Passenger doors: the leading car has a single wide door aft of centre,
+    // the trailing car a pair either side of its bogie — different rhythms, so
+    // the two flanks never line up.
+    const doors = lead ? [-0.22] : [-0.30, 0.24];
+    for (const dOff of doors) {
+      const dz = cz - seg * L * dOff;
+      for (const sx of [-1, 1]) {
+        body.box(sx * (W - 0.035), H - 0.05, dz, 0.045, H * 0.86, lead ? 0.78 : 0.55, 1.2);
+        rustM.box(sx * (W + 0.006), H - 0.05, dz, 0.01, H * 0.86, 0.02, 0.6);
+      }
     }
     // Roof: a dark, sooted deck carrying real equipment, not a clean corrugated
     // sheet. From the north half of the square this is the face the player sees
@@ -212,15 +231,21 @@ export function toppledTram(chunk: Chunk, x: number, z: number, yaw: number): vo
     kit.pop();
     rustM.box(seg * L * 0.3, H * 2 + 0.13, cz - seg * 1.5, 0.26, 0.11, 0.26, 0.4);
     rustM.box(0, 0.18, cz, W * 1.02, 0.18, L * 0.49, 1.4);
-  }
 
-  // End caps. Blank ends were what made this read as a crate: a tram has a
-  // raked windscreen, a destination box, twin headlamps and a coupler, and at
-  // 13 m the end is what half the map sees first.
-  for (const seg of [-1, 1]) {
+    // End cap. Blank ends were what made this read as a crate: a tram has a
+    // raked windscreen, a destination box, twin headlamps and a coupler, and
+    // at 13 m the end is what half the map sees first.
     const ez = seg * (L * 1.02);
     body.box(0, H + 0.15, ez, W * 0.98, H * 0.72, 0.06, 1.4);
-    glass.box(0, H + 0.62, ez + seg * 0.035, W * 0.82, 0.44, 0.008, { unit: true });
+    if (!lead) {
+      glass.box(0, H + 0.62, ez + seg * 0.035, W * 0.82, 0.44, 0.008, { unit: true });
+    } else {
+      // Windscreen gone, cab roof stove in on the impact corner.
+      rustM.box(0, H + 0.62, ez + seg * 0.03, W * 0.82, 0.05, 0.03, 0.5);
+      body.pushTRS(W * 0.45, H * 2 - 0.12, ez - seg * 0.35, 0, 0, -0.32);
+      body.box(0, 0, 0, W * 0.5, 0.05, 0.55, 1.2);
+      body.pop();
+    }
     // destination box
     cream.box(0, H + 1.16, ez + seg * 0.03, W * 0.5, 0.13, 0.02, { unit: true });
     // headlamps and coupler
@@ -230,40 +255,51 @@ export function toppledTram(chunk: Chunk, x: number, z: number, yaw: number): vo
       rustM.pop();
     }
     rustM.box(0, 0.28, ez + seg * 0.12, 0.09, 0.09, 0.22, 0.4);
+
+    // Bogies and wheels for this half-car, now facing sideways.
+    const wh = chunk.m('steel');
+    wh.push(body.matrix);
+    for (const bz of [seg * L * 0.15, seg * L * 0.78]) {
+      wh.box(0, -0.05, bz, W * 0.7, 0.16, 0.4, 0.8);
+      for (const sx of [-1, 1]) {
+        wh.pushTRS(sx * W * 0.6, -0.05, bz, 0, 0, Math.PI / 2);
+        wh.cylinder(0.34, 0.34, 0.09, 12, true, true, 0.4);
+        wh.pop();
+      }
+    }
+    wh.pop();
+
+    if (!lead) {
+      // Pantograph, folded and bent — only the trailing car carries one.
+      const pan = chunk.m('rust');
+      pan.push(body.matrix);
+      pan.tube([V3(0, H * 2, 0.6), V3(0.5, H * 2 + 0.6, 1.3), V3(-0.2, H * 2 + 0.75, 2.1)], 0.035, 5, false, 0.5);
+      pan.tube([V3(0, H * 2, 0.6), V3(0.35, H * 2 + 0.75, 0.9)], 0.03, 5, false, 0.5);
+      pan.pop();
+    }
+
+    glass.pop();
+    rustM.pop();
+    cream.pop();
+    body.pop();
   }
 
-  // articulation bellows
+  /* --- articulation ----------------------------------------------------
+   * The joint is the thing that proves this is one vehicle and not two. It
+   * gets a turntable ring, a concertina wide enough to bridge the fold, and
+   * the torn skirt plates that pulled apart when the cars jackknifed. */
   const bel = chunk.m('rubber');
-  bel.push(body.matrix);
-  for (let i = 0; i < 5; i++) {
-    bel.box(0, H, -0.24 + i * 0.12, W * 0.94 + (i % 2) * 0.05, H * 0.9, 0.05, 0.6);
+  bel.pushTRS(x, y + 0.85, z, yaw - 0.01, 0, roll - 0.01);
+  for (let i = 0; i < 7; i++) {
+    const t = (i - 3) * 0.115;
+    bel.box(0, H, t, W * 0.93 + (i % 2) * 0.055, H * 0.88, 0.055, 0.6);
   }
   bel.pop();
-
-  // bogies and wheels, now facing sideways
-  const wh = chunk.m('steel');
-  wh.push(body.matrix);
-  for (const cz of [-L * 0.75, -L * 0.15, L * 0.15, L * 0.75]) {
-    wh.box(0, -0.05, cz, W * 0.7, 0.16, 0.4, 0.8);
-    for (const sx of [-1, 1]) {
-      wh.pushTRS(sx * W * 0.6, -0.05, cz, 0, 0, Math.PI / 2);
-      wh.cylinder(0.34, 0.34, 0.09, 12, true, true, 0.4);
-      wh.pop();
-    }
-  }
-  wh.pop();
-
-  // pantograph, folded and bent
-  const pan = chunk.m('rust');
-  pan.push(body.matrix);
-  pan.tube([V3(0, H * 2, 0.6), V3(0.5, H * 2 + 0.6, 1.3), V3(-0.2, H * 2 + 0.75, 2.1)], 0.035, 5, false, 0.5);
-  pan.tube([V3(0, H * 2, 0.6), V3(0.35, H * 2 + 0.75, 0.9)], 0.03, 5, false, 0.5);
-  pan.pop();
-
-  glass.pop();
-  rustM.pop();
-  cream.pop();
-  body.pop();
+  const ring = chunk.m('steel');
+  ring.pushTRS(x, y + 0.85, z, yaw - 0.01, 0, roll - 0.01);
+  ring.box(0, 0.1, 0, W * 0.92, 0.09, 0.5, 0.8);
+  for (const sx of [-1, 1]) ring.box(sx * W * 0.96, H, 0, 0.04, H * 0.5, 0.42, 0.6);
+  ring.pop();
 
   /* --- contact ---------------------------------------------------------
    * Nothing sells weight like the ground giving way under it. A berm of dirt
@@ -297,6 +333,65 @@ export function toppledTram(chunk: Chunk, x: number, z: number, yaw: number): vo
     t.pushTRS(px, groundHeightAt(px, pz) + s * 0.4, pz, rand.next() * 3, rand.range(-0.3, 0.3), rand.range(-0.3, 0.3));
     t.box(0, 0, 0, s, s * 0.35, s * 1.3, 0.5);
     t.pop();
+  }
+
+  /* --- derailment scar --------------------------------------------------
+   * Twenty-five tonnes of tram does not come to rest on undisturbed paving.
+   * It left the rails somewhere up the alignment and ploughed across the
+   * square: a gouge of torn setts and sub-base curving out of the trackbed,
+   * ballast kicked out along it, and a bow wave of paving shoved up on the
+   * outside of the turn where the flange dug in. */
+  const scar = chunk.m('dirt');
+  const torn = chunk.m('setts');
+  const ballast = chunk.m('gravel');
+  const start = { x: 0.9, z: -21.5 };                 // still on the alignment
+  const nose = { x: x + ux * L * 0.95, z: z + uz * L * 0.95 };
+  const steps = 22;
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    // Quadratic swing: straight out of the trackbed, then hard across.
+    const cx = start.x + (nose.x - start.x) * t + Math.sin(t * Math.PI) * -1.9;
+    const cz = start.z + (nose.z - start.z) * t;
+    const width = 0.55 + t * 1.15;
+    const gy = groundHeightAt(cx, cz);
+    // The gouge floor itself.
+    scar.pushTRS(cx, gy - 0.015, cz, Math.atan2(nose.x - start.x, nose.z - start.z));
+    scar.box(0, 0, 0, width, 0.035, 0.95, 1.4);
+    scar.pop();
+    // Paving shoved aside, standing proud on both lips.
+    for (const side of [-1, 1] as const) {
+      if (!rand.bool(0.7)) continue;
+      const px = cx + side * width * rand.range(0.95, 1.3);
+      const pz = cz + rand.range(-0.4, 0.4);
+      const w = rand.range(0.16, 0.34);
+      torn.pushTRS(px, groundHeightAt(px, pz) - 0.02, pz,
+        rand.range(0, 6.28), -rand.range(0.3, 0.95), rand.range(-0.3, 0.3));
+      torn.box(0, w * 0.5, 0, w * 0.6, w * 0.5, rand.range(0.035, 0.06), 0.4);
+      torn.pop();
+    }
+    // Ballast kicked clear of the bed.
+    for (let k = 0; k < 2; k++) {
+      const bx = cx + rand.range(-2.4, 2.4), bz = cz + rand.range(-1.6, 1.6);
+      const s = rand.range(0.28, 0.6);
+      ballast.pushTRS(bx, groundHeightAt(bx, bz) + 0.005, bz, rand.range(0, 6.28));
+      ballast.lump(s, 6, 3, (kk) => 0.2 + 0.16 * frac(Math.sin((kk + i * 3 + k) * 12.9898) * 43758.5), 1.0);
+      ballast.pop();
+    }
+  }
+  // Settled dust: a pale skirt of pulverised sub-base thrown out downwind.
+  //
+  // Emphatically *not* a rectangular plate laid a few centimetres over the
+  // cobbles — that reads as a sheet of concrete dropped on the road, straight
+  // edges and all. Flattened lumps have an organic outline and die into the
+  // paving at their rim.
+  for (let i = 0; i < 26; i++) {
+    const t = rand.next();
+    const cx = start.x + (nose.x - start.x) * t + Math.sin(t * Math.PI) * -1.9 + rand.range(-3.4, 3.4);
+    const cz = start.z + (nose.z - start.z) * t + rand.range(-2.6, 2.6);
+    const s = rand.range(0.5, 1.35);
+    scar.pushTRS(cx, groundHeightAt(cx, cz) + 0.012, cz, rand.range(0, 6.28), 0, 0, 1, 0.075, 1);
+    scar.lump(s, 9, 4, (k) => 0.55 + 0.5 * frac(Math.sin((k + i * 17) * 12.9898) * 43758.5), 1.6);
+    scar.pop();
   }
 }
 

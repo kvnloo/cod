@@ -7,8 +7,16 @@
  *     → additive composite
  *
  * The Karis average on mip 0 is what stops a single blown-out pixel from
- * producing a flickering star; the log-space knee is what keeps the threshold
- * from clipping into a hard ring around bright objects.
+ * producing a flickering star; the soft knee is what keeps the threshold from
+ * clipping into a hard ring around bright objects.
+ *
+ * The prefilter is *subtractive*: a source contributes only the energy it has
+ * above the threshold, not all of its energy once it crosses the line. That
+ * distinction is the whole difference between "bloom on genuinely bright
+ * sources" and "a veil over the frame" — a dusk sky sitting a stop over the
+ * threshold covers a third of the image, and with a pure weighting prefilter it
+ * dumps *all* of that radiance into the widest mips, which then glow onto the
+ * foreground's own shadows.
  *
  * The final pyramid level is published on `PostResources.bloom` so the lens pass
  * can modulate dirt and streaks with it instead of re-blurring the frame.
@@ -51,12 +59,14 @@ void main() {
   if (br > uClamp) c *= uClamp / br;
   br = min(br, uClamp);
 
-  // Soft knee in log2 (stops) space: a genuinely smooth onset instead of the
-  // quadratic ramp that leaves a visible contour.
-  float lb = log2(br + 1e-5);
-  float lt = log2(max(uThreshold, 1e-4));
-  float w = smoothstep(lt - uKnee, lt + uKnee, lb);
-  fragColor = vec4(c * w, 1.0);
+  // Subtractive soft knee. uKnee is the linear half-width of the quadratic
+  // shoulder either side of the threshold, so the onset is smooth (no contour
+  // ring) but a source only ever contributes br - threshold.
+  float knee = max(uKnee, 1e-4);
+  float soft = clamp(br - uThreshold + knee, 0.0, 2.0 * knee);
+  soft = soft * soft / (4.0 * knee);
+  float contribution = max(soft, br - uThreshold) / max(br, 1e-5);
+  fragColor = vec4(c * contribution, 1.0);
 }
 `;
 
@@ -146,6 +156,27 @@ void main() {
 }
 `;
 
+/**
+ * Where `settings.bloomThreshold = 1` actually lands, in exposed linear units.
+ *
+ * The tonemapper (AgX, key 0.11) maps exposed 1.0 to about display 195/255 and
+ * exposed 5.2 to about 241/255. Thresholding at 1.0 therefore called every
+ * sunlit wall a bloom source. 2.6 puts the knee just under paper white, which is
+ * what "only where something is genuinely brighter than white" means here.
+ */
+const THRESHOLD_SCALE = 2.6;
+/** Knee half-width as a fraction of the threshold. */
+const KNEE_FRACTION = 0.5;
+/**
+ * Fraction of `settings.bloomIntensity` that actually reaches the composite.
+ *
+ * The upsample chain is energy-normalising, so an intensity of 1 would add back
+ * 100% of the thresholded radiance smeared over the frame. Shipped glare is a
+ * few percent of the source energy; the setting is left as an artist-facing
+ * 0..1 dial and scaled here.
+ */
+const INTENSITY_SCALE = 0.26;
+
 export class BloomPass extends BasePass {
   readonly name = 'bloom';
   readonly order = PASS_ORDER.BLOOM;
@@ -220,8 +251,9 @@ export class BloomPass extends BasePass {
     const pu = this.prefilter.uniforms;
     pu.tInput.value = input;
     (pu.uSourceTexel.value as THREE.Vector2).set(1 / ctx.width, 1 / ctx.height);
-    pu.uThreshold.value = Math.max(0.05, g.bloomThreshold);
-    pu.uKnee.value = 0.75;
+    const threshold = Math.max(0.05, g.bloomThreshold) * THRESHOLD_SCALE;
+    pu.uThreshold.value = threshold;
+    pu.uKnee.value = threshold * KNEE_FRACTION;
     pu.uClamp.value = 64;
     ctx.blit(this.prefilter, dn0);
     down.push(dn0);
@@ -262,7 +294,7 @@ export class BloomPass extends BasePass {
     const cu = this.composite.uniforms;
     cu.tInput.value = input;
     cu.tBloom.value = small.texture;
-    cu.uIntensity.value = g.bloomIntensity;
+    cu.uIntensity.value = g.bloomIntensity * INTENSITY_SCALE;
     ctx.blit(this.composite, output);
     return true;
   }

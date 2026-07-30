@@ -14,6 +14,7 @@ import { clamp01, Ease, motion, motionTime } from '../Anim';
 import { hairWidth, measureText, text, wash } from '../Draw';
 import type { DrawCtx } from '../Draw';
 import type { HudModel } from '../Model';
+import { aboveSightY } from '../Sight';
 import { lift, rgba, type Palette, type RGB } from '../Theme';
 import type { Widget } from './Widget';
 
@@ -80,9 +81,11 @@ export class Banners implements Widget {
 
   flourish(title: string, sub = ''): void {
     const p = this.pal();
+    // Kill confirmations are near-white, always. A critical hit is told apart by
+    // its second line and its heavier glow, not by wearing the objective hue.
     this.flourishes.push({
       title, sub, age: 0, life: motionTime(1.5),
-      tint: sub === 'CRITICAL HIT' ? p.accent : p.ink,
+      tint: sub === 'CRITICAL HIT' ? lift(p.ink, 0.35) : p.ink,
     });
     if (this.flourishes.length > 3) this.flourishes.shift();
   }
@@ -114,7 +117,7 @@ export class Banners implements Widget {
 
   draw(d: DrawCtx, m: HudModel): void {
     this.drawBanner(d);
-    this.drawFlourishes(d);
+    this.drawFlourishes(d, m);
     this.drawToasts(d);
   }
 
@@ -133,7 +136,7 @@ export class Banners implements Widget {
     const a = Ease.outQuart(inT) * (1 - Ease.inCubic(outT)) * d.alpha;
     if (a <= 0.005) return;
 
-    const tint: RGB = b.kind === 'reward' ? p.accent : b.kind === 'warn' ? p.hostile : p.ink;
+    const tint: RGB = b.kind === 'reward' ? p.accent : b.kind === 'warn' ? p.hostile : p.accent;
     const cx = d.w / 2;
     const cy = d.h * 0.235 - Ease.outCubic(outT) * 14 * s * motion();
 
@@ -176,9 +179,15 @@ export class Banners implements Widget {
     c.fillRect(cx - half - 1 * s, cy + 8 * s, 2.2 * s, 9 * s);
     c.fillRect(cx + half - 1.2 * s, cy + 8 * s, 2.2 * s, 9 * s);
 
+    // The headline is near-white and the *rules* carry the semantic hue. A
+    // 34 px objective title painted solid amber is a block of accent the size
+    // of a paragraph — the colour says "objective" just as clearly from a pair
+    // of hairlines, and the type stays the brightest thing rather than the
+    // most saturated.
+    const titleInk: RGB = b.kind === 'objective' ? lift(p.ink, 0.3) : lift(tint, 0.25);
     text(c, b.title, cx, cy, {
       ...titleOpts,
-      color: rgba(lift(tint, 0.25), 1),
+      color: rgba(titleInk, 1),
       shadow: Math.max(1.4, 2 * s),
       glow: b.kind === 'reward' ? 16 * s : 7 * s,
       glowColor: rgba(tint, 0.45),
@@ -199,11 +208,15 @@ export class Banners implements Widget {
 
   /* --------------------------------------------------------- flourish --- */
 
-  private drawFlourishes(d: DrawCtx): void {
+  private drawFlourishes(d: DrawCtx, m: HudModel): void {
     const p = this.pal();
     const c = d.c;
     const s = d.s;
     const cx = d.w / 2;
+    // The confirmation row rides above the optic and climbs further as the
+    // player aims, so "HEADSHOT / CRITICAL HIT" never lands on the housing of
+    // the sight it is reporting on.
+    const baseY = aboveSightY(d, m, 72, d.h * 0.395);
 
     for (let i = 0; i < this.flourishes.length; i++) {
       const f = this.flourishes[i];
@@ -213,7 +226,7 @@ export class Banners implements Widget {
       if (a <= 0.005) continue;
 
       const rise = Ease.outQuint(inT) * 1 - t * 10 * s * motion();
-      const cy = d.h * 0.395 - i * 22 * s + rise;
+      const cy = baseY - i * 22 * s + rise;
 
       c.save();
       c.globalAlpha = a;

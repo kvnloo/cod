@@ -6,8 +6,15 @@
  *
  *   normal   thin diagonal ticks, near-white
  *   armour   diagonal ticks bracketed by two arcs, steel blue
- *   critical diagonal ticks inside a thin ring, accent amber
+ *   critical heavier, brighter ticks plus two axis ticks — same hue as a body
+ *            shot, read apart by weight and silhouette rather than by colour
  *   kill     heavy X plus an expanding rotated square, hostile red
+ *
+ * The critical marker used to be amber. Sitting dead centre on the reticle it
+ * was the single most prominent amber element on the screen, competing directly
+ * with the objective marker it shared a hue with. A shipped shooter spends
+ * *value* here — a crit is a bigger, hotter white — and keeps colour for the one
+ * outcome that changes what you do next: the kill.
  *
  * Motion: each marker punches out from 55% scale with a spring, holds, then
  * decays. Markers stack — a burst that kills produces the normal marker still
@@ -164,7 +171,7 @@ function drawArmor(c: CanvasRenderingContext2D, s: number, p: Palette, a: number
 }
 
 function drawCrit(c: CanvasRenderingContext2D, s: number, p: Palette, t: number): void {
-  const hot = lift(p.accent, 0.42);
+  const hot = lift(p.ink, 0.6);
   drawTicks(c, s, 5.0, 13.5, 2.7, rgba(hot, 1));
   // Four short axis ticks distinguish a crit from a body shot at a glance —
   // these carry the read, not a ring. The full circle the original drew sat
@@ -180,7 +187,7 @@ function drawCrit(c: CanvasRenderingContext2D, s: number, p: Palette, t: number)
   if (t < 0.45) {
     const k = 1 - t / 0.45;
     const ringR = (14 + Ease.outCubic(t) * 7) * s;
-    c.strokeStyle = rgba(p.accent, k * 0.8);
+    c.strokeStyle = rgba(p.ink, k * 0.8);
     c.lineWidth = Math.max(1, 1.4 * s);
     c.beginPath();
     c.arc(0, 0, ringR, -Math.PI * 0.42, -Math.PI * 0.08);

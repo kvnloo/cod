@@ -116,7 +116,32 @@ export function projectUV(geo: THREE.BufferGeometry, metresPerRepeat: number): T
  *
  * Cost is a few milliseconds for a whole armoury and it happens once, at build.
  */
-export function bakeWear(geo: THREE.BufferGeometry): THREE.BufferGeometry {
+export interface WearZone {
+  /** Centre, in the same space as the geometry handed to `bakeWear`. */
+  x: number; y: number; z: number;
+  /** Radius of influence, metres. */
+  r: number;
+  /** Multiplier on the convex-edge mask inside the zone. */
+  edge: number;
+  /** Multiplier on the concave-cavity mask inside the zone. */
+  cavity: number;
+}
+
+export interface WearTuning {
+  /** Whole-part multipliers — a charging handle is handled, a stock is not. */
+  edgeGain?: number;
+  cavityGain?: number;
+  /** Localised hot spots: the magwell lip, the ejection port, the hand rests. */
+  zones?: readonly WearZone[];
+  /**
+   * How strongly upward-facing surfaces collect dust. Gravity is the single
+   * biggest organising principle in how a real object gets dirty, and it is
+   * free here: the face normal is already in hand.
+   */
+  gravity?: number;
+}
+
+export function bakeWear(geo: THREE.BufferGeometry, tune: WearTuning = {}): THREE.BufferGeometry {
   const pos = geo.getAttribute('position') as THREE.BufferAttribute | undefined;
   const nrm = geo.getAttribute('normal') as THREE.BufferAttribute | undefined;
   const count = pos?.count ?? 0;
@@ -216,16 +241,48 @@ export function bakeWear(geo: THREE.BufferGeometry): THREE.BufferGeometry {
   // on the welded mean, while the flanking faces sit ~22° off it. Weighting by
   // that alignment puts the wear on the chamfer strip and leaves the flats
   // clean, which is precisely where a real finish rubs through.
+  const edgeGain = tune.edgeGain ?? 1;
+  const cavityGain = tune.cavityGain ?? 1;
+  const zones = tune.zones ?? [];
+  const gravity = tune.gravity ?? 0;
+
   for (let i = 0; i < count; i++) {
     const u = uid[i];
     const s = strength[u];
-    if (s <= 0) { wear[i * 2] = 0; wear[i * 2 + 1] = 0; continue; }
+    const px = pos.getX(i), py = pos.getY(i), pz = pos.getZ(i);
+
+    // Local multipliers: whole-part, plus any hot spot this vertex falls in.
+    let eg = edgeGain;
+    let cg = cavityGain;
+    for (const z of zones) {
+      const dx = px - z.x, dy = py - z.y, dz = pz - z.z;
+      const q = 1 - Math.min(1, Math.hypot(dx, dy, dz) / Math.max(1e-4, z.r));
+      if (q <= 0) continue;
+      const k = q * q * (3 - 2 * q);
+      eg += (z.edge - 1) * k;
+      cg += (z.cavity - 1) * k;
+    }
+
+    // Gravity: dust and grit settle on whatever faces up. It is applied to the
+    // cavity channel because that is the one wired to "darker and rougher",
+    // which is exactly what a film of dust does.
+    let grav = 0;
+    if (gravity > 0) {
+      const up = nrm.getY(i);
+      grav = gravity * Math.max(0, up) ** 1.6;
+    }
+
+    if (s <= 0) {
+      wear[i * 2] = 0;
+      wear[i * 2 + 1] = Math.min(1, grav);
+      continue;
+    }
     const d = nrm.getX(i) * nAvg[u * 3] + nrm.getY(i) * nAvg[u * 3 + 1] + nrm.getZ(i) * nAvg[u * 3 + 2];
     const t = (d - 0.62) / 0.36;
     const align = t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t);
     const v = s * align;
-    wear[i * 2] = convex[u] ? v : 0;
-    wear[i * 2 + 1] = convex[u] ? 0 : v;
+    wear[i * 2] = convex[u] ? Math.min(1.4, v * eg) : 0;
+    wear[i * 2 + 1] = Math.min(1.2, (convex[u] ? 0 : v * cg) + grav);
   }
   geo.setAttribute('aWear', new THREE.BufferAttribute(wear, 2));
   return geo;

@@ -232,8 +232,12 @@ export class ShadowSystem {
     renderer.setRenderTarget(prevTarget);
 
     // Sun angular radius: 0.27° physically; `softness` opens it up so shadows
-    // read as soft on screen without needing a 16k shadow map.
-    const angular = 0.0047 * (1 + 11 * THREE.MathUtils.clamp(cfg.softness, 0, 1));
+    // read as soft on screen without needing a 16k shadow map. Opening it 12x
+    // (the old figure) put the penumbra of a 3 m prop at over a third of a metre
+    // and blurred every small shadow out of existence, so the ceiling is now a
+    // little over one degree — still four times the real sun, but the contact
+    // end of a shadow stays legible.
+    const angular = 0.0047 * (1 + 3.5 * THREE.MathUtils.clamp(cfg.softness, 0, 1));
     const info = this.uniforms.boCsmInfo.value;
     info.set(count, Math.tan(angular), far, this.mapSize);
   }

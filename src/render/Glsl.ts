@@ -406,8 +406,24 @@ float boCascadeSample( const in int c, const in vec3 wp, const in float NdotL, c
 
 	float tanSun = boCsmInfo.y;
 
+	// The widest penumbra this cascade may produce, in metres. Tied to the
+	// cascade's own texel so cascade 0 stays contact-sharp and the far cascade
+	// stays cheap, with an absolute ceiling so a distant roof edge cannot smear
+	// into a featureless gradient.
+	float maxFilterM = clamp( texelW * 8.0, 0.10, 0.80 );
+
 	// ---- blocker search (PCSS step 1)
-	float searchM = clamp( tanSun * zRange * 0.35, texelW * 2.0, 2.5 );
+	//
+	// This radius is the single most important number in the filter. An 8-tap
+	// search only finds an occluder whose shadow is a decent fraction of the
+	// search disc wide, so a metre-scale radius is statistically blind to poles,
+	// railings, benches and crates: every one of them reports "no blocker" and
+	// the surface comes back fully lit. Deriving it from the cascade's depth
+	// range (which includes the 60 m light pull-back) made it 1.5-2.5 m, which
+	// is why nothing under two metres across cast a shadow anywhere in the level.
+	// It is now the projected light size over a plausible blocker distance,
+	// clamped to a few texels either side.
+	float searchM = max( texelW * 1.25, min( tanSun * 6.0, min( maxFilterM, 0.35 ) ) );
 	float searchUV = searchM * uvPerMetre;
 	float blockerSum = 0.0;
 	float blockerCount = 0.0;
@@ -422,7 +438,7 @@ float boCascadeSample( const in int c, const in vec3 wp, const in float NdotL, c
 
 	// ---- variable penumbra (PCSS step 2)
 	float penumbraM = max( ( uvd.z - blocker ) * zRange, 0.0 ) * tanSun;
-	float filterM = clamp( penumbraM, texelW * 1.1, 3.0 );
+	float filterM = max( texelW * 0.8, min( max( penumbraM, texelW * 0.8 ), maxFilterM ) );
 	float filterUV = filterM * uvPerMetre;
 
 	// ---- filtered comparison (PCSS step 3)
@@ -455,7 +471,7 @@ float boSunShadow( const in vec3 worldPos, const in vec3 worldNormal,
 	}
 
 	float rot = ( boIGN( screenPos ) + boFrameJitter ) * 6.2831853;
-	float nOff = 1.4 + 2.6 * ( 1.0 - NdotL );
+	float nOff = 1.1 + 2.2 * ( 1.0 - NdotL );
 
 	vec3 wp = worldPos + worldNormal * ( boCsmParams[ c ].z * nOff );
 	float s = boCascadeSample( c, wp, NdotL, rot );

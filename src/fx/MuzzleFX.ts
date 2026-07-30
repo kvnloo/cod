@@ -50,7 +50,7 @@ const PROFILES: Record<string, MuzzleProfile> = {
   ar: AR,
   smg: { ...AR, scale: 0.78, lightIntensity: 18, coneLength: 0.4, tracerEvery: 5, heatPerShot: 0.05, casing: 'pistol', shake: 0.006 },
   lmg: { ...AR, scale: 1.22, lightIntensity: 34, lightRadius: 11, coneLength: 0.7, tracerEvery: 3, casing: 'lmg', heatPerShot: 0.07, shake: 0.011 },
-  sniper: { ...AR, scale: 1.55, lightIntensity: 46, lightRadius: 14, starChance: 0.75, coneLength: 1.05, smoke: 1.6, gasSpeed: 20, tracerEvery: 1, tracerColor: 0xfff0c0, heatPerShot: 0.09, shake: 0.026 },
+  sniper: { ...AR, scale: 1.55, lightIntensity: 46, lightRadius: 14, starChance: 0.75, coneLength: 1.05, smoke: 1.6, gasSpeed: 20, tracerEvery: 1, tracerColor: 0xffdc90, heatPerShot: 0.09, shake: 0.026 },
   shotgun: { ...AR, scale: 1.5, lightIntensity: 40, lightRadius: 12, starChance: 0.85, coneLength: 0.95, smoke: 2.2, gasSpeed: 11, color: 0xffa050, casing: 'shotgun', ejectSpeed: 2.2, tracerEvery: 0, heatPerShot: 0.08, shake: 0.03 },
   pistol: { ...AR, scale: 0.72, lightIntensity: 15, lightRadius: 7, starChance: 0.35, coneLength: 0.34, smoke: 0.8, casing: 'pistol', tracerEvery: 0, heatPerShot: 0.05, shake: 0.006 },
   launcher: { ...AR, scale: 2.0, lightIntensity: 55, lightRadius: 16, starChance: 0.9, coneLength: 1.6, smoke: 3.5, gasSpeed: 9, casing: 'shotgun', tracerEvery: 0, heatPerShot: 0.2, shake: 0.05 },
@@ -148,7 +148,12 @@ export class MuzzleFX {
     );
 
     if (firstPerson) {
-      w.shake(prof.shake * (suppressed ? 0.5 : 1), 34, 0.12);
+      // "First person" only means the shot came through the player's own weapon
+      // event, not that the muzzle is at the player's eye. A rifle staged fifteen
+      // metres away must not kick the camera: the shake shows up as a per-frame
+      // camera delta, and the motion-blur pass then smears the entire frame.
+      const near = clamp(1 - w.distanceToCamera(muzzle.x, muzzle.y, muzzle.z) / 2.5, 0, 1);
+      if (near > 0.01) w.shake(prof.shake * near * (suppressed ? 0.5 : 1), 34, 0.12);
     }
   }
 
@@ -376,11 +381,13 @@ export class MuzzleFX {
       ax: direction.x * len, ay: direction.y * len, az: direction.z * len,
       // Thin: a tracer is a 7 mm round glowing, not a beam weapon. Width is what
       // separates "hot projectile" from "laser" more than colour does.
-      w0: 0.16, h0: 1, w1: 0.10, h1: 1,
-      r: colour.r, g: colour.g, b: colour.b, alpha: 0.95,
+      w0: 0.19, h0: 1, w1: 0.12, h1: 1,
+      r: colour.r, g: colour.g, b: colour.b, alpha: 1.0,
       life, cell: CELL.RAIN, frames: 1,
       mode: QUAD_MODE.BEAM, blend: QUAD_BLEND.ADD,
-      fadeIn: 0.02, fadeOut: 0.55, soft: 0.4, intensity: 2.8,
+      // A tracer is one of the few things in the frame that genuinely is
+      // brighter than white; at 2.8 it read as a pale hairline in daylight.
+      fadeIn: 0.02, fadeOut: 0.55, soft: 0.4, intensity: 5.0,
     });
     q.push();
 
@@ -388,11 +395,11 @@ export class MuzzleFX {
     q.begin({
       px: muzzle.x + direction.x * len, py: muzzle.y + direction.y * len, pz: muzzle.z + direction.z * len,
       vx: direction.x * speed, vy: direction.y * speed, vz: direction.z * speed,
-      w0: 0.22, h0: 0.22, w1: 0.16, h1: 0.16,
-      r: colour.r, g: colour.g, b: colour.b, alpha: 0.8,
+      w0: 0.30, h0: 0.30, w1: 0.22, h1: 0.22,
+      r: colour.r, g: colour.g, b: colour.b, alpha: 0.9,
       life, cell: CELL.GLOW_SOFT, frames: 1,
       mode: QUAD_MODE.BILLBOARD, blend: QUAD_BLEND.ADD,
-      fadeIn: 0.02, fadeOut: 0.5, soft: 0.3, intensity: 2.0,
+      fadeIn: 0.02, fadeOut: 0.5, soft: 0.3, intensity: 3.4,
     });
     q.push();
   }

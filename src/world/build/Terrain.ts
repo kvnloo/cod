@@ -14,7 +14,7 @@ import * as THREE from 'three';
 import { Rand } from '../../core/Rand';
 import type { Chunk } from '../geom/Chunk';
 import { FOOTPRINTS, LANE, MAP, SQUARE } from '../Layout';
-import { V2, V3 } from '../geom/Mesher';
+import { V2, V3, type Mesher } from '../geom/Mesher';
 
 export interface Crater {
   x: number; z: number; radius: number; depth: number;
@@ -24,17 +24,87 @@ export interface Crater {
 
 /** Shell craters, authored so they break sightlines rather than block routes. */
 export const CRATERS: Crater[] = [
-  { x: -4.5, z: -14.0, radius: 3.4, depth: 0.62, dirt: true },
-  { x: 6.5, z: -2.0, radius: 4.2, depth: 0.78, dirt: true },
-  { x: -2.0, z: 11.5, radius: 2.8, depth: 0.48, dirt: true },
-  { x: 9.0, z: -25.0, radius: 2.4, depth: 0.42 },
-  { x: -10.5, z: 4.0, radius: 2.1, depth: 0.36 },
-  { x: -30.0, z: -14.0, radius: 2.6, depth: 0.44, dirt: true },
-  { x: 30.5, z: 2.5, radius: 3.0, depth: 0.52, dirt: true },
-  { x: 30.0, z: -35.0, radius: 2.2, depth: 0.38 },
-  { x: -30.5, z: 26.0, radius: 2.7, depth: 0.46 },
-  { x: 2.0, z: 30.5, radius: 2.5, depth: 0.4 },
+  { x: -4.5, z: -14.0, radius: 3.4, depth: 0.88, dirt: true },
+  { x: 6.5, z: -2.0, radius: 4.2, depth: 1.02, dirt: true },
+  { x: -2.0, z: 11.5, radius: 2.8, depth: 0.70, dirt: true },
+  { x: 9.0, z: -25.0, radius: 2.4, depth: 0.54 },
+  { x: -10.5, z: 4.0, radius: 2.1, depth: 0.46 },
+  { x: -30.0, z: -14.0, radius: 2.6, depth: 0.62, dirt: true },
+  { x: 30.5, z: 2.5, radius: 3.0, depth: 0.74, dirt: true },
+  { x: 30.0, z: -35.0, radius: 2.2, depth: 0.48 },
+  { x: -30.5, z: 26.0, radius: 2.7, depth: 0.60 },
+  { x: 2.0, z: 30.5, radius: 2.5, depth: 0.52 },
 ];
+
+/* ------------------------------------------------------- level changes -- */
+
+/**
+ * The square is a *raised plaza*, not paint on the road surface.
+ *
+ * The whole playable area used to be one plane at y ≈ 0 with asphalt, cobble
+ * and dirt painted on to it, and the single loudest tell in the wide shots was
+ * that nothing anywhere had a vertical edge. A real setted square is a kerbed
+ * island: the paving stands one kerb height above the carriageway, and the
+ * tram runs down a sunken lane through the middle of it with a granite kerb on
+ * each side. That gives the map three continuous 50 m shadow lines through the
+ * hero sightline and a real step everywhere the surfaces change.
+ *
+ * 0.145 m is a kerb, not a wall — it is the standard 15 cm the visual bar asks
+ * for, and it stays under the character controller's step height.
+ */
+export const PLAZA = {
+  x0: SQUARE.x0 - 1.5, x1: SQUARE.x1 + 1.5,
+  z0: SQUARE.z0 - 1.5, z1: SQUARE.z1 + 1.5,
+  /** Half-width of the tram carriageway cut through the plaza. */
+  trackHalf: 3.6,
+  lift: 0.145,
+  /** Width of the height-field transition, hidden behind the kerb face. */
+  ramp: 0.42,
+} as const;
+
+function edge01(d: number): number {
+  return d <= 0 ? 0 : d >= PLAZA.ramp ? 1 : d / PLAZA.ramp;
+}
+
+/** Height added by the raised plaza at (x,z). Zero everywhere else. */
+export function plazaLift(x: number, z: number, footDist = footprintDistance(x, z)): number {
+  const inside = edge01(x - PLAZA.x0) * edge01(PLAZA.x1 - x)
+    * edge01(z - PLAZA.z0) * edge01(PLAZA.z1 - z)
+    // Never lift under a pavement ring: the plaza kerb line then falls exactly
+    // where the shopfront pavement already ends, so the two read as one
+    // continuous footway rather than two steps 40 cm apart.
+    * edge01(footDist - 2.35);
+  if (inside <= 0) return 0;
+  // The tram carriageway stays at street level all the way through.
+  const lane = 1 - edge01(Math.abs(x) - PLAZA.trackHalf);
+  return PLAZA.lift * inside * (1 - lane);
+}
+
+/** Distance to the nearest building footprint edge; 0 when inside one. */
+function footprintDistance(x: number, z: number): number {
+  let best = Infinity;
+  for (const k in FOOTPRINTS) {
+    const f = FOOTPRINTS[k];
+    const dx = Math.max(f.x0 - x, 0, x - f.x1);
+    const dz = Math.max(f.z0 - z, 0, z - f.z1);
+    const d = dx === 0 && dz === 0 ? 0 : Math.hypot(dx, dz);
+    if (d < best) best = d;
+  }
+  return best;
+}
+
+/**
+ * Gutter: a shallow dished channel against each kerb line of the two flanking
+ * streets. Streets drain somewhere, and a 6 cm dish running the length of a
+ * lane is a continuous highlight/shadow pair that a flat plane cannot give.
+ */
+function gutter(d: number, half: number): number {
+  const t = Math.abs(d);
+  const g = half - 0.55;
+  if (t < g - 0.5 || t > half) return 0;
+  const k = Math.max(0, 1 - Math.abs(t - g) / 0.5);
+  return -0.055 * k * k * (3 - 2 * k);
+}
 
 /** Standing water — the map's only mirror surfaces, so they earn their keep. */
 export const PUDDLES: { x: number; z: number; rx: number; rz: number }[] = [
@@ -55,20 +125,44 @@ export function groundHeightAt(x: number, z: number): number {
   for (let i = 0; i < CRATERS.length; i++) {
     const c = CRATERS[i];
     const d = Math.hypot(x - c.x, z - c.z) / c.radius;
-    if (d > 1.45) continue;
-    const bowl = -c.depth * Math.pow(Math.max(0, 1 - d * d), 1.25);
-    const lipT = (d - 0.94) * 4.2;
-    const lip = c.depth * 0.32 * Math.exp(-lipT * lipT);
+    if (d > 1.55) continue;
+    // Exponent below 1 holds the depth out toward the rim and then drops it
+    // fast, which is the profile a shell actually leaves: a flattish floor of
+    // spoil and a steep wall. The old 1.25 gave a saucer you could read
+    // straight through.
+    const bowl = -c.depth * Math.pow(Math.max(0, 1 - d * d), 0.72);
+    const lipT = (d - 1.0) * 5.0;
+    const lip = c.depth * 0.20 * Math.exp(-lipT * lipT);
     y += bowl + lip;
   }
-  // Very low-amplitude undulation so long tarmac never reads as a flat plane.
-  y += 0.035 * Math.sin(x * 0.21 + 1.3) * Math.cos(z * 0.17)
-    + 0.018 * Math.sin(x * 0.63 + z * 0.41)
-    + 0.012 * Math.cos(x * 1.13 - z * 0.87);
-  // Road camber: streets crown slightly toward their centre-lines.
+  // Long-wavelength fall across the site, plus two finer octaves. A block of a
+  // real town has the best part of a metre of relief across it; this is the
+  // slow part of it, damped to nothing against every building so the facades
+  // stay planted on their plinths.
+  const fd = footprintDistance(x, z);
+  const relief = 0.30 * Math.sin(x * 0.031 + 0.7) * Math.cos(z * 0.026 - 1.1)
+    + 0.16 * Math.sin(x * 0.058 - z * 0.047 + 2.3)
+    + 0.055 * Math.sin(x * 0.21 + 1.3) * Math.cos(z * 0.17);
+  y += relief * plinthMask(fd);
+  y += 0.02 * Math.sin(x * 0.63 + z * 0.41) + 0.013 * Math.cos(x * 1.13 - z * 0.87);
+  // Road camber and kerb-side gutters: streets crown toward their centre-lines
+  // and dish out again against the kerb.
   y += camber(x - LANE.aX, LANE.aHalf) + camber(x - LANE.cX, LANE.cHalf)
     + camber(z - LANE.northZ, LANE.northHalf) + camber(z - LANE.southZ, LANE.southHalf);
+  y += gutter(x - LANE.aX, LANE.aHalf) + gutter(x - LANE.cX, LANE.cHalf)
+    + gutter(z - LANE.northZ, LANE.northHalf) + gutter(z - LANE.southZ, LANE.southHalf);
+  y += plazaLift(x, z, fd);
   return y;
+}
+
+/**
+ * Fades the long-wavelength relief out near any building so walls that are
+ * authored from y = 0 never end up floating or buried. Full strength past
+ * ~6 m from a facade, zero inside the pavement ring.
+ */
+function plinthMask(footDist: number): number {
+  const t = Math.max(0, Math.min(1, (footDist - 2.6) / 3.4));
+  return t * t * (3 - 2 * t);
 }
 
 function camber(d: number, half: number): number {
@@ -147,23 +241,32 @@ export function buildTerrain(chunk: Chunk): void {
     (x, z) => groundHeightAt(x, z) + 0.045, 0.8,
   );
 
-  /* --- granite edging around the square -------------------------------
-   * The cobbles used to end on a bare straight line against the tarmac: a
-   * 30 m seam running diagonally through the hero shot with nothing to explain
-   * it. Every real setted square is contained by a course of kerbstones, and a
-   * 30 cm dark band both hides the join and gives the ground plane a drawn
-   * edge to read against. */
-  const edge = chunk.m('setts');
-  const ex0 = SQUARE.x0 - 1.5, ex1 = SQUARE.x1 + 1.5;
-  const ez0 = SQUARE.z0 - 1.5, ez1 = SQUARE.z1 + 1.5;
-  const band = 0.34;
-  for (const [ax, az, bx, bz] of [
-    [ex0 - band, ez0 - band, ex1 + band, ez0], [ex0 - band, ez1, ex1 + band, ez1 + band],
-    [ex0 - band, ez0, ex0, ez1], [ex1, ez0, ex1 + band, ez1],
-  ] as const) {
-    edge.grid(ax, az, bx, bz,
-      Math.max(1, Math.round((bx - ax) / 1.4)), Math.max(1, Math.round((bz - az) / 1.4)),
-      (x, z) => groundHeightAt(x, z) + 0.05, 0.7);
+  /* --- granite kerbs -------------------------------------------------
+   * The plaza is raised, so its edge is a real course of kerbstones with a
+   * vertical face, not a painted line. Three runs matter:
+   *
+   *  - the north and south ends of the square, where nothing else edges it;
+   *  - both sides of the tram carriageway, which puts two continuous 56 m
+   *    granite lines straight down the hero sightline — the single biggest
+   *    change to the ground read;
+   *  - the two flanking streets, where the kerb sits against the gutter.
+   *
+   * The long east/west sides are already edged by the shopfront pavements, so
+   * a kerb there would be a second step 40 cm from the first. */
+  const kerbStone = chunk.m('setts');
+  const zTrack0 = PLAZA.z0, zTrack1 = PLAZA.z1;
+  // `out` points at the low side: for the west kerb of the carriageway that is
+  // +x, for the east kerb −x.
+  kerbAlongZ(kerbStone, -PLAZA.trackHalf, zTrack0, zTrack1, 1);
+  kerbAlongZ(kerbStone, PLAZA.trackHalf, zTrack0, zTrack1, -1);
+  for (const [zLine, out] of [[PLAZA.z0, -1], [PLAZA.z1, 1]] as const) {
+    kerbAlongX(kerbStone, PLAZA.x0, -PLAZA.trackHalf - 0.2, zLine, out);
+    kerbAlongX(kerbStone, PLAZA.trackHalf + 0.2, PLAZA.x1, zLine, out);
+  }
+  // Corner returns so the plaza edge turns rather than stopping in mid-air.
+  for (const sx of [-1, 1] as const) {
+    kerbAlongZ(kerbStone, sx * (PLAZA.x1 - 0.02), PLAZA.z0, PLAZA.z0 + 2.6, sx);
+    kerbAlongZ(kerbStone, sx * (PLAZA.x1 - 0.02), PLAZA.z1 - 2.6, PLAZA.z1, sx);
   }
 
   /* --- worn asphalt patches: break the uniform tarmac ----------------- */
@@ -209,26 +312,90 @@ export function buildTerrain(chunk: Chunk): void {
   }
 
   /* --- blast scorch ----------------------------------------------------
-   * Every crater gets a burnt collar and a few radial fingers of soot thrown
-   * downwind. This is the cheapest damage-storytelling there is: a shell hole
-   * with clean paving around it reads as a dent, not as a detonation. */
+   * A burnt collar just outside the lip, plus a handful of narrow radial
+   * fingers thrown downwind.
+   *
+   * This used to run from 0.84r out to 2.7r with a ragged sinusoidal edge —
+   * a near-black disc eleven metres across around the big crater, which is
+   * what drew the scalloped "amoeba" outlines cutting across the cobbles in
+   * every wide shot. Soot from a shell is a collar a metre or two wide with
+   * streaks; it is not a lake. */
   const scorch = chunk.m('scorch');
   for (const c of CRATERS) {
-    const spread = c.radius * 1.9;
-    const n = 14;
+    const n = 30;
+    const rIn = c.radius * 0.92;
+    const spread = Math.min(c.radius * 0.45, 1.5);
+    const p = (ax: number, r: number) => {
+      const x = c.x + Math.cos(ax) * r, z = c.z + Math.sin(ax) * r;
+      return V3(x, groundHeightAt(x, z) + 0.052, z);
+    };
     for (let i = 0; i < n; i++) {
       const a0 = (i / n) * Math.PI * 2;
       const a1 = ((i + 1) / n) * Math.PI * 2;
-      const rIn = c.radius * 0.84;
-      // Ragged outer edge — a clean disc of soot is worse than none.
-      const kA = 0.55 + 0.45 * Math.abs(Math.sin(a0 * 2.3 + c.x));
-      const kB = 0.55 + 0.45 * Math.abs(Math.sin(a1 * 2.3 + c.x));
-      const rA = rIn + spread * kA, rB = rIn + spread * kB;
-      const p = (ax: number, r: number) => {
-        const x = c.x + Math.cos(ax) * r, z = c.z + Math.sin(ax) * r;
-        return V3(x, groundHeightAt(x, z) + 0.052, z);
-      };
-      scorch.quad(p(a0, rIn), p(a1, rIn), p(a1, rB), p(a0, rA), 3.0, false);
+      const kA = 0.35 + 0.65 * Math.abs(Math.sin(a0 * 3.7 + c.x));
+      const kB = 0.35 + 0.65 * Math.abs(Math.sin(a1 * 3.7 + c.x));
+      scorch.quad(p(a0, rIn), p(a1, rIn), p(a1, rIn + spread * kB), p(a0, rIn + spread * kA), 3.0, false);
+    }
+    // Four narrow streaks of soot thrown clear of the collar.
+    for (let i = 0; i < 4; i++) {
+      const a = (i / 4) * Math.PI * 2 + c.x * 0.7;
+      const half = 0.10 + 0.05 * ((i * 7 + c.z) % 1);
+      const len = c.radius * (1.5 + 0.9 * ((i * 13 + c.x) % 1));
+      scorch.quad(
+        p(a - half, rIn), p(a + half, rIn),
+        p(a + half * 0.35, rIn + len), p(a - half * 0.35, rIn + len), 3.0, false);
+    }
+  }
+
+  /* --- crater rim: displaced paving and ejecta -------------------------
+   * A shell does not paint a disc on the road, it lifts the paving. Every
+   * crater gets a ring of slabs tipped up out of the ground on the lip, spoil
+   * mounded between them and a scatter of thrown blocks outside — which is
+   * what gives the hole a silhouette against the horizon instead of reading
+   * as a stain you could walk across. */
+  const slab = chunk.m('setts');
+  const spoil = chunk.m('dirt');
+  const lump = chunk.m('concreteDark');
+  for (const c of CRATERS) {
+    const rr = new Rand(`crater:${c.x}:${c.z}`);
+    const ring = Math.round(9 + c.radius * 3.4);
+    for (let i = 0; i < ring; i++) {
+      const a = (i / ring) * Math.PI * 2 + rr.range(-0.16, 0.16);
+      const r = c.radius * rr.range(0.94, 1.12);
+      const px = c.x + Math.cos(a) * r, pz = c.z + Math.sin(a) * r;
+      const py = groundHeightAt(px, pz);
+      if (rr.bool(0.58)) {
+        // A flag of paving levered up on its outer edge and left leaning: the
+        // hinge stays in the ground, so it reads as *displaced* paving rather
+        // than as a piece of wall someone stood on end.
+        const tilt = rr.range(0.45, 1.05);
+        const w = rr.range(0.20, 0.40), t = rr.range(0.035, 0.065);
+        slab.pushTRS(px, py - 0.03, pz, a + Math.PI / 2 + rr.range(-0.35, 0.35), -tilt, rr.range(-0.3, 0.3));
+        slab.box(0, w * 0.5, 0, w * 0.62, w * 0.55, t, 0.4);
+        slab.pop();
+      } else {
+        // Mound of thrown sub-base — wide and low, not a potato.
+        const s = rr.range(0.34, 0.7);
+        spoil.pushTRS(px, py - 0.06, pz, rr.range(0, 6.28), 0, 0, 1, 0.34, 1);
+        spoil.lump(s, 8, 4, (k) => {
+          const v = Math.sin((k + i) * 12.9898) * 43758.5;
+          return 0.5 + 0.42 * (v - Math.floor(v));
+        }, 0.9);
+        spoil.pop();
+      }
+    }
+    // Blocks thrown clear.
+    const thrown = Math.round(4 + c.radius * 1.6);
+    for (let i = 0; i < thrown; i++) {
+      const a = rr.range(0, Math.PI * 2);
+      const r = c.radius * rr.range(1.15, 2.0);
+      const px = c.x + Math.cos(a) * r, pz = c.z + Math.sin(a) * r;
+      if (insideAnyFootprint(px, pz, 0.4)) continue;
+      const py = groundHeightAt(px, pz);
+      const s = rr.range(0.09, 0.24);
+      lump.pushTRS(px, py + s * 0.42, pz, rr.range(0, 6.28), rr.range(-0.5, 0.5), rr.range(-0.5, 0.5));
+      lump.box(0, 0, 0, s, s * rr.range(0.4, 0.8), s * rr.range(0.6, 1.3), 0.5);
+      lump.pop();
     }
   }
 
@@ -300,8 +467,12 @@ export function buildTerrain(chunk: Chunk): void {
   const rail = chunk.m('steel');
   const trackZ0 = SQUARE.z0 - 2, trackZ1 = SQUARE.z1 + 24;
   const gauge = 1.55;
-  // Bed follows the ground exactly: sampled per corner, so no gaps.
-  bed.grid(-2.35, trackZ0, 2.35, trackZ1, 6, Math.round((trackZ1 - trackZ0) / 1.3),
+  // Bed follows the ground exactly: sampled per corner, so no gaps. It runs the
+  // full width of the sunken carriageway so the lane between the two kerb lines
+  // reads as one dark granite strip rather than a stripe of setts floating in
+  // the cobbles.
+  bed.grid(-PLAZA.trackHalf + 0.1, trackZ0, PLAZA.trackHalf - 0.1, trackZ1,
+    9, Math.round((trackZ1 - trackZ0) / 1.3),
     (x, z) => groundHeightAt(x, z) + 0.048, 0.85);
   for (const rx of [-gauge, gauge]) {
     for (let z = trackZ0; z < trackZ1; z += 1.5) {
@@ -363,6 +534,37 @@ export function buildTerrain(chunk: Chunk): void {
     const y = lowestIn(p.x, p.z, Math.max(p.rx, p.rz)) + 0.025;
     water.extrude(pts, y - 0.02, y, 2.4, true, false, false);
     void n;
+  }
+}
+
+/* ------------------------------------------------------------- kerbing -- */
+
+const KERB_TOP = 0.055;
+const KERB_W = 0.30;
+
+/** Kerb run along Z at constant x. `out` is +1/−1: the low (road) side. */
+function kerbAlongZ(m: Mesher, x: number, z0: number, z1: number, out: -1 | 1): void {
+  const step = 1.15;
+  for (let z = z0; z < z1 - 1e-3; z += step) {
+    const ze = Math.min(z + step, z1);
+    const zm = (z + ze) * 0.5;
+    const top = groundHeightAt(x - out * 0.5, zm) + KERB_TOP;
+    const bot = groundHeightAt(x + out * 0.6, zm) - 0.34;
+    const a = x - out * KERB_W, b = x + out * 0.05;
+    m.boxMinMax(Math.min(a, b), bot, z, Math.max(a, b), top, ze, 1.0);
+  }
+}
+
+/** Kerb run along X at constant z. `out` is +1/−1: the low (road) side. */
+function kerbAlongX(m: Mesher, x0: number, x1: number, z: number, out: -1 | 1): void {
+  const step = 1.15;
+  for (let x = x0; x < x1 - 1e-3; x += step) {
+    const xe = Math.min(x + step, x1);
+    const xm = (x + xe) * 0.5;
+    const top = groundHeightAt(xm, z - out * 0.5) + KERB_TOP;
+    const bot = groundHeightAt(xm, z + out * 0.6) - 0.34;
+    const a = z - out * KERB_W, b = z + out * 0.05;
+    m.boxMinMax(x, bot, Math.min(a, b), xe, top, Math.max(a, b), 1.0);
   }
 }
 

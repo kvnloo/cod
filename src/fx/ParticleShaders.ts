@@ -569,10 +569,16 @@ void main() {
 		float mu = boSat( dot( - V, boSunDirWorld ) );
 		const float G = 0.62;
 		float hg = ( 1.0 - G * G ) / pow( 1.0 + G * G - 2.0 * G * mu, 1.5 );
+		// Un-normalised, that lobe peaks at 11 and is then multiplied by an
+		// illuminance already in the tens — so every puff facing anywhere near
+		// the key went straight through the top of the tonemapper and came out
+		// flat white, with no bright side, no dark side and no apparent
+		// thickness. Capping the peak keeps the backlit rim without the clip.
+		hg = min( hg, 5.0 );
 		// Transmission falls off with optical depth — a thin wisp glows, the
 		// dense core stays dark, and that contrast is what gives smoke volume.
 		float transmit = exp( - thickness * 2.35 );
-		sun += boSunColor * hg * transmit * shadow * 0.42;
+		sun += boSunColor * hg * transmit * shadow * 0.38;
 
 		// boSunColor is illuminance; a scattering lobe converts it to radiance.
 		// The extra hold-down is deliberate: pale dust really is ~3x brighter

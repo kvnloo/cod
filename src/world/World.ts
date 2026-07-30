@@ -58,15 +58,22 @@ export interface SpawnPoint { position: THREE.Vector3; yaw: number; team: 'playe
 export type { CoverPoint, TraversalLink, CoverQuery, PathResult, ScoredCover };
 
 /**
- * Late afternoon, an hour or so before the golden hour proper.
+ * Golden hour proper — solar elevation ≈ 11°, azimuth just north of west.
  *
- * Pushed up from 17:20 deliberately: with the sun below ~20° the ground plane
- * receives more light from the sky hemisphere than from the sun, which flattens
- * the whole map and leaves the cast shadows barely readable. At ~26° the key
- * dominates horizontal surfaces, shadows stretch across the square, and the
- * light is still warm.
+ * The previous 16:25 put the sun at 28°, which is mid-afternoon: the key came
+ * down steeply enough to light the plaza directly, but the atmosphere was still
+ * short enough that both the direct light and the sky read neutral-to-cold, and
+ * every frame measured bluer than it was red. A sun this low is the whole point
+ * of the setting — the light travels through three times the air, so it lands
+ * amber, the shadows it throws run the full width of the square, and the sky
+ * itself warms toward the horizon.
+ *
+ * The trade the old comment worried about — a low key underlighting horizontal
+ * surfaces — is real, but it is an *exposure* problem, not a sun-height problem:
+ * the meter now anchors to the subject rather than the sky, so a plaza in the
+ * shadow of the shop row lands where the eye expects it instead of at 3% grey.
  */
-const TIME_OF_DAY = 16.25;
+const TIME_OF_DAY = 18.0;
 
 export class WorldSystem implements System {
   readonly name = 'world';
@@ -234,6 +241,12 @@ export class WorldSystem implements System {
     this.renderApi = ctx.engine.tryGet<System & RenderAPI>('render') ?? null;
 
     registerWorldShots(this);
+    // Pin the level's own hour on to every level shot. `setShot` only touches
+    // the time of day when a shot names one, so in a run that also contains the
+    // render module's time-of-day shots every level shot after `render-night`
+    // was silently captured at 23:20 — which is exactly how a contact sheet of
+    // a golden-hour map comes back reading as blue midnight.
+    for (const shot of WORLD_SHOTS) if (shot.hour === undefined) shot.hour = TIME_OF_DAY;
 
     let triangles = 0;
     this.root.traverse((o) => {
@@ -265,21 +278,24 @@ export class WorldSystem implements System {
     render.setTimeOfDay(TIME_OF_DAY);
     // Just enough haze to separate the depth layers. The volumetric density
     // scales steeply off this value, so anything above ~0.06 turns a 60 m
-    // sightline into a white wall at eye level — at 0.05 a 30 m sightline into
-    // the sun was already losing its midground, hence 0.038.
-    render.setWeather(0, 0.038, 0.4);
-    // Golden hour needs the sun to dominate. A full-strength sky probe lights
-    // horizontal surfaces from the whole hemisphere and drowns both the warm key
-    // and its shadows — the road ends up brighter than the sunlit facades.
+    // sightline into a white wall at eye level. Down from 0.038: a sun this low
+    // pushes far more light forward through the haze than a 28° one did, and at
+    // the old value the midground of every westward sightline went milky.
+    render.setWeather(0, 0.020, 0.4);
+    // Golden hour needs the sun to dominate: the point of a low warm key is the
+    // *ratio* between a sunlit facade and a shaded one, and a full-strength sky
+    // probe lights every face from the whole hemisphere until the two sides of a
+    // corner are within half a stop of each other.
     //
-    // 0.55, not 0.78: the point of a low warm key is the *ratio* between a
-    // sunlit facade and a shaded one. At 0.78 the sky fill was carrying enough
-    // of the shaded side that the two faces of a corner were within half a stop
-    // of each other and the whole map read flat. Dropping the fill and pushing
-    // its tint further into the blue widens both the value split and the colour
-    // split, which is the entire golden-hour read.
+    // 2.0 rather than the old 0.55 because the sky bake itself is now 0.65 of
+    // a stop dimmer (SKY_INTENSITY) against a sun 0.7 of a stop stronger. The
+    // key-to-fill ratio is therefore *wider* than it was at 0.55, while the
+    // absolute level of a shaded surface stays where the eye expects it instead
+    // of falling off the bottom of the frame — which is what put the plaza at
+    // 3% grey. The tint stays firmly blue: sky fill is the cool half of the
+    // golden-hour colour split.
     const api = render as unknown as { setAmbient?: (tint: THREE.ColorRepresentation, i: number) => void };
-    api.setAmbient?.(0x8fb4e6, 0.55);
+    api.setAmbient?.(0x7fa9ef, 2.0);
     this.cloth.setWind(0.75);
   }
 

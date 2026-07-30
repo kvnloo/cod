@@ -28,6 +28,10 @@ export function validatePipelineManifest(manifest) {
       || isolation.desktopPauseCommands.some((command) => typeof command !== 'string' || !command)) {
     throw new Error('resource isolation requires a desktopPauseCommands array');
   }
+  if (!Array.isArray(isolation.exclusiveSignalPauseCommands)
+      || isolation.exclusiveSignalPauseCommands.some((command) => typeof command !== 'string' || !command)) {
+    throw new Error('resource isolation requires an exclusiveSignalPauseCommands array');
+  }
   for (const field of ['maxCpuUtilization', 'maxGpuUtilization']) {
     const value = finiteNumber(isolation[field], `resourceIsolation.${field}`);
     if (value < 0 || value > 100) throw new Error(`resourceIsolation.${field} must be within 0..100`);

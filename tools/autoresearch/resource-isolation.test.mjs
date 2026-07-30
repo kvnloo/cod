@@ -11,6 +11,7 @@ import {
   quietSampleAccepted,
   selectPauseCgroups,
   selectPauseTargets,
+  selectSignalPauseTargets,
 } from './resource-isolation.mjs';
 import { parsePmon } from './resource-watchdog.mjs';
 
@@ -42,6 +43,17 @@ test('deduplicates target cgroups and never freezes the active ancestry cgroup',
   assert.equal(groups.length, 1);
   assert.deepEqual(groups[0].pids, [20, 21]);
   assert.deepEqual(groups[0].commands, ['claude', 'node']);
+});
+
+test('signal fallback selects only non-TTY workloads outside writable user cgroups', () => {
+  const targets = [
+    { pid: 1, startTime: '1', comm: 'python3', ttyNr: 0, cgroup: '/system.slice/cronie.service' },
+    { pid: 2, startTime: '2', comm: 'python3', ttyNr: 34816, cgroup: '/system.slice/interactive.service' },
+    { pid: 3, startTime: '3', comm: 'node', ttyNr: 0, cgroup: '/user.slice/user-1000.slice/user@1000.service/app.slice/node.scope' },
+  ];
+  assert.deepEqual(selectSignalPauseTargets(targets), [
+    { pid: 1, startTime: '1', command: 'python3' },
+  ]);
 });
 
 test('quiet samples fail closed when either CPU or GPU exceeds policy', () => {

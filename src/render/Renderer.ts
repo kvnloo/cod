@@ -20,7 +20,7 @@ import { bus } from '../core/EventBus';
 import {
   LAYERS, type DecalRequest, type DynamicLightRequest, type RenderAPI, type ScreenEffectRequest,
 } from './types';
-import { PASS_ORDER, type PassContext, type RenderPass } from './Pass';
+import { PASS_ORDER, type AtmosphereState, type PassContext, type RenderPass } from './Pass';
 import { RenderUniforms } from './RenderUniforms';
 import { MaterialPatcher, skipPatch } from './MaterialPatch';
 import { SceneIndex } from './SceneIndex';
@@ -200,6 +200,23 @@ export class RenderSystem implements System, RenderAPI {
   private gradeVec = new THREE.Vector4(1.05, 1.03, 0.0, 0.0);
   private borrowed: THREE.WebGLRenderTarget[] = [];
   private warnedLights = false;
+  private readonly atmosphere: AtmosphereState = {
+    sunDirection: new THREE.Vector3(0, 1, 0),
+    sunColor: new THREE.Color(1, 1, 1),
+    skyColor: new THREE.Color(0.5, 0.6, 0.75),
+    skyCube: null,
+    nightFactor: 0,
+    weather: 0,
+    shadow: {
+      atlas: null,
+      matrices: this.uniforms.boCsmMatrix.value,
+      tiles: this.uniforms.boCsmTile.value,
+      params: this.uniforms.boCsmParams.value,
+      count: 0,
+      distance: 0,
+      strength: 1,
+    },
+  };
 
   /* ------------------------------------------------------------- lifecycle */
 
@@ -603,6 +620,43 @@ export class RenderSystem implements System, RenderAPI {
     return this._depthOnly;
   }
 
+  private _vmPunch: THREE.MeshDepthMaterial | null = null;
+  /**
+   * Stamps the far plane into the depth buffer over the view model's own
+   * silhouette, and nothing else.
+   *
+   * The weapon must never be occluded by world geometry, which used to be
+   * arranged by clearing the whole depth buffer before drawing it — but that
+   * buffer is the G-buffer's depth attachment, the one every depth-driven post
+   * pass reads. Clearing it made the entire world read as "far plane" to GTAO,
+   * SSR, DoF, motion blur and the volumetric apply. Punching a hole exactly the
+   * shape of the weapon gives the same occlusion guarantee while leaving the
+   * world's depth intact everywhere else.
+   */
+  private vmPunch(): THREE.MeshDepthMaterial {
+    if (!this._vmPunch) {
+      const m = skipPatch(new THREE.MeshDepthMaterial({
+        depthPacking: THREE.BasicDepthPacking,
+        side: THREE.DoubleSide,
+      }));
+      m.colorWrite = false;
+      m.depthWrite = true;
+      m.depthTest = true;
+      m.depthFunc = THREE.AlwaysDepth;
+      m.onBeforeCompile = (shader) => {
+        // Snap every vertex to the far plane; keeps early-Z and works with
+        // skinning, instancing and batching because it rides on the stock chunk.
+        shader.vertexShader = shader.vertexShader.replace(
+          '#include <project_vertex>',
+          '#include <project_vertex>\n\tgl_Position.z = gl_Position.w;',
+        );
+      };
+      m.customProgramCacheKey = () => 'bo-vm-punch';
+      this._vmPunch = m;
+    }
+    return this._vmPunch;
+  }
+
   private renderMain(width: number, height: number): void {
     const r = this.renderer;
     const gb = this.graph.gbuffer;
@@ -631,7 +685,13 @@ export class RenderSystem implements System, RenderAPI {
       this.viewModelCamera.near = this.camera.near;
       this.viewModelCamera.far = this.camera.far;
       this.viewModelCamera.updateProjectionMatrix();
-      r.clear(false, true, false);
+      // Punch the weapon's silhouette to the far plane, then draw it normally.
+      // See vmPunch(): a full depth clear here would destroy the depth buffer
+      // the whole post chain depends on.
+      const prevOverride = this.viewModelScene.overrideMaterial;
+      this.viewModelScene.overrideMaterial = this.vmPunch();
+      r.render(this.viewModelScene, this.viewModelCamera);
+      this.viewModelScene.overrideMaterial = prevOverride;
       r.render(this.viewModelScene, this.viewModelCamera);
     }
 
@@ -642,11 +702,25 @@ export class RenderSystem implements System, RenderAPI {
     if (this.passes.length === 0) return input;
 
     const gb = this.graph.gbuffer;
+    const atmo = this.atmosphere;
+    atmo.sunDirection.copy(this.uniforms.boSunDirWorld.value);
+    atmo.sunColor.copy(this.sky.sunIlluminance);
+    atmo.skyColor.copy(this.sky.horizonColor);
+    atmo.skyCube = this.uniforms.boSkyCube.value as THREE.Texture | null;
+    atmo.nightFactor = this.sky.nightFactor;
+    atmo.weather = THREE.MathUtils.clamp(this.sky.rain * 0.7 + this.sky.fogAmount, 0, 1);
+    const csm = this.uniforms.boCsmInfo.value;
+    atmo.shadow.atlas = this.uniforms.boShadowAtlas.value;
+    atmo.shadow.count = csm.x;
+    atmo.shadow.distance = csm.z;
+    atmo.shadow.strength = this.uniforms.boShadowStrength.value;
+
     const ctx: PassContext = {
       renderer: this.renderer,
       scene: this.scene,
       camera: this.camera,
       gbuffer: gb,
+      atmosphere: atmo,
       dt: this.elapsedDelta(),
       frame: this.frameIndex,
       time: this.elapsed,
@@ -699,11 +773,18 @@ export class RenderSystem implements System, RenderAPI {
   private updateFog(): void {
     const g = settings.gfx;
     const weather = this.sky.rain * 0.6 + this.sky.fogAmount;
-    const density = (0.00075 + weather * 0.011) * g.fogDensity;
-    this.uniforms.boFogParams.value.set(density, 0.055, 1.7, 0.76 + 0.05 * this.sky.fogAmount);
+    // Long-range term. The froxel volume owns the first ~180 m; this is what
+    // makes 300 m read as 300 m. 0.0013/m is ~12% at 100 m, 30% at 300 m.
+    const density = (0.0009 + weather * 0.009) * g.fogDensity;
+    this.uniforms.boFogParams.value.set(
+      density,
+      0.032,                                  // height falloff (1/m)
+      0.055,                                  // sun single-scatter weight
+      0.76 + 0.05 * this.sky.fogAmount,       // Mie g
+    );
     this.uniforms.boFogParams2.value.set(
       0,
-      0.985,
+      0.97,
       1.0,
       THREE.MathUtils.clamp(this.sky.rain * 0.5 + this.sky.fogAmount * 0.3, 0, 1),
     );

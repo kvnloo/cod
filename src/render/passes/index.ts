@@ -93,7 +93,9 @@ export function postScreenEffect(req: ScreenEffectRequest): void {
 export function postSetWeather(rain: number, fog: number, wind: number): void {
   const vol = registry.get('volumetrics') as VolumetricPass | undefined;
   if (vol) {
-    vol.fogScale = 0.6 + fog * 2.2;
+    // Quadratic so "a bit of haze" stays a bit of haze and only real fog
+    // weather closes the level down.
+    vol.fogScale = 0.55 + fog * 1.4 + fog * fog * 5.0;
     vol.windSpeed = 0.01 + wind * 0.06;
   }
   const fx = postResources.fx;

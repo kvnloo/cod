@@ -17,7 +17,7 @@ import { bus } from '../../core/EventBus';
 import { registerDebugScene, registerShots } from '../../core/Shots';
 import { ORDER, type EngineContext, type System } from '../../core/Engine';
 import { settings } from '../../core/Settings';
-import type { GBuffer, PassContext, RenderPass } from '../Pass';
+import type { AtmosphereState, GBuffer, PassContext, RenderPass } from '../Pass';
 import { haltonJitter } from './BlueNoise';
 import { FULLSCREEN_VERT } from './Shaders';
 import {
@@ -370,6 +370,25 @@ export class LabFrameGraph {
   focusDistance = 8;
   exposure = 1;
 
+  /** Stand-in sky state; the lab has no `SkySystem`. */
+  readonly atmosphere: AtmosphereState = {
+    sunDirection: new THREE.Vector3(0.42, 0.72, 0.55).normalize(),
+    sunColor: new THREE.Color(1.0, 0.94, 0.84).multiplyScalar(6),
+    skyColor: new THREE.Color(0.34, 0.45, 0.62),
+    skyCube: null,
+    nightFactor: 0,
+    weather: 0,
+    shadow: {
+      atlas: null,
+      matrices: Array.from({ length: 4 }, () => new THREE.Matrix4()),
+      tiles: Array.from({ length: 4 }, () => new THREE.Vector4()),
+      params: Array.from({ length: 4 }, () => new THREE.Vector4()),
+      count: 0,
+      distance: 0,
+      strength: 0,
+    },
+  };
+
   constructor(renderer: THREE.WebGLRenderer, passes?: RenderPass[]) {
     this.renderer = renderer;
     this.passes = (passes ?? createPasses()).slice().sort((a, b) => a.order - b.order);
@@ -544,6 +563,7 @@ export class LabFrameGraph {
       scene,
       camera,
       gbuffer,
+      atmosphere: this.atmosphere,
       dt,
       frame: this.frame,
       time: this.time,

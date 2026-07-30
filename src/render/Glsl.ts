@@ -549,9 +549,25 @@ float boContactShadow( const in vec3 viewPos, const in vec3 viewNormal,
 #endif
 `;
 
+/* ------------------------------------------------------------------- sun -- */
+
+/** The analytic sun. Separate chunk so aerial perspective can use it without
+ *  pulling in the whole lit-material prelude. */
+export const GLSL_SUN = /* glsl */ `
+#ifndef BO_SUN
+#define BO_SUN
+
+uniform vec3 boSunDirWorld;
+uniform vec3 boSunDirView;
+uniform vec3 boSunColor;
+
+#endif
+`;
+
 /* ------------------------------------------------------ aerial perspective -- */
 
 export const GLSL_AERIAL = /* glsl */ `
+${GLSL_SUN}
 #ifndef BO_AERIAL
 #define BO_AERIAL
 
@@ -591,10 +607,14 @@ vec3 boAerialPerspective( vec3 color, vec3 worldPos, vec3 camPos, vec3 sunDirWor
 	float fog = 1.0 - exp( - od );
 	fog = min( fog, boFogParams2.y );
 
+	// In-scatter = the sky along the view ray, plus single-scattered sunlight.
+	//
+	// The sun term is *added*, never multiplied into the sky: a multiplicative
+	// Mie boost reaches ~46x within twenty degrees of a low sun and turns the
+	// whole forward hemisphere into a white sheet.
 	vec3 sky = textureLod( boSkyCube, dir, 3.0 ).rgb;
 	float mu = dot( dir, sunDirWorld );
-	float mie = boPhaseMie( mu, boFogParams.w ) * 12.566;
-	vec3 inscatter = mix( sky, sky * ( 1.0 + boFogParams.z * mie ), 0.75 );
+	vec3 inscatter = sky + boSunColor * ( boPhaseMie( mu, boFogParams.w ) * boFogParams.z );
 	inscatter = mix( inscatter, vec3( boLuma( inscatter ) ) * boFogTint, boFogParams2.w );
 	inscatter *= boFogParams2.z;
 

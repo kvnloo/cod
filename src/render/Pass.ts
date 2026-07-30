@@ -28,11 +28,57 @@ export interface GBuffer {
   height: number;
 }
 
+/**
+ * Sky/atmosphere state resolved by `SkySystem` for the current frame.
+ *
+ * Post passes must not reach into the sky system directly, but several of them
+ * (volumetrics above all) are wrong unless their in-scatter colour tracks the
+ * time of day. The renderer publishes this snapshot once per frame.
+ */
+export interface AtmosphereState {
+  /** Unit vector from the world toward the dominant celestial light. */
+  sunDirection: THREE.Vector3;
+  /** Illuminance of that light, renderer linear units. */
+  sunColor: THREE.Color;
+  /** Mean sky radiance near the horizon — the colour distance recedes toward. */
+  skyColor: THREE.Color;
+  /** Filtered environment cubemap (mip 0 = sharp sky). */
+  skyCube: THREE.Texture | null;
+  /** 0 at day, 1 at full night. */
+  nightFactor: number;
+  /** Combined weather amount, 0..1 (rain + fog). */
+  weather: number;
+  /** Cascaded sun shadows, so participating media can be shadowed too. */
+  shadow: SunShadowState;
+}
+
+/**
+ * The cascaded shadow atlas and its transforms.
+ *
+ * `ShadowSystem` replaces three's shadow pipeline wholesale, which means a pass
+ * that goes looking for `DirectionalLight.shadow.map` finds nothing. Anything
+ * that needs sun visibility — volumetric god rays above all — reads this.
+ */
+export interface SunShadowState {
+  atlas: THREE.Texture | null;
+  /** World -> cascade [0,1]^3, one per cascade. */
+  matrices: THREE.Matrix4[];
+  /** Atlas tile: xy offset, zw scale. */
+  tiles: THREE.Vector4[];
+  /** x worldExtent(m), y zRange(m), z texelWorld(m), w splitFar(view m). */
+  params: THREE.Vector4[];
+  count: number;
+  /** Beyond this view distance the cascades hold nothing. */
+  distance: number;
+  strength: number;
+}
+
 export interface PassContext {
   renderer: THREE.WebGLRenderer;
   scene: THREE.Scene;
   camera: THREE.PerspectiveCamera;
   gbuffer: GBuffer;
+  atmosphere: AtmosphereState;
   /** Frame delta in seconds. */
   dt: number;
   /** Monotonically increasing frame index — drives temporal sample sequences. */

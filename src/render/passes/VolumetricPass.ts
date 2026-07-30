@@ -23,14 +23,12 @@ const MAX_LIGHTS = 8;
 const SCATTER_FRAG = /* glsl */ `
 uniform sampler2D tPrev;
 #ifdef VOL_SHADOW
-#ifdef VOL_SHADOW_COMPARE
-uniform highp sampler2DShadow tShadow;
-#else
-uniform sampler2D tShadow;
-#endif
-uniform mat4 uShadowMatrix;
-uniform float uShadowBias;
-uniform vec2 uShadowTexel;
+uniform sampler2D tShadow;   // the CSM depth atlas
+uniform mat4 uCsmMatrix[4];
+uniform vec4 uCsmTile[4];
+uniform vec4 uCsmParams[4];
+uniform vec4 uCsmInfo;       // x count, y unused, z distance, w mapSize
+uniform float uShadowStrength;
 #endif
 uniform vec2 uFroxel;        // froxel tile size in pixels
 uniform vec2 uTiles;         // tiles across / down
@@ -86,27 +84,47 @@ float henyeyGreenstein(float cosTheta, float g) {
 }
 
 #ifdef VOL_SHADOW
-float shadowTap(vec2 uv, float ref) {
-#ifdef VOL_SHADOW_COMPARE
-  return texture(tShadow, vec3(uv, ref));
-#else
-  return ref <= texture(tShadow, uv).r ? 1.0 : 0.0;
-#endif
-}
+/**
+ * Sun visibility for a froxel centre, sampled from the renderer's cascaded
+ * shadow atlas. The engine replaces three's shadow pipeline entirely, so the
+ * usual DirectionalLight.shadow.map route finds nothing — without this the
+ * medium is lit uniformly and there are no shafts at all.
+ */
+float sunShadow(vec3 world, float viewZ, float rot) {
+  int count = int(uCsmInfo.x);
+  if (count <= 0 || uShadowStrength <= 0.0) return 1.0;
+  if (viewZ > uCsmInfo.z) return 1.0;
 
-float sunShadow(vec3 world) {
-  vec4 s = uShadowMatrix * vec4(world, 1.0);
-  if (s.w <= 0.0) return 1.0;
-  vec3 p = s.xyz / s.w;
-  if (any(lessThan(p.xy, vec2(0.0))) || any(greaterThan(p.xy, vec2(1.0))) || p.z > 1.0) return 1.0;
-  // 4-tap rotated cross — volumetrics do not need PCSS, just no banding.
+  int c = count - 1;
+  for (int i = 0; i < 4; i++) {
+    if (i >= count) break;
+    if (viewZ < uCsmParams[i].w) { c = i; break; }
+  }
+
+  vec4 lp = uCsmMatrix[c] * vec4(world, 1.0);
+  vec3 uvd = lp.xyz;
+  if (uvd.z <= 0.0 || uvd.z >= 1.0) return 1.0;
+  if (any(lessThan(uvd.xy, vec2(0.004))) || any(greaterThan(uvd.xy, vec2(0.996)))) return 1.0;
+
+  vec4 tile = uCsmTile[c];
+  vec2 base = tile.xy + uvd.xy * tile.zw;
+  float texelW = uCsmParams[c].z;
+  float bias = (texelW * 2.2) / max(uCsmParams[c].y, 1e-3);
+  float texelUV = (tile.z / max(uCsmParams[c].x, 1e-3)) * texelW;
+  vec2 lo = tile.xy + texelUV;
+  vec2 hi = tile.xy + tile.zw - texelUV;
+
+  float ca = cos(rot), sa = sin(rot);
   float sum = 0.0;
   for (int i = 0; i < 4; i++) {
-    float a = float(i) * 1.5707963 + p.x * 12.0;
-    vec2 o = vec2(cos(a), sin(a)) * uShadowTexel * 1.2;
-    sum += shadowTap(p.xy + o, p.z - uShadowBias);
+    float a = float(i) * 1.5707963;
+    vec2 o = vec2(cos(a) * ca - sin(a) * sa, cos(a) * sa + sin(a) * ca) * texelUV * 1.6;
+    float d = texture(tShadow, clamp(base + o, lo, hi)).r;
+    sum += step(uvd.z - bias, d);
   }
-  return sum * 0.25;
+  // Fade out at the cascade limit so shafts do not stop with a hard edge.
+  float fade = 1.0 - smoothstep(uCsmInfo.z * 0.8, uCsmInfo.z, viewZ);
+  return mix(1.0, sum * 0.25, fade * uShadowStrength);
 }
 #endif
 
@@ -149,10 +167,16 @@ void main() {
   vec3 inscatter = uAmbient * sigmaS;
 
   float cosTheta = dot(-rayDir, uSunDirection);
-  float phase = henyeyGreenstein(cosTheta, uAnisotropy);
+  // Dual-lobe HG: a wide backscatter lobe under a narrow forward one. A single
+  // g=0.7 lobe puts everything in a blinding spike around the sun and leaves the
+  // rest of the medium dead; the mix is what makes shafts read from every angle.
+  float phase = mix(
+    henyeyGreenstein(cosTheta, uAnisotropy * 0.28),
+    henyeyGreenstein(cosTheta, uAnisotropy),
+    0.55);
   float shadow = 1.0;
 #ifdef VOL_SHADOW
-  shadow = sunShadow(world);
+  shadow = sunShadow(world, viewZ, jitter * BLK_TAU);
 #endif
   inscatter += uSunColor * (phase * shadow * sigmaS);
 
@@ -250,6 +274,7 @@ uniform float uFar;
 uniform float uFrame;
 uniform vec3 uDistantFogColor;
 uniform float uDistantFogDensity;
+uniform float uDistantFogMax;
 layout(location = 0) out vec4 fragColor;
 
 float viewZToSlice(float z) { return log(max(z, uVolNear) / uVolNear) / log(uVolFar / uVolNear); }
@@ -266,7 +291,8 @@ vec2 atlasUv(vec2 local, float slice) {
 void main() {
   vec3 color = texture(tInput, vUv).rgb;
   float d = texture(tDepth, vUv).r;
-  float z = d >= 1.0 ? uFar : linearizeDepth(d, uNear, uFar);
+  bool isSky = d >= 1.0;
+  float z = isSky ? uFar : linearizeDepth(d, uNear, uFar);
 
   float dither = blueNoise1T(gl_FragCoord.xy, uFrame) - 0.5;
   float slice = viewZToSlice(min(z, uVolFar)) * float(VOL_SLICES) + dither;
@@ -280,9 +306,15 @@ void main() {
 
   // Beyond the froxel volume, fall back to analytic exponential distance fog so
   // the horizon still recedes into atmosphere.
-  if (z > uVolFar) {
+  //
+  // The sky is deliberately excluded: it is already the result of a full
+  // atmospheric scattering integral out to space, so mixing a flat fog colour
+  // over it only destroys the gradient, the sun halo and the horizon warmth.
+  // (Doing this unconditionally, on a depth buffer that had been wiped by the
+  // view-model depth clear, is what used to turn every eye-level frame white.)
+  if (!isSky && z > uVolFar) {
     float extra = 1.0 - exp(-(z - uVolFar) * uDistantFogDensity);
-    color = mix(color, uDistantFogColor * v.a, sat(extra));
+    color = mix(color, uDistantFogColor * v.a, sat(extra) * uDistantFogMax);
   }
 
   fragColor = vec4(color, 1.0);
@@ -315,6 +347,12 @@ export class VolumetricPass extends BasePass {
   /** Weather knobs — driven by `RenderAPI.setWeather` through the pass registry. */
   fogScale = 1;
   windSpeed = 0.02;
+  /** Base extinction per metre at ground level, before weather scaling. */
+  density = 0.0026;
+  /** Fraction of the sun's illuminance that reaches the medium as in-scatter. */
+  sunStrength = 0.28;
+  /** Fraction of the horizon sky radiance the medium scatters ambiently. */
+  ambientScale = 0.30;
 
   constructor(res: PostResources) {
     super(res);
@@ -337,9 +375,11 @@ export class VolumetricPass extends BasePass {
         tPrev: { value: null },
         tBlueNoise: { value: this.res.blueNoise },
         tShadow: { value: null },
-        uShadowMatrix: { value: new THREE.Matrix4() },
-        uShadowBias: { value: 0.0016 },
-        uShadowTexel: { value: new THREE.Vector2(1 / 2048, 1 / 2048) },
+        uCsmMatrix: { value: Array.from({ length: 4 }, () => new THREE.Matrix4()) },
+        uCsmTile: { value: Array.from({ length: 4 }, () => new THREE.Vector4()) },
+        uCsmParams: { value: Array.from({ length: 4 }, () => new THREE.Vector4()) },
+        uCsmInfo: { value: new THREE.Vector4(0, 0, 0, 2048) },
+        uShadowStrength: { value: 1 },
         uFroxel: { value: new THREE.Vector2(160, 90) },
         uTiles: { value: new THREE.Vector2(6, 6) },
         uAtlasSize: { value: new THREE.Vector2(960, 540) },
@@ -402,23 +442,21 @@ export class VolumetricPass extends BasePass {
         uFrame: { value: 0 },
         uDistantFogColor: { value: new THREE.Vector3(0.5, 0.6, 0.72) },
         uDistantFogDensity: { value: 0.004 },
+        uDistantFogMax: { value: 0.7 },
       },
     });
   }
 
-  /** Finds the shadow-casting sun and the nearest local lights. */
+  /** Finds the nearest local lights that should light the medium. */
   private scanLights(ctx: PassContext): void {
-    if (ctx.frame - this.lightScanFrame < 12 && this.sun) return;
+    if (ctx.frame - this.lightScanFrame < 12) return;
     this.lightScanFrame = ctx.frame;
 
-    const suns: THREE.DirectionalLight[] = [];
     const candidates = this.candidates;
     candidates.length = 0;
     const camPos = ctx.camera.getWorldPosition(this.tmpV);
 
     ctx.scene.traverse((obj) => {
-      const dir = obj as THREE.DirectionalLight;
-      if (dir.isDirectionalLight) { suns.push(dir); return; }
       const pl = obj as THREE.PointLight;
       if (pl.isPointLight && pl.intensity > 0.01) {
         candidates.push({ light: pl, d2: pl.getWorldPosition(this.tmpB).distanceToSquared(camPos) });
@@ -429,13 +467,6 @@ export class VolumetricPass extends BasePass {
         candidates.push({ light: sl, d2: sl.getWorldPosition(this.tmpB).distanceToSquared(camPos) });
       }
     });
-
-    let brightest: THREE.DirectionalLight | null = null;
-    for (const s of suns) {
-      if (!brightest || s.intensity > brightest.intensity) brightest = s;
-      if (s.castShadow && s.shadow.map) { brightest = s; break; }
-    }
-    this.sun = brightest;
 
     candidates.sort((a, b) => a.d2 - b.d2);
     const n = Math.min(MAX_LIGHTS, candidates.length);
@@ -486,56 +517,54 @@ export class VolumetricPass extends BasePass {
     const proj = ctx.camera.projectionMatrix.elements;
     this.projVec.set(proj[0], proj[5], proj[8], proj[9]);
 
-    /* --- sun + shadow ------------------------------------------------------*/
-    const sun = this.sun;
+    /* --- sun + cascaded shadow --------------------------------------------- */
+    // The sun direction and illuminance come from the atmosphere snapshot, not
+    // from a scene `DirectionalLight`: the renderer neutralises those (the sky
+    // owns the sun), so the light this pass used to find had intensity ~0.75
+    // instead of the real ~14, and no shadow map at all.
     const su = this.scatter.uniforms;
+    const atmo = ctx.atmosphere;
+    this.sunDir.copy(atmo.sunDirection).multiplyScalar(-1); // direction of travel
+    const sunLum = Math.max(atmo.sunColor.r, atmo.sunColor.g, atmo.sunColor.b);
+    // Above the horizon only; a sun below it lights the medium from underneath.
+    const above = THREE.MathUtils.clamp(atmo.sunDirection.y * 6 + 0.15, 0, 1);
+    const k = this.sunStrength * above;
+    this.sunColor.set(atmo.sunColor.r * k, atmo.sunColor.g * k, atmo.sunColor.b * k);
+
+    const shadow = atmo.shadow;
     const defines = this.scatter.defines as Record<string, string | number>;
-    let shadowTex: THREE.Texture | null = null;
-    let shadowCompare = false;
-    if (sun) {
-      this.sunDir.copy(sun.target.getWorldPosition(this.tmpV)).sub(sun.getWorldPosition(this.tmpB));
-      if (this.sunDir.lengthSq() < 1e-8) this.sunDir.set(0, -1, 0);
-      this.sunDir.normalize();
-      const k = sun.intensity * 0.14;
-      this.sunColor.set(sun.color.r * k, sun.color.g * k, sun.color.b * k);
-      const map = sun.shadow.map;
-      const dt = map ? map.depthTexture : null;
-      // three uses a comparison sampler for PCF shadow maps and a plain depth
-      // texture for Basic/VSM; a define selects the matching sampler type.
-      if (map && dt) {
-        shadowCompare = dt.compareFunction != null;
-        shadowTex = dt;
-        (su.uShadowMatrix.value as THREE.Matrix4).copy(sun.shadow.matrix);
-        (su.uShadowTexel.value as THREE.Vector2).set(1 / map.width, 1 / map.height);
-        su.uShadowBias.value = 0.0018;
-      }
-    }
-    const wantShadow = shadowTex ? 1 : 0;
-    const wantCompare = shadowCompare ? 1 : 0;
+    const wantShadow = shadow.atlas && shadow.count > 0 && shadow.strength > 0 ? 1 : 0;
     if ((defines.VOL_SHADOW ?? 0) !== wantShadow) {
       if (wantShadow) defines.VOL_SHADOW = 1; else delete defines.VOL_SHADOW;
       this.scatter.needsUpdate = true;
     }
-    if ((defines.VOL_SHADOW_COMPARE ?? 0) !== wantCompare) {
-      if (wantCompare) defines.VOL_SHADOW_COMPARE = 1; else delete defines.VOL_SHADOW_COMPARE;
-      this.scatter.needsUpdate = true;
+    su.tShadow.value = shadow.atlas;
+    if (wantShadow) {
+      const mats = su.uCsmMatrix.value as THREE.Matrix4[];
+      const tiles = su.uCsmTile.value as THREE.Vector4[];
+      const params = su.uCsmParams.value as THREE.Vector4[];
+      for (let i = 0; i < 4; i++) {
+        mats[i].copy(shadow.matrices[i]);
+        tiles[i].copy(shadow.tiles[i]);
+        params[i].copy(shadow.params[i]);
+      }
+      (su.uCsmInfo.value as THREE.Vector4).set(shadow.count, 0, shadow.distance, 2048);
+      su.uShadowStrength.value = shadow.strength;
     }
-    su.tShadow.value = shadowTex;
 
-    /* --- ambient / fog colour from the scene ------------------------------ */
-    const bg = ctx.scene.background;
-    if (bg && (bg as THREE.Color).isColor) {
-      const c = bg as THREE.Color;
-      this.fogColor.set(c.r, c.g, c.b);
-      this.ambient.set(c.r * 0.06, c.g * 0.07, c.b * 0.09);
-    }
-    const fog = ctx.scene.fog;
-    let distantDensity = 0.0035;
-    if (fog && (fog as THREE.FogExp2).isFogExp2) {
-      distantDensity = (fog as THREE.FogExp2).density;
-      const c = (fog as THREE.FogExp2).color;
-      this.fogColor.set(c.r, c.g, c.b);
-    }
+    /* --- ambient / fog colour from the sky -------------------------------- */
+    // `RenderSystem` nulls `scene.background` and `scene.fog` every frame (the
+    // sky system owns the environment), so reading them here only ever produced
+    // the constructor defaults — a fixed blue-grey that never tracked the hour.
+    // The atmosphere snapshot is the authoritative source.
+    const sky = atmo.skyColor;
+    this.fogColor.set(sky.r, sky.g, sky.b);
+    // A fog particle sees the horizon radiance over the upper hemisphere and the
+    // (much darker) ground over the lower one; overcast evens the two out.
+    const amb = this.ambientScale * (1 + 0.5 * atmo.weather);
+    this.ambient.set(sky.r * amb, sky.g * amb, sky.b * amb);
+    const distantDensity = 0.0026 + 0.010 * atmo.weather;
+    void sunLum;
 
     /* --- 1: scatter --------------------------------------------------------*/
     su.tPrev.value = prev.texture;
@@ -551,10 +580,13 @@ export class VolumetricPass extends BasePass {
     (su.uAmbient.value as THREE.Vector3).copy(this.ambient);
     su.uVolNear.value = Math.max(0.25, ctx.cameraNear * 4);
     su.uVolFar.value = volFar;
-    su.uDensity.value = 0.010 * g.fogDensity * this.fogScale;
-    su.uHeight.value = 3;
-    su.uFalloff.value = 12;
-    su.uAnisotropy.value = 0.66;
+    // Calibration: clear air is ~0.0018/m of extinction, which is 3% opaque at
+    // 20 m and 28% at 180 m — depth without haze. The old 0.0071 milked
+    // everything past the first ten metres.
+    su.uDensity.value = this.density * g.fogDensity * this.fogScale;
+    su.uHeight.value = 1.5;
+    su.uFalloff.value = 26;
+    su.uAnisotropy.value = 0.72;
     su.uFrame.value = ctx.frame % 64;
     su.uTime.value = ctx.time;
     su.uNoiseAmount.value = 0.5;
@@ -587,6 +619,7 @@ export class VolumetricPass extends BasePass {
     au.uFrame.value = ctx.frame % 64;
     (au.uDistantFogColor.value as THREE.Vector3).copy(this.fogColor);
     au.uDistantFogDensity.value = distantDensity;
+    au.uDistantFogMax.value = 0.55 + 0.4 * ctx.atmosphere.weather;
     ctx.blit(this.apply, output);
     return true;
   }

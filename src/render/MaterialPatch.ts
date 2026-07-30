@@ -18,7 +18,7 @@
 
 import * as THREE from 'three';
 import {
-  GLSL_AERIAL, GLSL_COMMON, GLSL_CONTACT, GLSL_CSM, GLSL_SH, GLSL_ATMOSPHERE,
+  GLSL_AERIAL, GLSL_COMMON, GLSL_CONTACT, GLSL_CSM, GLSL_SH, GLSL_SUN, GLSL_ATMOSPHERE,
 } from './Glsl';
 import type { RenderUniforms } from './RenderUniforms';
 
@@ -122,17 +122,16 @@ const VERTEX_BODY = /* glsl */ `
 
 const FRAG_PARS_COMMON = GLSL_COMMON;
 
+/** Aerial perspective on its own — a material can want fog without the sun. */
+const FRAG_PARS_AERIAL = [GLSL_ATMOSPHERE, GLSL_SUN, GLSL_AERIAL].join('\n');
+
 const FRAG_PARS_LIT = [
-  GLSL_COMMON,
   GLSL_ATMOSPHERE,
+  GLSL_SUN,
   GLSL_SH,
   GLSL_CSM,
   GLSL_CONTACT,
-  GLSL_AERIAL,
   /* glsl */ `
-uniform vec3 boSunDirWorld;
-uniform vec3 boSunDirView;
-uniform vec3 boSunColor;
 uniform vec3 boAmbientSH[ 9 ];
 uniform vec3 boAmbientTint;
 uniform float boAmbientIntensity;
@@ -328,7 +327,11 @@ export class MaterialPatcher {
       }
 
       // --- fragment -----------------------------------------------------
-      const pars = wantSun ? FRAG_PARS_LIT : FRAG_PARS_COMMON;
+      const pars = [
+        FRAG_PARS_COMMON,
+        wantSun ? FRAG_PARS_LIT : '',
+        wantAerial && hasVertexAnchor ? FRAG_PARS_AERIAL : '',
+      ].join('\n');
       const varyings = hasVertexAnchor
         ? `${WORLD_VARYINGS}\n${VELOCITY_VARYINGS}`
         : '';

@@ -1,5 +1,5 @@
 import { readFile, readdir, rm, writeFile, mkdir } from 'node:fs/promises';
-import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -187,6 +187,25 @@ function cgroupFreezeState(record) {
   }
 }
 
+function cgroupFrozenEvent(record) {
+  const absolute = safeCgroupPath(record.cgroup);
+  if (!absolute || absolute !== record.absolute) return null;
+  try {
+    const match = readFileSync(path.join(absolute, 'cgroup.events'), 'utf8').match(/^frozen\s+([01])$/m);
+    return match ? match[1] === '1' : null;
+  } catch {
+    return existsSync(absolute) ? null : false;
+  }
+}
+
+function waitForCgroupEvent(record, frozen) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (cgroupFrozenEvent(record) === frozen) return true;
+    waitSync(20);
+  }
+  return false;
+}
+
 export function freezeCgroups(records) {
   const frozen = [];
   for (const record of records) {
@@ -194,7 +213,8 @@ export function freezeCgroups(records) {
     if (wasFrozen == null) continue;
     try {
       if (!wasFrozen) writeFileSync(path.join(record.absolute, 'cgroup.freeze'), '1');
-      frozen.push({ ...record, wasFrozen });
+      const candidate = { ...record, wasFrozen };
+      if (waitForCgroupEvent(candidate, true)) frozen.push(candidate);
     } catch { /* cgroup disappeared */ }
   }
   return frozen;
@@ -203,10 +223,15 @@ export function freezeCgroups(records) {
 export function thawCgroups(records) {
   const failures = [];
   for (const record of records) {
-    if (record.wasFrozen || cgroupFreezeState(record) == null) continue;
+    if (record.wasFrozen) continue;
+    if (!existsSync(record.absolute)) continue;
+    if (cgroupFreezeState(record) == null) {
+      failures.push(record.cgroup);
+      continue;
+    }
     try {
       writeFileSync(path.join(record.absolute, 'cgroup.freeze'), '0');
-      if (cgroupFreezeState(record) !== false) failures.push(record.cgroup);
+      if (!waitForCgroupEvent(record, false)) failures.push(record.cgroup);
     } catch {
       failures.push(record.cgroup);
     }
@@ -279,8 +304,17 @@ function gpuUtilization() {
 export function quietSampleAccepted(sample, config) {
   return Number.isFinite(sample.cpu)
     && Number.isFinite(sample.gpu)
+    && Number.isFinite(sample.memoryPressure)
+    && Number.isFinite(sample.ioPressure)
     && sample.cpu <= config.maxCpuUtilization
-    && sample.gpu <= config.maxGpuUtilization;
+    && sample.gpu <= config.maxGpuUtilization
+    && sample.memoryPressure <= config.maxMemoryPressure
+    && sample.ioPressure <= config.maxIoPressure;
+}
+
+function pressureAverage(text) {
+  const match = text.match(/^some\s+.*?avg10=([\d.]+)/m);
+  return match ? Number(match[1]) : null;
 }
 
 async function waitForQuiet(config, logger) {
@@ -291,10 +325,14 @@ async function waitForQuiet(config, logger) {
   while (Date.now() < deadline) {
     const cpu = await cpuUtilization(config.sampleIntervalMs);
     const gpu = gpuUtilization();
-    latest = { cpu: Number(cpu.toFixed(1)), gpu };
+    let memoryPressure = null;
+    let ioPressure = null;
+    try { memoryPressure = pressureAverage(await readFile('/proc/pressure/memory', 'utf8')); } catch {}
+    try { ioPressure = pressureAverage(await readFile('/proc/pressure/io', 'utf8')); } catch {}
+    latest = { cpu: Number(cpu.toFixed(1)), gpu, memoryPressure, ioPressure };
     samples.push({ at: new Date().toISOString(), ...latest });
     consecutive = quietSampleAccepted(latest, config) ? consecutive + 1 : 0;
-    logger(`[isolation] quiet sample ${consecutive}/${config.quietSamples}: CPU ${latest.cpu}% GPU ${gpu == null ? 'n/a' : `${gpu}%`}`);
+    logger(`[isolation] quiet sample ${consecutive}/${config.quietSamples}: CPU ${latest.cpu}% GPU ${gpu == null ? 'n/a' : `${gpu}%`} memory-PSI ${memoryPressure ?? 'n/a'}% IO-PSI ${ioPressure ?? 'n/a'}%`);
     if (consecutive >= config.quietSamples) return samples;
   }
   const error = new Error(`machine did not become quiet within ${config.maxWaitSeconds}s (last CPU ${latest?.cpu ?? '?'}%, GPU ${latest?.gpu ?? 'n/a'}%)`);
@@ -316,6 +354,8 @@ async function startWatchdog(config, frozen, auditPath) {
     intervalMs: config.monitorIntervalMs,
     maxExternalCpuPercent: config.maxExternalCpuPercent,
     maxExternalGpuPercent: config.maxExternalGpuPercent,
+    maxMemoryPressure: config.maxMemoryPressure,
+    maxIoPressure: config.maxIoPressure,
   }, null, 2)}\n`);
   const script = path.join(path.dirname(fileURLToPath(import.meta.url)), 'resource-watchdog.mjs');
   const child = spawn(process.execPath, [script, configPath, evidencePath], { stdio: 'ignore' });
@@ -350,6 +390,8 @@ export async function enterResourceIsolation(rawConfig, { statePath, auditPath, 
     pauseCommands: rawConfig?.pauseCommands || [],
     maxCpuUtilization: Number(rawConfig?.maxCpuUtilization ?? 20),
     maxGpuUtilization: Number(rawConfig?.maxGpuUtilization ?? 20),
+    maxMemoryPressure: Number(rawConfig?.maxMemoryPressure ?? 1),
+    maxIoPressure: Number(rawConfig?.maxIoPressure ?? 1),
     quietSamples: Number(rawConfig?.quietSamples ?? 3),
     sampleIntervalMs: Number(rawConfig?.sampleIntervalMs ?? 1000),
     maxWaitSeconds: Number(rawConfig?.maxWaitSeconds ?? 60),
@@ -366,6 +408,7 @@ export async function enterResourceIsolation(rawConfig, { statePath, auditPath, 
   const safeLog = (message) => { try { logger(message); } catch { /* diagnostics cannot strand resources */ } };
   const owner = await claimIsolationState(statePath, safeLog);
   let frozen = [];
+  let freezeAttempted = [];
   let paused = [];
   let watchdog = null;
   let released = false;
@@ -377,6 +420,8 @@ export async function enterResourceIsolation(rawConfig, { statePath, auditPath, 
     thresholds: {
       maxCpuUtilization: config.maxCpuUtilization,
       maxGpuUtilization: config.maxGpuUtilization,
+      maxMemoryPressure: config.maxMemoryPressure,
+      maxIoPressure: config.maxIoPressure,
       quietSamples: config.quietSamples,
       sampleIntervalMs: config.sampleIntervalMs,
       maxWaitSeconds: config.maxWaitSeconds,
@@ -391,7 +436,7 @@ export async function enterResourceIsolation(rawConfig, { statePath, auditPath, 
     if (released) return [];
     released = true;
     if (watchdog && watchdog.child.exitCode == null) watchdog.child.kill('SIGTERM');
-    const failures = thawCgroups(frozen).map((group) => `cgroup ${group}`);
+    const failures = thawCgroups(freezeAttempted).map((group) => `cgroup ${group}`);
     failures.push(...resumeRecords(paused).map((pid) => `PID ${pid}`));
     if (!failures.length) {
       try { rmSync(statePath, { force: true }); } catch { failures.push('isolation journal'); }
@@ -428,6 +473,7 @@ export async function enterResourceIsolation(rawConfig, { statePath, auditPath, 
     const planned = groups.map((record) => ({ ...record, wasFrozen: cgroupFreezeState(record) }));
     if (planned.some((record) => record.wasFrozen == null)) throw new Error('could not inspect all competing process cgroups');
     await writeFile(statePath, `${JSON.stringify({ owner, createdAt: audit.startedAt, frozen: planned, paused: plannedPaused }, null, 2)}\n`);
+    freezeAttempted = planned;
     frozen = freezeCgroups(planned);
     if (frozen.length !== groups.length) throw new Error(`could not freeze all competing process cgroups (${frozen.length}/${groups.length})`);
     paused = plannedPaused;

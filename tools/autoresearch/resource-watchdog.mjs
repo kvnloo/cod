@@ -50,6 +50,13 @@ function gpuProcesses() {
   return parsePmon(result.stdout);
 }
 
+async function pressureAverage(kind) {
+  const text = await readFile(`/proc/pressure/${kind}`, 'utf8');
+  const match = text.match(/^some\s+.*?avg10=([\d.]+)/m);
+  if (!match) throw new Error(`missing ${kind} PSI telemetry`);
+  return Number(match[1]);
+}
+
 async function writeEvidence(path, evidence) {
   const temporary = `${path}.${process.pid}.tmp`;
   await writeFile(temporary, `${JSON.stringify(evidence, null, 2)}\n`);
@@ -62,7 +69,7 @@ async function main() {
   if (!configPath || !evidencePath) throw new Error('usage: resource-watchdog.mjs CONFIG EVIDENCE');
   const config = JSON.parse(await readFile(configPath, 'utf8'));
   const clock = Number(spawnSync('getconf', ['CLK_TCK'], { encoding: 'utf8' }).stdout.trim()) || 100;
-  const allowed = [config.activeCgroup, ...(config.frozenCgroups || [])].filter(Boolean);
+  const allowed = (config.frozenCgroups || []).filter(Boolean);
   const evidence = {
     version: 1,
     startedAt: new Date().toISOString(),
@@ -83,8 +90,17 @@ async function main() {
     const allowedPids = descendantPids(processes, config.parentPid);
     const elapsed = Math.max(0.001, (started - previousAt) / 1000);
     if (previous.size) {
+      const memoryPressure = await pressureAverage('memory');
+      const ioPressure = await pressureAverage('io');
+      if (memoryPressure > config.maxMemoryPressure) {
+        evidence.violations.push({ at: new Date().toISOString(), resource: 'memory-pressure', percent: memoryPressure });
+      }
+      if (ioPressure > config.maxIoPressure) {
+        evidence.violations.push({ at: new Date().toISOString(), resource: 'io-pressure', percent: ioPressure });
+      }
       for (const item of processes) {
         if (allowedPids.has(item.pid) || cgroupAllowed(item.cgroup, allowed)) continue;
+        if (item.cgroup === '/' && !item.cmdline) continue;
         const before = previous.get(item.pid);
         if (!before || before.startTime !== item.startTime) continue;
         const cpu = 100 * (item.cpuTicks - before.cpuTicks) / clock / elapsed;

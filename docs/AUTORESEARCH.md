@@ -23,10 +23,10 @@ Each loop gets its own Git branch and worktree. A proposal agent makes one uncom
 - The proposal importer rejects symlinks, commits/staging, protected files, repository-policy files, ignored source injection, and newly introduced capture/debug/URL/environment-conditioned code.
 - Evaluators reject inherited `BLACKOUT_URL` values and refuse to reuse an unowned server already listening on their assigned port.
 - Every baseline and candidate evaluator enters a fail-closed, remote-safe resource-isolation window immediately before measuring. Configured competing same-user AI agents and browsers are suspended while the active pipeline ancestry, desktop compositor, and Sunshine stream remain alive.
-- The machine must then remain below the configured CPU and GPU thresholds for three consecutive samples. If it cannot become quiet within the configured timeout, no benchmark runs and no KEEP/REVERT decision is made.
+- The machine must then remain below configured CPU, GPU, memory-pressure PSI, and I/O-pressure PSI thresholds for three consecutive samples. If it cannot become quiet within the configured timeout, no benchmark runs and no KEEP/REVERT decision is made.
 - Suspended processes are resumed on success, error, SIGINT, SIGTERM, or SIGHUP. A private recovery journal resumes matching PIDs after an interrupted prior invocation without risking PID reuse.
 - Every isolation window records thresholds, timestamps, quiet samples, and sanitized paused PID/command evidence under `.git/autoresearch-state/resource-evidence/`.
-- A separate watchdog samples process CPU and NVIDIA per-process GPU activity throughout every measurement. Activity from outside the evaluator cgroup or frozen workload cgroups invalidates the measurement before the evaluator can return an accepted score.
+- A separate watchdog samples external process CPU, NVIDIA per-process GPU activity, memory PSI, and I/O PSI throughout every measurement. Activity outside the evaluator process tree or frozen workload cgroups invalidates the measurement before the evaluator can return an accepted score.
 - Runs, captures, generated configs, and the Python environment are ignored by Git.
 
 ## Commands

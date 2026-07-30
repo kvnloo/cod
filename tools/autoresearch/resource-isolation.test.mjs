@@ -57,11 +57,14 @@ test('signal fallback selects only non-TTY workloads outside writable user cgrou
 });
 
 test('quiet samples fail closed when either CPU or GPU exceeds policy', () => {
-  const policy = { maxCpuUtilization: 20, maxGpuUtilization: 20 };
-  assert.equal(quietSampleAccepted({ cpu: 10, gpu: 5 }, policy), true);
-  assert.equal(quietSampleAccepted({ cpu: 21, gpu: 5 }, policy), false);
-  assert.equal(quietSampleAccepted({ cpu: 10, gpu: 21 }, policy), false);
-  assert.equal(quietSampleAccepted({ cpu: 10, gpu: null }, policy), false);
+  const policy = { maxCpuUtilization: 20, maxGpuUtilization: 20, maxMemoryPressure: 1, maxIoPressure: 1 };
+  const quiet = { cpu: 10, gpu: 5, memoryPressure: 0, ioPressure: 0 };
+  assert.equal(quietSampleAccepted(quiet, policy), true);
+  assert.equal(quietSampleAccepted({ ...quiet, cpu: 21 }, policy), false);
+  assert.equal(quietSampleAccepted({ ...quiet, gpu: 21 }, policy), false);
+  assert.equal(quietSampleAccepted({ ...quiet, memoryPressure: 2 }, policy), false);
+  assert.equal(quietSampleAccepted({ ...quiet, ioPressure: 2 }, policy), false);
+  assert.equal(quietSampleAccepted({ ...quiet, gpu: null }, policy), false);
 });
 
 test('parses NVIDIA per-process activity for continuous contamination checks', () => {

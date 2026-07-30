@@ -15,6 +15,7 @@
  */
 
 import * as THREE from 'three';
+import { settings } from '../../core/Settings';
 import { PASS_ORDER, type PassContext } from '../Pass';
 import { BasePass } from './PassBase';
 import type { PostResources } from './Shared';
@@ -145,7 +146,9 @@ export class GrainPass extends BasePass {
     (u.uTexel.value as THREE.Vector2).set(1 / ctx.width, 1 / ctx.height);
     (u.uResolution.value as THREE.Vector2).set(ctx.width, ctx.height);
     // A fraction of a pixel at the frame edge — any more reads as a filter.
-    u.uAberration.value = g.chromaticAberration * 0.004;
+    // Low uses the shader's single-sample path; higher presets retain the
+    // five-tap spectral smear.
+    u.uAberration.value = settings.preset === 'low' ? 0 : g.chromaticAberration * 0.004;
     u.uGrain.value = g.filmGrain;
     u.uVignette.value = g.vignette;
     u.uFrame.value = ctx.frame % 64;

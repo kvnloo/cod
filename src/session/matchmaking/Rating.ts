@@ -193,25 +193,53 @@ export interface MatchPerformance {
   lobbyMeanScore: number;
   /** Match length in seconds, used to normalise short games. */
   durationSec: number;
+  /**
+   * Fraction of the player's own team that was human, in [0,1]. Defaults to 1.
+   *
+   * The win/loss half of the signal is only worth what it says about *you*, and
+   * on a team that is five-sixths bots it says almost nothing — it reports how
+   * well the bot director was tuned. This scales the team component down as the
+   * team fills with bots, which matters enormously in a game that bot-fills by
+   * design: without it, rating in the population sim never correlated with true
+   * skill above r = 0.44 no matter how many matches a player logged.
+   */
+  teamHumanFraction?: number;
 }
 
 /**
  * Blends the team result with individual contribution into a Glicko score.
  *
- * Pure win/loss is too noisy in a 12-player lobby — one player in six decides
- * very little — so 40% of the signal comes from how far above or below the
- * lobby mean the player scored. The logistic keeps a 3× score from being worth
- * 3× the credit; a carry gets ~0.9 on a win and ~0.45 even on a loss, which is
- * exactly the behaviour players expect from "you played well, you lost".
+ * Pure win/loss is far too noisy to rate an individual in a 12-player lobby:
+ * you are one sixth of your team, and matchmaking is actively trying to make
+ * the other five cancel out the enemy's five, so the outcome converges on a
+ * coin flip *by design*. The more successful the matchmaker, the less a win
+ * tells you about the winner. Most of the signal therefore has to come from how
+ * far above or below the lobby mean the player scored.
+ *
+ * Two things scale that split:
+ *
+ *  - **Match length.** A quit-out or a stomp carries less individual signal, so
+ *    short matches lean back on the result.
+ *  - **How human the player's team was.** A win beside five bots is a fact
+ *    about the bots. `teamHumanFraction` pushes weight onto individual
+ *    performance as the team fills with them — worth r = 0.44 → 0.79 against
+ *    ground-truth skill in the population sim.
+ *
+ * The logistic keeps a 3× score from being worth 3× the credit; a carry gets
+ * ~0.9 on a win and ~0.5 even on a loss, which is exactly the behaviour players
+ * expect from "you played well, you lost".
  */
 export function performanceScore(p: MatchPerformance): number {
   const team = p.drawn ? 0.5 : p.won ? 1 : 0;
   const mean = Math.max(1, p.lobbyMeanScore);
-  const rel = (p.combatScore - mean) / (mean * 0.65);
+  // 0.35 rather than 0.65: one standard deviation of lobby score should move
+  // the individual term to roughly 0.7/0.3, not 0.61/0.39. The wider divisor
+  // kept every player bunched around 0.5 and threw away most of the signal.
+  const rel = (p.combatScore - mean) / (mean * 0.35);
   const perf = 1 / (1 + Math.exp(-rel));
-  // Short matches (a quit-out, a stomp) carry less individual signal.
   const w = p.durationSec > 0 ? clamp(p.durationSec / 240, 0.35, 1) : 1;
-  const perfWeight = 0.4 * w;
+  const humanShare = clamp(p.teamHumanFraction ?? 1, 0, 1);
+  const perfWeight = clamp(w * (0.55 + 0.30 * (1 - humanShare)), 0, 0.95);
   return clamp(team * (1 - perfWeight) + perf * perfWeight, 0.02, 0.98);
 }
 

@@ -56,7 +56,9 @@ export const STAT_RULES: Record<StatKey, StatRule> = {
   drawTime: { label: 'Draw', unit: 's', better: 'lower', soften: 0.80, minMul: 0.55, maxMul: 1.60, min: 0.12 },
   holsterTime: { label: 'Holster', unit: 's', better: 'lower', soften: 0.80, minMul: 0.55, maxMul: 1.60, min: 0.08 },
   reloadTime: { label: 'Reload', unit: '×', better: 'lower', soften: 0.70, minMul: 0.62, maxMul: 1.90 },
-  moveScale: { label: 'Move', unit: '×', better: 'higher', soften: 0.65, minMul: 0.86, maxMul: 1.14, min: 0.68, max: 1.16 },
+  // 1.15 is the hard design bar for movement with a weapon out — nothing may
+  // exceed it, and the attachment table is tuned so nothing reaches it either.
+  moveScale: { label: 'Move', unit: '×', better: 'higher', soften: 0.65, minMul: 0.86, maxMul: 1.14, min: 0.68, max: 1.15 },
   adsMoveScale: { label: 'ADS move', unit: '×', better: 'higher', soften: 0.65, minMul: 0.80, maxMul: 1.60, min: 0.20, max: 0.95 },
   sway: { label: 'Sway', unit: '×', better: 'lower', soften: 0.72, minMul: 0.50, maxMul: 2.20 },
   flinch: { label: 'Flinch', unit: '×', better: 'lower', soften: 0.75, minMul: 0.50, maxMul: 1.60 },
@@ -67,7 +69,10 @@ export const STAT_RULES: Record<StatKey, StatRule> = {
   recoilRecovery: { label: 'Recovery', unit: '', better: 'higher', soften: 0.80, minMul: 0.80, maxMul: 1.45, max: 0.95 },
 
   hipSpread: { label: 'Hipfire', unit: '°', better: 'lower', soften: 0.62, minMul: 0.45, maxMul: 1.90, min: 0.35 },
-  adsSpread: { label: 'ADS spread', unit: '°', better: 'lower', soften: 0.70, minMul: 0.35, maxMul: 1.60, min: 0.02 },
+  // The absolute floor must sit *below* the tightest weapon in the catalogue
+  // (the bolt-action and the marksman rifle are both 0.02°), otherwise every
+  // optic on those guns pins the rail and the safety net becomes the balance.
+  adsSpread: { label: 'ADS spread', unit: '°', better: 'lower', soften: 0.70, minMul: 0.35, maxMul: 1.60, min: 0.005 },
   bloomPerShot: { label: 'Bloom', unit: '°', better: 'lower', soften: 0.70, minMul: 0.40, maxMul: 1.80 },
   bloomDecay: { label: 'Bloom decay', unit: '°/s', better: 'higher', soften: 0.80, minMul: 0.70, maxMul: 1.60 },
 
@@ -80,6 +85,23 @@ export const STAT_RULES: Record<StatKey, StatRule> = {
   fireRate: { label: 'RPM', unit: '×', better: 'higher', soften: 0.90, minMul: 0.88, maxMul: 1.15 },
 
   magnification: { label: 'Zoom', unit: '×', better: 'higher', soften: 1, minMul: 1, maxMul: 12, min: 1, max: 12 },
+};
+
+/**
+ * Absolute rails for reload *durations*, in seconds.
+ *
+ * `reloadTime` is a scale stat with a base of 1, so its rails live in
+ * scale-space and cannot see that a legitimate ×1.45 drum penalty on an LMG
+ * that already takes 4.2 s to reload produces a six-second animation no player
+ * would ever sit through. These are the rails in the domain that matters,
+ * applied after the scale — the only place in the system where a stat is
+ * railed in units rather than multiples.
+ */
+export interface DurationRail { min: number; max: number }
+export const RELOAD_RAILS: Record<'tactical' | 'empty' | 'perShell', DurationRail> = {
+  tactical: { min: 0.35, max: 5.60 },
+  empty: { min: 0.45, max: 7.20 },
+  perShell: { min: 0.12, max: 1.00 },
 };
 
 /** Structural limits. A mode may widen these through `ValidationContext`. */
@@ -144,6 +166,8 @@ export const FLAG_LABEL: Record<LoadoutFlag, string> = {
 export interface TuningPatch {
   stats?: Partial<Record<StatKey, Partial<StatRule>>>;
   limits?: Partial<LoadoutLimits>;
+  /** Reload duration rails, in seconds. */
+  reload?: Partial<Record<'tactical' | 'empty' | 'perShell', Partial<DurationRail>>>;
   /** attachment id → stat → new multiplicative value. */
   attachments?: Record<string, Partial<Record<StatKey, number>>>;
   /** perk id → stat → new multiplicative value. */
@@ -169,6 +193,19 @@ export function applyStatTuning(patch: TuningPatch): string[] {
         if (v === undefined) continue;
         (rule as Record<string, unknown>)[field] = v;
         notes.push(`stat ${key}.${String(field)} = ${String(v)}`);
+      }
+    }
+  }
+  if (patch.reload) {
+    for (const key of Object.keys(patch.reload) as Array<keyof typeof RELOAD_RAILS>) {
+      const over = patch.reload[key];
+      const rail = RELOAD_RAILS[key];
+      if (!over || !rail) continue;
+      for (const side of ['min', 'max'] as const) {
+        const v = over[side];
+        if (typeof v !== 'number' || !Number.isFinite(v)) continue;
+        rail[side] = v;
+        notes.push(`reload ${key}.${side} = ${v}`);
       }
     }
   }

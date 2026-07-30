@@ -74,6 +74,15 @@ interface Peer {
 }
 
 /**
+ * What a real transport does for free: hand every peer its own copy. Everything
+ * that crosses this seam is JSON by construction (see the note at the top of
+ * `../types`), so this is exactly the fidelity the wire would give.
+ */
+function wire<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+/**
  * An in-process mesh. One hub, N transports — enough to run a full lobby with
  * bots, to run the offline/solo path where the local player is always the host,
  * and to drive `tools/session-lobby.mjs` without any network at all.
@@ -130,20 +139,24 @@ export class LocalTransportHub {
       send(cmd) {
         const host = hub.peers.get(hub.host);
         if (!host || !host.connected || !peer.connected) return;
-        for (const fn of [...host.onCommand]) fn(cmd, peer.id);
+        for (const fn of [...host.onCommand]) fn(wire(cmd), peer.id);
       },
       broadcast(msg) {
         if (hub.host !== peer.id) return;
         for (const p of hub.peers.values()) {
           if (!p.connected) continue;
-          for (const fn of [...p.onMessage]) fn(msg);
+          // One fresh copy per recipient: a real transport serialises, and a
+          // client that scribbles on its read model must not corrupt the host's.
+          const copy = p.id === peer.id ? msg : wire(msg);
+          for (const fn of [...p.onMessage]) fn(copy);
         }
       },
       sendTo(id, msg) {
         if (hub.host !== peer.id) return;
         const p = hub.peers.get(id);
         if (!p || !p.connected) return;
-        for (const fn of [...p.onMessage]) fn(msg);
+        const copy = p.id === peer.id ? msg : wire(msg);
+        for (const fn of [...p.onMessage]) fn(copy);
       },
       onCommand(fn) {
         peer.onCommand.push(fn);

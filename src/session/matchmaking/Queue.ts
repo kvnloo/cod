@@ -26,10 +26,10 @@ import { effectiveRtt, selectHost, pingsToHost, type HostCandidateInfo } from '.
 import { playlist as playlistDef, slotCount } from './Playlists';
 import { balanceTeams } from './TeamBalance';
 import { fillRoster } from './BotFill';
-import { mutualWindows, wideningFor, windowsForTicket, type SearchWindows } from './Widening';
+import { humansRequired, mutualWindows, wideningFor, windowsForTicket, type SearchWindows } from './Widening';
 import type {
-  HumanSlot, MatchProposal, MatchQuality, MatchRoster, PlaylistDef, PlaylistId,
-  QueueTicket, RegionId, TicketId,
+  ConnectionInfo, HumanSlot, MatchProposal, MatchQuality, MatchRoster, PlaylistDef,
+  PlaylistId, QueueTicket, RegionId, TicketId, WideningParams,
 } from './types';
 
 export interface QueueOptions {
@@ -37,6 +37,18 @@ export interface QueueOptions {
   maxBotsPerTeam?: number;
   /** Matches formed per tick, per playlist. Keeps a burst from hitching. */
   maxMatchesPerTick?: number;
+  /**
+   * Seeds examined per playlist per tick before the pass gives up. Bounds the
+   * cost of the head-of-line fallback in `tick()` on a very long queue.
+   */
+  maxSeedsPerTick?: number;
+  /**
+   * Live-ops override applied on top of every playlist's widening params.
+   * This is the knob you turn at 3am when a region's population collapses and
+   * queue times triple; it is also what `tools/session-mm-sweep.mjs` walks to
+   * plot the speed-versus-fairness frontier.
+   */
+  widening?: Partial<WideningParams>;
 }
 
 export interface TicketStatus {
@@ -49,8 +61,13 @@ export interface TicketStatus {
 }
 
 export function ticketRegion(t: QueueTicket): RegionId {
+  return ticketConnection(t).region;
+}
+
+/** The party leader's connection stands in for the party when bucketing. */
+export function ticketConnection(t: QueueTicket): ConnectionInfo {
   const leader = t.members.find((m) => m.playerId === t.leaderId) ?? t.members[0];
-  return leader.connection.region;
+  return leader.connection;
 }
 
 export class MatchQueue {
@@ -100,13 +117,19 @@ export class MatchQueue {
     this.byPlaylist.clear();
   }
 
+  /** Playlist widening params with any live-ops override folded in. */
+  paramsFor(def: PlaylistDef): WideningParams {
+    const base = wideningFor(def);
+    return this.opts.widening ? { ...base, ...this.opts.widening } : base;
+  }
+
   /* ------------------------------------------------------------- status -- */
 
   status(id: TicketId, now: number): TicketStatus | null {
     const ticket = this.tickets.get(id);
     if (!ticket) return null;
     const def = playlistDef(ticket.playlist);
-    const params = wideningFor(def);
+    const params = this.paramsFor(def);
     const windows = windowsForTicket(ticket, now, params);
     const pool = this.poolFor(ticket, now, def);
     const candidates = pool.reduce((n, c) => n + c.ticket.members.length, 0);
@@ -123,7 +146,7 @@ export class MatchQueue {
   ): number {
     const capacity = slotCount(def);
     const have = ticket.members.length + candidates;
-    const params = wideningFor(def);
+    const params = this.paramsFor(def);
     const botsIn = def.allowBots ? Math.max(0, params.botFillAfter - (now - ticket.joinedAt)) : Infinity;
     if (have >= capacity) return 0;
     const rate = this.arrivalRate.get(ticket.playlist) ?? 0;
@@ -137,17 +160,43 @@ export class MatchQueue {
 
   /* --------------------------------------------------------------- tick -- */
 
-  /** Forms as many matches as it can. Returns the proposals; removes the tickets. */
+  /**
+   * Forms as many matches as it can. Returns the proposals; removes the tickets.
+   *
+   * The oldest ticket is always tried first — it has the widest windows and the
+   * strongest claim — but when it *cannot* form, the pass moves down the list
+   * and tries the next one instead of abandoning the playlist for this tick.
+   *
+   * Skipping that fallback is a head-of-line stall, and it is subtle because it
+   * only bites once the queue starts holding out for humans. One apac player at
+   * the head of a queue full of eu-west players blocks every match in the
+   * playlist until they hit the 120 s hard timeout, at which point they launch a
+   * bot lobby and the next unlucky seed inherits the block. Measured cost in the
+   * 500-player sim: median queue 75 s instead of 20 s, and a bot-fill rate that
+   * stayed pinned near 45% no matter how large the population grew — the
+   * giveaway, since a genuine supply problem gets better when you add players.
+   */
   tick(now: number): MatchProposal[] {
     const out: MatchProposal[] = [];
     const limit = this.opts.maxMatchesPerTick ?? 8;
+    const seedBudget = this.opts.maxSeedsPerTick ?? 32;
     for (const id of this.byPlaylist.keys()) {
       let formed = 0;
-      while (formed < limit) {
-        const proposal = this.tryForm(id, now);
-        if (!proposal) break;
-        out.push(proposal);
-        formed++;
+      let seedIndex = 0;
+      let tried = 0;
+      while (formed < limit && tried < seedBudget) {
+        const list = this.ordered(id);
+        if (seedIndex >= list.length) break;
+        tried++;
+        const proposal = this.tryForm(list[seedIndex], id, now);
+        if (proposal) {
+          out.push(proposal);
+          formed++;
+          // The list just changed under us; restart from the oldest.
+          seedIndex = 0;
+        } else {
+          seedIndex++;
+        }
       }
     }
     return out;
@@ -169,33 +218,85 @@ export class MatchQueue {
     return list;
   }
 
-  /** Candidate tickets compatible with `seed` right now, closest skill first. */
+  /**
+   * Candidate tickets compatible with `seed` right now, best fit first.
+   *
+   * "Best fit" is a *normalised* blend of the two axes rather than skill alone.
+   * Ordering purely on rating distance is what produced 142 ms mean lobbies in
+   * the population sim: the greedy accumulator would happily reach across an
+   * ocean for a player 3 rating points closer, and once eleven such players are
+   * seated the host election has nothing good left to pick from. Dividing each
+   * distance by the window that currently admits it makes them comparable —
+   * "how much of my skill budget does this cost" versus "how much of my latency
+   * budget" — so a marginally worse skill fit next door beats a perfect one
+   * three regions away, which is the trade a player would make themselves.
+   */
   private poolFor(seed: QueueTicket, now: number, def: PlaylistDef): Array<{ ticket: QueueTicket; windows: SearchWindows }> {
-    const params = wideningFor(def);
+    const params = this.paramsFor(def);
     const seedW = windowsForTicket(seed, now, params);
     const seedRegion = ticketRegion(seed);
-    const out: Array<{ ticket: QueueTicket; windows: SearchWindows; d: number }> = [];
+    const seedConn = ticketConnection(seed);
+    const out: Array<{ ticket: QueueTicket; windows: SearchWindows; cost: number }> = [];
     for (const t of this.ordered(def.id)) {
       if (t.id === seed.id) continue;
       const w = mutualWindows(seedW, windowsForTicket(t, now, params));
-      if (Math.abs(t.skill - seed.skill) > w.skill) continue;
+      const dSkill = Math.abs(t.skill - seed.skill);
+      if (dSkill > w.skill) continue;
       if (!w.crossRegion && ticketRegion(t) !== seedRegion) continue;
-      out.push({ ticket: t, windows: w, d: Math.abs(t.skill - seed.skill) });
+      // Pairwise RTT is a proxy for "will this player be happy behind whatever
+      // host we end up electing". It is not the admission test — that is the
+      // host-viability check in `tryForm`, which knows the real topology — but
+      // it is the right thing to *rank* on.
+      const dPing = effectiveRtt(ticketConnection(t), seedConn);
+      const cost = dSkill / Math.max(1, w.skill) + dPing / Math.max(1, w.ping);
+      out.push({ ticket: t, windows: w, cost });
     }
-    out.sort((a, b) => (a.d !== b.d ? a.d - b.d : a.ticket.joinedAt - b.ticket.joinedAt));
+    out.sort((a, b) => (a.cost !== b.cost ? a.cost - b.cost : a.ticket.joinedAt - b.ticket.joinedAt));
     return out;
   }
 
-  private tryForm(id: PlaylistId, now: number): MatchProposal | null {
-    const list = this.ordered(id);
-    if (list.length === 0) return null;
+  /**
+   * Ticket arrivals per second, aged. The raw EMA only moves when a ticket
+   * arrives, so a playlist that has gone quiet keeps reporting the rate it had
+   * before everyone left — and the launch gate below would then hold a lobby
+   * open waiting for humans who are not coming. Dividing by the drought length
+   * makes "nobody has queued for 30 s" read as the near-zero supply it is.
+   */
+  private arrivalsPerSecond(id: PlaylistId, now: number): number {
+    const raw = this.arrivalRate.get(id) ?? 0;
+    if (raw <= 0) return 0;
+    const last = this.lastArrival.get(id);
+    if (last === undefined) return 0;
+    const quiet = Math.max(0, now - last);
+    return raw / (1 + quiet / 10);
+  }
+
+  /** Mean party size currently queued for a playlist, floored at 1. */
+  private meanPartySize(id: PlaylistId): number {
+    const set = this.byPlaylist.get(id);
+    if (!set || set.size === 0) return 1;
+    let n = 0;
+    for (const tid of set) n += this.tickets.get(tid)?.members.length ?? 0;
+    return Math.max(1, n / set.size);
+  }
+
+  private tryForm(seed: QueueTicket | undefined, id: PlaylistId, now: number): MatchProposal | null {
+    if (!seed) return null;
     const def = playlistDef(id);
-    const params = wideningFor(def);
+    const params = this.paramsFor(def);
     const capacity = slotCount(def);
 
-    const seed = list[0];
     const seedW = windowsForTicket(seed, now, params);
     if (seed.members.length > capacity) { this.remove(seed.id); return null; }
+
+    // Remaining seats per team. Parties are never split, so a candidate is only
+    // addable if it fits *inside one team* — checking only the lobby total lets
+    // the accumulator build groups like 5+4+3 for a 6v6, which no assignment
+    // can pack. Those extra players are then rejected by `balanceTeams` and
+    // silently replaced by bots, which is how a lobby the gate approved with
+    // twelve humans reaches the map with nine.
+    const bins = new Array<number>(def.teams).fill(def.teamSize);
+    if (!seatParty(bins, seed.members.length)) { this.remove(seed.id); return null; }
 
     const group: QueueTicket[] = [seed];
     let humans = seed.members.length;
@@ -204,22 +305,35 @@ export class MatchQueue {
     for (const cand of this.poolFor(seed, now, def)) {
       if (humans >= capacity) break;
       const t = cand.ticket;
-      if (humans + t.members.length > capacity) continue;
+      const size = t.members.length;
+      if (!bins.some((b) => b >= size)) continue;
       const merged = members.concat(t.members.map((m) => ({ playerId: m.playerId, connection: m.connection })));
       // A viable host must exist for the *whole* group under the ping window.
       const host = selectHost(merged, merged.length - 1);
       if (host.hostId && host.worstPing > cand.windows.ping && !cand.windows.desperate) continue;
+      if (!seatParty(bins, size)) continue;
       group.push(t);
       members = merged;
-      humans += t.members.length;
+      humans += size;
     }
 
     const full = humans >= capacity;
     const canBotFill = def.allowBots && (seedW.botFill || seedW.desperate);
-    const enoughHumans = humans >= def.minHumansToStart;
-    if (!full && !(canBotFill && enoughHumans) && !(seedW.desperate && enoughHumans && !def.allowBots)) {
-      return null;
-    }
+
+    // How many humans the curve *wants* before it will accept bots...
+    const demand = humansRequired(seedW.waited, capacity, def.minHumansToStart, params);
+    // ...capped by how many the population can plausibly still deliver before
+    // this seed times out. Four friends alone in a playlist must not be held
+    // hostage to a floor of nine; a busy playlist must not launch at four just
+    // because the timer said it could.
+    const remaining = Math.max(0, params.hardTimeout - seedW.waited);
+    const inbound = this.arrivalsPerSecond(def.id, now) * this.meanPartySize(def.id) * remaining;
+    const supply = Math.min(capacity, Math.floor(humans + inbound));
+    const need = Math.max(def.minHumansToStart, Math.min(demand, supply));
+
+    const ready = canBotFill && humans >= need;
+    const forced = seedW.desperate && humans >= def.minHumansToStart;
+    if (!full && !ready && !forced) return null;
 
     for (const t of group) this.remove(t.id);
     return this.buildProposal(group, def, now, seedW);
@@ -277,6 +391,23 @@ export class MatchQueue {
       ticketIds: placed.map((t) => t.id),
     };
   }
+}
+
+/**
+ * Seats a party of `size` in the emptiest team that can hold it, mutating
+ * `bins`. Returns false when no team has room. Emptiest-first mirrors
+ * `balanceTeams`, so the packing the accumulator assumes is the packing the
+ * assignment step actually finds.
+ */
+function seatParty(bins: number[], size: number): boolean {
+  let best = -1;
+  for (let i = 0; i < bins.length; i++) {
+    if (bins[i] < size) continue;
+    if (best < 0 || bins[i] > bins[best]) best = i;
+  }
+  if (best < 0) return false;
+  bins[best] -= size;
+  return true;
 }
 
 /* -------------------------------------------------------------- quality -- */

@@ -15,6 +15,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
+import inspector from 'node:inspector';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { mkdirSync, readdirSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import path from 'node:path';
@@ -100,6 +101,37 @@ function near(name, got, want, tol, unit = '') {
     'got=' + got.toFixed(4) + unit + ' want=' + want.toFixed(4) + unit + ' delta=' + d.toFixed(5));
 }
 function section(t) { console.log('\n' + t + '\n' + '-'.repeat(t.length)); }
+
+/**
+ * Bytes of garbage produced per call, measured with V8's sampling heap
+ * profiler. Every sampled allocation is attributed to the JS frame that made
+ * it, so this separates "the library allocated" from "the engine and this
+ * harness were busy" — which a heapUsed delta cannot do at all.
+ *
+ * Returns { lagcomp, other }: bytes/op charged to frames inside
+ * src/net/lagcomp, and bytes/op charged to every other non-engine frame.
+ */
+async function allocPerOp(fn, N, samplingInterval = 64) {
+  const s = new inspector.Session();
+  s.connect();
+  const post = (m, p) => new Promise((ok, no) => s.post(m, p, (e, r) => (e ? no(e) : ok(r))));
+  await post('HeapProfiler.startSampling', { samplingInterval });
+  for (let i = 0; i < N; i++) fn(i);
+  const { profile } = await post('HeapProfiler.stopSampling');
+  s.disconnect();
+
+  let lagcomp = 0, other = 0;
+  const walk = (node) => {
+    if (node.selfSize > 0) {
+      const url = node.callFrame.url || '';
+      if (url.includes('/net/lagcomp/')) lagcomp += node.selfSize;
+      else if (!url.startsWith('node:') && !url.includes('inspector')) other += node.selfSize;
+    }
+    for (const c of node.children) walk(c);
+  };
+  walk(profile.head);
+  return { lagcomp: lagcomp / N, other: other / N };
+}
 
 /* ------------------------------------------------------------------ */
 /* Simulated world                                                     */
@@ -220,32 +252,59 @@ section('1. the rewind formula');
 /* ------------------------------------------------------------------ */
 resetLagCompConfig();
 {
-  // With a client command stamp only the downstream leg is unaccounted for.
+  // A stamped command says when it was authored, so only the interpolation
+  // window is left to undo — subtracting RTT/2 as well would double count it.
   const p = computeRewindTime(
     { serverTimeSec: 10.05, commandServerTimeSec: 10.0, rttMs: 120, interpDelayMs: 100 },
     lagcompConfig,
   );
-  near('stamped: renderTime = C - rtt/2 - interp', p.renderTimeSec, 10.0 - 0.060 - 0.100, 1e-9, 's');
-  near('stamped: rtt term is half of rtt', p.rttTermMs, 60, 1e-9, 'ms');
+  near('stamped: renderTime = C - interp', p.renderTimeSec, 10.0 - 0.100, 1e-9, 's');
+  near('stamped: no rtt term at all', p.rttTermMs, 0, 1e-9, 'ms');
   check('stamped: usedCommandStamp', p.usedCommandStamp === true);
-  near('stamped: age vs server now', p.ageMs, 210, 1e-6, 'ms');
+  near('stamped: age vs server now is (S - C) + interp', p.ageMs, 150, 1e-6, 'ms');
 
-  // Without a stamp both legs must come off.
+  // Without a stamp the authoring time is guessed: one upstream leg back.
   const q = computeRewindTime(
     { serverTimeSec: 10.0, rttMs: 120, interpDelayMs: 100 },
     lagcompConfig,
   );
-  near('unstamped: renderTime = S - rtt - interp', q.renderTimeSec, 10.0 - 0.120 - 0.100, 1e-9, 's');
-  near('unstamped: rtt term is the whole rtt', q.rttTermMs, 120, 1e-9, 'ms');
+  near('unstamped: renderTime = S - rtt/2 - interp', q.renderTimeSec, 10.0 - 0.060 - 0.100, 1e-9, 's');
+  near('unstamped: rtt term is the upstream half', q.rttTermMs, 60, 1e-9, 'ms');
+
+  // A stamp inside the tolerance is honoured even though it is older than the
+  // pure rtt/2 estimate — buffering and jitter are normal.
+  const jit = computeRewindTime(
+    { serverTimeSec: 10.0, commandServerTimeSec: 10.0 - (0.060 + lagcompConfig.maxStampSkewMs / 1000) + 0.001,
+      rttMs: 120, interpDelayMs: 100 },
+    lagcompConfig,
+  );
+  check('a slightly late stamp is still believed (jitter is not cheating)',
+    jit.usedCommandStamp === true && jit.stampClamped === false);
+
+  // Back-dating the stamp to steal rewind: ignored, and the host's own
+  // measurement is used instead. Note the shot is NOT rejected.
+  const lie = computeRewindTime(
+    { serverTimeSec: 10.0, commandServerTimeSec: 9.0, rttMs: 120, interpDelayMs: 100 },
+    lagcompConfig,
+  );
+  check('a back-dated stamp is discarded, not obeyed',
+    lie.stampClamped === true && lie.usedCommandStamp === false && lie.reason === 'ok',
+    'stampClamped=' + lie.stampClamped + ' reason=' + lie.reason);
+  near('the back-dated shot falls back to the host-measured rewind',
+    lie.renderTimeSec, q.renderTimeSec, 1e-9, 's');
 
   // Hostile inputs get clamped, not believed.
   const r = computeRewindTime(
-    { serverTimeSec: 10.0, commandServerTimeSec: 10.0, rttMs: 9000, interpDelayMs: 5000 },
+    { serverTimeSec: 10.0, rttMs: 9000, interpDelayMs: 5000 },
     lagcompConfig,
   );
-  near('clamped: rtt term capped by maxRttMs*fraction', r.rttTermMs, 200, 1e-9, 'ms');
-  near('clamped: interp capped by maxInterpDelayMs', r.interpTermMs, 200, 1e-9, 'ms');
-  near('clamped: age capped at maxRewindMs', r.ageMs, 250, 1e-6, 'ms');
+  near('clamped: rtt term capped by maxRttMs*fraction',
+    r.rttTermMs, lagcompConfig.maxRttMs * lagcompConfig.rttFraction, 1e-9, 'ms');
+  near('clamped: interp capped by maxInterpDelayMs',
+    r.interpTermMs, lagcompConfig.maxInterpDelayMs, 1e-9, 'ms');
+  // The cap is policy, not a magic number: read it from the config so this
+  // assertion tracks DEFAULT_LAGCOMP_CONFIG instead of drifting away from it.
+  near('clamped: age capped at maxRewindMs', r.ageMs, lagcompConfig.maxRewindMs, 1e-6, 'ms');
   check('clamped: reason is stale', r.reason === 'stale', 'reason=' + r.reason);
 
   // A command stamped in the future is refused, not honoured.
@@ -333,7 +392,11 @@ let headlineRewindM = 0;
   const INTERP = 100;          // ms, the client's snapshot interpolation delay
   const C = S - RTT / 2000;    // client stamped the command half an RTT ago
 
-  const renderTime = C - RTT / 2000 - INTERP / 1000;
+  // Ground truth for "what the shooter's screen showed": its interpolator draws
+  // remote players at (its server-clock estimate) - interp delay. That is the
+  // client's own behaviour, derived here independently of the library, so the
+  // rewind either lands on it or it does not.
+  const renderTime = C - INTERP / 1000;
   const seen = seenChest(renderTime);
   const now = seenChest(S);
   const dir = aimAt(seen);
@@ -363,8 +426,11 @@ let headlineRewindM = 0;
     + ' m  (the hitbox had moved that far by the time the shot arrived)');
   check('rewind distance is a real displacement, not noise', hit.rewindDistanceM > 0.5,
     hit.rewindDistanceM.toFixed(3) + ' m');
-  // Total unlag from server-now = upstream (S - C) + downstream (rtt/2) + interp.
-  near('rewind age matches the formula', hit.rewindMs, RTT + INTERP, 1e-6, 'ms');
+  // Unlag measured from server-now = the command's own age (S - C, i.e. the
+  // upstream leg) + the interpolation window. No second RTT term: see Rewind.ts.
+  near('rewind age matches the formula', hit.rewindMs, RTT / 2 + INTERP, 1e-6, 'ms');
+  near('the rewind lands on the frame the client actually rendered',
+    hit.renderTimeSec, renderTime, 1e-9, 's');
 
   // Same shot, feature off.
   configureLagComp({ enabled: false });
@@ -394,12 +460,14 @@ resetLagCompConfig();
   const INTERP = 100;
   console.log('   rtt   rewind    separation   comp ON   comp OFF   part');
   let seq = 100;
-  let onHits = 0, offHits = 0, staleRejects = 0;
+  let onHits = 0, offHits = 0, staleRejects = 0, inWindow = 0, outOfWindow = 0;
   const resOn = new ShotResolution();
   const resOff = new ShotResolution();
-  for (const RTT of [0, 40, 80, 120, 160, 180, 280, 400]) {
+  for (const RTT of [0, 40, 80, 120, 160, 200, 400, 700]) {
     const C = S - RTT / 2000;
-    const renderTime = C - RTT / 2000 - INTERP / 1000;
+    const renderTime = C - INTERP / 1000;
+    // Ages are derived, not assumed, so the counts below track the config.
+    if ((S - renderTime) * 1000 <= lagcompConfig.maxRewindMs) inWindow++; else outOfWindow++;
     const seen = seenChest(renderTime);
     const now = seenChest(S);
     const sep = Math.hypot(now.x - seen.x, now.z - seen.z);
@@ -422,18 +490,18 @@ resetLagCompConfig();
     if (resOn.reason === 'stale') staleRejects++;
 
     console.log('  ' + String(RTT).padStart(4) + 'ms'
-      + String((RTT + INTERP).toFixed(0)).padStart(8) + 'ms'
+      + String(((S - renderTime) * 1000).toFixed(0)).padStart(8) + 'ms'
       + sep.toFixed(3).padStart(12) + 'm'
       + (resOn.hit ? '       HIT' : (resOn.valid ? '      miss' : '  ' + resOn.reason.padStart(8)))
       + (resOff.hit ? '       HIT' : '       miss')
       + '   ' + (resOn.hit ? resOn.partName : '-'));
   }
-  check('compensation lands every shot inside the legal rewind window', onHits === 6,
-    onHits + '/6 in-window shots landed');
+  check('compensation lands every shot inside the legal rewind window', onHits === inWindow,
+    onHits + '/' + inWindow + ' in-window shots landed');
   check('without compensation only the zero-latency graze lands', offHits === 1,
     offHits + '/8');
   check('shots asking to rewind past the cap are rejected, not silently accepted',
-    staleRejects === 2, staleRejects + ' of 2 out-of-window shots refused');
+    staleRejects === outOfWindow, staleRejects + ' of ' + outOfWindow + ' out-of-window shots refused');
 }
 
 /* ------------------------------------------------------------------ */
@@ -578,8 +646,8 @@ configureLagComp({ debug: true });
   const dbg = new RewindDebugRing({ capacity: 4, maxTargets: 4, maxBoxes: 18 });
   const { history } = buildWorld(1.6);
   const svc = new RewindService(history, { debug: dbg, validator: new ShotValidator(history.maxPlayers) });
-  const S = 1.30, C = S - 0.075;
-  const seen = seenChest(C - 0.075 - 0.1);
+  const S = 1.30, C = S - 0.075;      // 150 ms rtt, stamped half an rtt ago
+  const seen = seenChest(C - 0.1);    // ...and rendered 100 ms behind its clock
   const dir = aimAt(seen);
   for (let i = 0; i < 6; i++) {
     svc.resolveShot({
@@ -629,14 +697,45 @@ section('9. steady-state cost');
       POSE[o] = s.x + i * 0.7 - 5; POSE[o + 1] = 0; POSE[o + 2] = s.z; POSE[o + 3] = s.yaw;
     }
   }
-  const recordTick = (tick) => {
-    history.beginTick(tick, tick * DT);
-    for (let i = 0; i < PLAYERS; i++) {
-      const o = (tick * PLAYERS + i) * 4;
-      writeRigFast(history, slots[i], POSE[o], POSE[o + 1], POSE[o + 2], POSE[o + 3]);
+  /* Ticks must keep increasing across repeated measurement runs — the ring
+   * refuses to reopen a tick older than its head — while the pose table wraps. */
+  let tickCursor = 0;
+  const recordTick = (i) => {
+    const t = tickCursor++;
+    const p = i % REC_TICKS;
+    history.beginTick(t, t * DT);
+    for (let k = 0; k < PLAYERS; k++) {
+      const o = (p * PLAYERS + k) * 4;
+      writeRigFast(history, slots[k], POSE[o], POSE[o + 1], POSE[o + 2], POSE[o + 3]);
     }
   };
   for (let tick = 0; tick <= 200; tick++) recordTick(tick);
+
+  /* Time, and what the loop leaves behind.
+   *
+   * `retained` (gc on both ends) is the memory-bound claim and the only thing
+   * heapUsed can honestly answer: whatever the loop touched, none of it
+   * survives. A raw heapUsed delta *cannot* measure garbage — a provably
+   * allocation-free spin loop still shows ~11 bytes/op after 170 ms, because
+   * V8 does its own bookkeeping while the loop runs, and that fixed cost
+   * divided by N is indistinguishable from a small per-op allocation. Garbage
+   * is measured by `allocPerOp` below instead. */
+  const measure = (fn, N, repeats = 5) => {
+    let usPerOp = Infinity, retained = Infinity;
+    for (let r = 0; r < repeats; r++) {
+      globalThis.gc(); globalThis.gc();
+      const before = process.memoryUsage().heapUsed;
+      const t0 = process.hrtime.bigint();
+      for (let i = 0; i < N; i++) fn(i);
+      const t1 = process.hrtime.bigint();
+      globalThis.gc(); globalThis.gc();
+      const kept = process.memoryUsage().heapUsed - before;
+      const us = Number(t1 - t0) / 1000 / N;
+      if (us < usPerOp) usPerOp = us;
+      if (Math.abs(kept) < Math.abs(retained)) retained = kept;
+    }
+    return { usPerOp, retained };
+  };
   const svc = new RewindService(history, { validator: new ShotValidator(history.maxPlayers) });
   const dir = { x: 0, y: 0, z: 1 };
   const req = {
@@ -649,38 +748,34 @@ section('9. steady-state cost');
   const res = new ShotResolution();
   const N = 50000;
   for (let i = 0; i < N; i++) svc.resolveShot(req, res);   // warm up + JIT
-  const settle = () => { globalThis.gc(); globalThis.gc(); return process.memoryUsage().heapUsed; };
 
-  const before = settle();
-  const t0 = process.hrtime.bigint();
-  for (let i = 0; i < N; i++) svc.resolveShot(req, res);
-  const t1 = process.hrtime.bigint();
-  const after = process.memoryUsage().heapUsed;
-  const perShotUs = Number(t1 - t0) / 1000 / N;
-  const bytesPerShot = (after - before) / N;
+  const shot = measure(() => { svc.resolveShot(req, res); }, N);
+  const shotAlloc = await allocPerOp(() => { svc.resolveShot(req, res); }, N * 4);
   console.log('  ' + N + ' rewound shots vs ' + PLAYERS + ' players x ' + RIG.length + ' hitboxes: '
-    + perShotUs.toFixed(2) + ' us/shot, ' + bytesPerShot.toFixed(3) + ' bytes/shot heap growth');
-  check('resolveShot is allocation-free in the steady state', Math.abs(bytesPerShot) < 1,
-    bytesPerShot.toFixed(3) + ' bytes/shot');
-  check('resolveShot is fast enough to run per bullet on a host tick', perShotUs < 60,
-    perShotUs.toFixed(2) + ' us');
+    + shot.usPerOp.toFixed(2) + ' us/shot, ' + shotAlloc.lagcomp.toFixed(4)
+    + ' bytes/shot allocated, ' + shot.retained + ' bytes retained by the whole loop');
+  check('resolveShot is allocation-free in the steady state', shotAlloc.lagcomp < 1,
+    shotAlloc.lagcomp.toFixed(4) + ' bytes/shot inside lagcomp, '
+    + shotAlloc.other.toFixed(4) + ' outside');
+  check('resolveShot retains nothing across a 50k-shot loop', Math.abs(shot.retained) < 65536,
+    shot.retained + ' bytes');
+  check('resolveShot is fast enough to run per bullet on a host tick', shot.usPerOp < 60,
+    shot.usPerOp.toFixed(2) + ' us');
 
   // Recording cost.
   const RECORD_N = REC_TICKS - 201;
-  const rb = settle();
-  const r0 = process.hrtime.bigint();
-  for (let tick = 201; tick < REC_TICKS; tick++) recordTick(tick);
-  const r1 = process.hrtime.bigint();
-  const ra = process.memoryUsage().heapUsed;
-  const perTickUs = Number(r1 - r0) / 1000 / RECORD_N;
-  const bytesPerTick = (ra - rb) / RECORD_N;
-  console.log('  recording ' + RECORD_N + ' ticks x ' + PLAYERS + ' players: ' + perTickUs.toFixed(2)
-    + ' us/tick, ' + bytesPerTick.toFixed(3) + ' bytes/tick heap growth, ring still '
-    + (history.bytes / 1048576).toFixed(2) + ' MB');
-  check('recording is allocation-free in the steady state', Math.abs(bytesPerTick) < 1,
-    bytesPerTick.toFixed(3) + ' bytes/tick');
-  check('recording fits comfortably inside a 64 Hz tick budget', perTickUs < 200,
-    perTickUs.toFixed(2) + ' us of 15625 us');
+  const rec = measure(recordTick, RECORD_N);
+  const recAlloc = await allocPerOp(recordTick, RECORD_N * 4);
+  console.log('  recording ' + RECORD_N + ' ticks x ' + PLAYERS + ' players: ' + rec.usPerOp.toFixed(2)
+    + ' us/tick, ' + recAlloc.lagcomp.toFixed(4) + ' bytes/tick allocated, ' + rec.retained
+    + ' bytes retained, ring still ' + (history.bytes / 1048576).toFixed(2) + ' MB');
+  check('recording is allocation-free in the steady state', recAlloc.lagcomp < 1,
+    recAlloc.lagcomp.toFixed(4) + ' bytes/tick inside lagcomp, '
+    + recAlloc.other.toFixed(4) + ' outside');
+  check('the ring never grows: 30k ticks retain nothing', Math.abs(rec.retained) < 65536,
+    rec.retained + ' bytes');
+  check('recording fits comfortably inside a 64 Hz tick budget', rec.usPerOp < 200,
+    rec.usPerOp.toFixed(2) + ' us of 15625 us');
   check('no writes were dropped', history.droppedWrites === 0, 'dropped=' + history.droppedWrites);
 }
 

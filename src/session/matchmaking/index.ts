@@ -30,12 +30,12 @@ export type {
   MatchmakingOptions, MatchResultReport, MmEmitter, PartyMemberInput,
 } from './Service';
 
-export { MatchQueue, qualityOf, ticketRegion } from './Queue';
+export { MatchQueue, qualityOf, ticketConnection, ticketRegion } from './Queue';
 export type { QueueOptions, TicketStatus } from './Queue';
 
 export {
   DEFAULT_WIDENING, PRIVATE_WIDENING, RANKED_WIDENING, describeCurve,
-  mutualWindows, wideningFor, windowsAt, windowsForTicket,
+  humansRequired, mutualWindows, wideningFor, windowsAt, windowsForTicket,
 } from './Widening';
 export type { SearchWindows } from './Widening';
 

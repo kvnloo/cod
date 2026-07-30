@@ -21,7 +21,7 @@
  */
 
 import {
-  angleDelta, bell, clamp, distXZ, rayDistanceXZ, saturate, yawTo,
+  angleDelta, bell, clamp, distXZ, hash01, rayDistanceXZ, saturate, yawTo,
 } from './Math';
 import type { InfluenceField } from './InfluenceField';
 import type { SpawnPolicy } from './Policies';
@@ -74,6 +74,7 @@ export class SpawnScorer {
   private team: SpawnTeam = 'friendly';
   private teamSign = 1;
   private halfFovCos = 0;
+  private jitterSalt = 0;
   private readonly rayScratch = new Float64Array(1);
 
   /** Caches the per-request view of the world. Call once per request. */
@@ -91,6 +92,8 @@ export class SpawnScorer {
       else this.enemies.push(a);
     }
     this.halfFovCos = Math.cos((ctx.policy.weights.viewConeDeg * Math.PI) / 180);
+    // One draw per request, not one per candidate: see `hash01`.
+    this.jitterSalt = (ctx.rand.u32() ^ ((ctx.req.seed ?? 0) >>> 0)) >>> 0;
     this.target = ctx.policy.objectiveDriven ? this.pickObjective(ctx) : null;
   }
 
@@ -147,7 +150,8 @@ export class SpawnScorer {
     if (req.owner && p.owner !== req.owner && p.owner !== 'neutral') {
       this.veto = 'team'; return -Infinity;
     }
-    if (tier < 2 && policy.requireOwnedPoints && p.owner !== this.team && p.owner !== 'neutral') {
+    if (tier < 2 && policy.requireOwnedPoints && p.owner !== this.team
+      && !(p.owner === 'neutral' && !policy.strictOwnership)) {
       this.veto = 'team'; return -Infinity;
     }
     if (req.filter && !req.filter(p)) { this.veto = 'filter'; return -Infinity; }
@@ -287,7 +291,7 @@ export class SpawnScorer {
     t.cover = w.cover * (p.cover - p.openness * 0.5);
     score += t.cover;
 
-    t.jitter = ctx.rand.range(-w.jitter, w.jitter);
+    t.jitter = w.jitter * (hash01(p.id, this.jitterSalt) * 2 - 1);
     score += t.jitter;
 
     this.total = score;

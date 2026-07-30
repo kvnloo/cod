@@ -32,6 +32,7 @@ import './host/NetEvents';
 import { PeerSession, type SessionStats, type SnapshotSink } from './host/PeerSession';
 import { LoopbackNetwork, PERFECT_LINK, type LinkConditions } from './host/testing/LoopbackTransport';
 import type { AuthorityConfig } from './host/Authority';
+import type { PeerHost } from './host/PeerHost';
 import type { MigrationPolicy, MigrationPhase } from './host/HostMigration';
 import type { Codec, SimStepper, SnapshotWriter, Transport } from './host/ports';
 import {
@@ -112,6 +113,11 @@ export class NetSystem implements System {
   private bytesAtWindowStart = 0;
   private interpolationDelayMs = 100;
   private latestSnapshot: Snapshot | null = null;
+  /** The `PeerHost` instance whose events we are currently relaying, if any. */
+  private boundHost: PeerHost | null = null;
+  private unbindHost: (() => void) | null = null;
+  /** Client slots already announced on the bus, so a rebind does not re-announce. */
+  private announcedPeers = new Set<number>();
 
   /* ------------------------------------------------------ System --- */
 
@@ -175,6 +181,10 @@ export class NetSystem implements System {
   /** Tear the net stack down and return to offline single-player behaviour. */
   disconnect(reason = 'disconnected'): void {
     if (!this.session) return;
+    this.unbindHost?.();
+    this.unbindHost = null;
+    this.boundHost = null;
+    this.announcedPeers.clear();
     this.session.dispose();
     this.session = null;
     this.opts = null;
@@ -243,32 +253,51 @@ export class NetSystem implements System {
       input: (tick) => this.sampleInput(tick),
     });
 
-    session.onStatus = () => this.publishStatus();
-
     // On the host, authoritative events never travel over a transport — relay
     // them onto the bus directly so FX/audio/HUD behave identically either way.
+    //
+    // `report()` fires on every roster/migration change, so this must be
+    // idempotent: binding a second observer to the same host would double every
+    // hit, kill and spawn the HUD and FX layers see. Promotion after a migration
+    // creates a *new* PeerHost, which is the one case where we do rebind.
     const bindHostObserver = (): void => {
-      session.host?.observe({
+      const host = session.host;
+      if (!host || host === this.boundHost) return;
+      this.unbindHost?.();
+      this.boundHost = host;
+      this.unbindHost = host.observe({
         onEvent: (ev) => this.relayEvent(ev),
         onPlayerJoin: (clientId, _stableId, name) => {
-          const team = session.host?.core.slot(clientId)?.team ?? 0;
-          bus.emit('net:peer:join', { clientId, name, team });
+          this.announceJoin(clientId, name, host.core.slot(clientId)?.team ?? 0);
         },
         onPlayerLeave: (clientId, reason) => {
-          const name = session.host?.core.slot(clientId)?.name ?? String(clientId);
+          this.announcedPeers.delete(clientId);
+          const name = host.core.slot(clientId)?.name ?? String(clientId);
           bus.emit('net:peer:leave', { clientId, name, reason });
         },
       });
+      // Slots that already exist have no join event to observe: our own slot is
+      // admitted before this binding runs, and a host promoted by migration
+      // inherits the whole roster from a checkpoint. Announce them now or the UI
+      // never learns those players exist.
+      for (const [clientId, slot] of host.core.state.players) {
+        this.announceJoin(clientId, slot.name, slot.team);
+      }
     };
-    const origStatus = session.onStatus;
     session.onStatus = (s) => {
       if (s.role === 'host') bindHostObserver();
-      origStatus?.(s);
+      this.publishStatus();
     };
 
     this.session = session;
-    if (session.host) bindHostObserver();
+    bindHostObserver();
     return session;
+  }
+
+  private announceJoin(clientId: number, name: string, team: number): void {
+    if (this.announcedPeers.has(clientId)) return;
+    this.announcedPeers.add(clientId);
+    bus.emit('net:peer:join', { clientId, name, team });
   }
 
   private relayEvent(ev: NetEvent): void {

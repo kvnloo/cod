@@ -28,6 +28,11 @@ import { V3 } from '../geom/Mesher';
 export type Side = 'n' | 'w' | 's' | 'e';
 const SIDE_INDEX: Record<Side, number> = { n: 0, w: 1, s: 2, e: 3 };
 
+/** Shutter paints. Mostly tired timber, occasionally something that was loud. */
+const SHUTTER_KEYS: readonly MatKey[] = [
+  'woodPaint', 'woodPaint', 'wood', 'plank', 'steelPaint', 'paintRed',
+];
+
 export interface BlockSpec {
   name: string;
   x0: number; z0: number; x1: number; z1: number;
@@ -223,6 +228,15 @@ export function buildBlock(chunk: Chunk, spec: BlockSpec): BlockResult {
       // Fit out the openings.
       for (const o of openings) {
         if (o.kind === 'window') {
+          // Per-opening dressing. The structural rhythm stays exact — real
+          // windows are on a grid — so every bit of the variation goes into
+          // what is hung in the reveal: shutters open, half-shut, closed or
+          // absent, in four different paints.
+          const wr = new Rand(spec.seed * 7 + Math.round(o.u * 53 + y0 * 17) + SIDE_INDEX[side] * 401);
+          const roll = wr.next();
+          const shutters = roll < 0.17 ? 'closed'
+            : roll < 0.32 ? 'half'
+              : roll < 0.66 ? 'open' : 'none';
           windowUnit(chunk, frame, o, {
             wallThickness: t,
             broken: o.broken,
@@ -232,6 +246,8 @@ export function buildBlock(chunk: Chunk, spec: BlockSpec): BlockResult {
             seed: spec.seed + Math.round(o.u * 31 + y0 * 7),
             curtainKey: lvl > 0 ? 'canvasCream' : undefined,
             frameKey: 'woodPaint',
+            shutters: o.boarded ? 'none' : shutters,
+            shutterKey: wr.pick(SHUTTER_KEYS),
           });
         } else if (o.kind === 'door') {
           const e = (spec.entrances ?? []).find((x) => x.side === side && Math.abs(uOn(spec, side, x.at) - o.u) < 0.01);

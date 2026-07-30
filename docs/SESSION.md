@@ -342,35 +342,137 @@ with fake peers.
 system under the engine name above. Nothing else is required; there is no
 registration call and no ordering constraint.
 
+### 6.1 Bridges — for the modules that already exist
+
+The six session subsystems were written in parallel with this file and none of
+them speak the port vocabulary above, because none of them should have to. The
+adapters live here, in `SessionSystem.ts`, and are structural: each takes
+`unknown`, proves the shape at runtime and returns a port or `null`. Nothing in
+another agent's module was changed to make this work.
+
+| Bridge | Accepts | Produces |
+|---|---|---|
+| `lobbyPortFrom(src, fallback?)` | a `LobbySession`, or anything owning one (`LobbySystem.session`), or an existing `LobbyPort` | `LobbyPort` |
+| `matchmakingPortFrom(src, opts?)` | a `MatchmakingService` (`requestJoin` / `update` / `snapshot`) | `MatchmakingPort` |
+| `loadoutPortFrom(src)` | a `LoadoutBook` (`current()`) | `LoadoutPort` |
+
+What each one has to reconcile:
+
+- **Lobby.** `LobbyState` is fat (parties, votes, teams, settings, epochs);
+  `SessionLobbyView` is the flat slice the front end draws. `MemberState`
+  flattens to `SessionMember`, `countdown.secondsLeft` to `countdown`. Intents
+  go back out as the lobby's own commands — `setMode` → `{ t: 'pin' }`,
+  `requestLaunch` → `ready(true)` then `{ t: 'start' }`, `requestCancel` →
+  `{ t: 'cancel' }` — so the host still adjudicates every one of them and a
+  non-leader's command is refused exactly as it would be from the lobby UI.
+  `fallback` covers the frames before a lobby exists, so the front end shows
+  your own party instead of flashing an empty room.
+- **Matchmaking.** The service is ticket-shaped and *deliberately owns no
+  clock*: `update(now)` takes absolute seconds. The bridge keeps that clock and
+  advances it from the session's `tick(dt)`, so matchmaking inherits the
+  session's determinism instead of wall time. `search()` enqueues humans only
+  (bots are the matchmaker's job, not the party's) on the playlist for the mode
+  — `tdm → core-tdm-6v6`, `operation → operation-coop-4`,
+  `firefight → firefight-coop-4`, overridable via `opts.playlistFor`. A formed
+  `MatchRoster` becomes a `MatchLaunch`, with roster team indices `0/1` mapped
+  onto `alpha/bravo`. The service reports "still looking", never "gave up", so
+  the session's own `searchTimeout` is what turns a hopeless search into a
+  failure.
+- **Loadout.** The module has two faces: `LoadoutBook` is the client's saved
+  classes, `LoadoutService` is the host's grant authority. The session only ever
+  needs the active class *name*, so it bridges the book. The host face is
+  exposed through the service registry instead (§7.1).
+
+Measured, end to end: the real `MatchmakingService` fills a solo search with 11
+bots into a 12-slot roster after 25 s of simulated queue time, and the real
+`LobbySystem` and `LoadoutBook` bind on the first frame.
+
 ---
 
 ## 7. Installation, and why single-player cannot regress
 
-`SessionSystem` is registered by `installSession()` in `src/game/Services.ts`,
-which `resolveServices()` calls. Two details are load-bearing:
+There is exactly one call:
 
-1. **Registration is deferred to `game:ready`.** `Engine.init()` walks
-   `this.systems` with `for…of` while we are inside another system's `init`, and
-   `Engine.add` pushes *and re-sorts* that same array — which can make the loop
-   revisit or skip a system. `game:ready` fires once the loop has finished, so
-   adding there is safe. `init` is then called manually because the engine will
-   not run its init pass again.
+```ts
+import { installSession } from './session/SessionSystem';
 
-2. **It never starts a match that is already running.** `GameDirector` boots a
+installSession(engine);                       // local session — this is single player
+installSession(engine, {                      // …or hand it the meta layer
+  lobby: new LobbySystem(),                   // a System — registered for you
+  matchmaking: new MatchmakingService({ seed }),
+  loadout: book,
+});
+```
+
+Everything is optional, subsystems are bridged onto ports (§6.1), any subsystem
+that is itself a `System` is registered so the engine ticks it, and the call is
+idempotent — a session already in the registry is returned untouched.
+
+**`src/main.ts` does not call it.** `main.ts` belongs to another agent, so
+`src/game/Services.ts` arms the session instead: `resolveServices()` — which
+`GameDirector.init` already calls — subscribes once to `game:ready` and installs
+there. Three details are load-bearing:
+
+1. **Deferred to `game:ready`.** `Engine.init()` walks `this.systems` with
+   `for…of` while we are inside `GameDirector.init`, and `Engine.add` pushes
+   *and re-sorts* that same array — which can make the loop revisit or skip a
+   system. `game:ready` fires once the loop has finished, so adding there is
+   safe. `init` is then called by hand because the engine will not run its init
+   pass again.
+
+2. **Dynamically imported.** `src/session/` sits *around* the match, not under
+   it. A static import would invert that and pull the whole meta layer into
+   every headless game test; the dynamic one keeps `src/game` standalone and
+   lets the bundler split it into its own chunk. Any failure is caught and
+   logged — the game then runs exactly as it did before the session existed.
+
+3. **It never starts a match that is already running.** `GameDirector` boots a
    match on its own today. When it has, the session **adopts** it: fast-forwards
    the flow to `live` with every intermediate state announced but *no side
    effects run*, sets `adopted`/`launched`, and leaves the director completely
    alone. Adoption is bookkeeping to catch up with reality, not a journey.
 
    In capture mode the session is installed `passive` and never starts anything,
-   so it cannot spawn soldiers into another module's shots.
+   so it cannot spawn soldiers into another module's shots — verified in the real
+   browser build by `tools/session-live.mjs`.
 
 `startMatchIfNeeded()` is the only place a match is ever started, and `adopted`
 and `launched` between them make a double-start impossible. The verifier asserts
 `starts === 0` for an adopted match and `starts === 1` for a fresh one.
 
-Failure to install is never fatal: the game runs exactly as it did before, it
-just has no front end.
+*If `main.ts` ever wants the session earlier or with subsystems attached, the
+change is one line — `installSession(engine, { … })` next to the other
+`engine.add` calls — and `armSessionLayer` will then no-op, because installation
+is idempotent.*
+
+### 7.1 The service registry
+
+`src/game/Services.ts` is how the match layer *finds* the meta layer without
+depending on it. `resolveServices()` fills `GameServices.meta` with:
+
+| Field | Resolved from | Surface |
+|---|---|---|
+| `session` | engine `session` | `state()`, `isHost()`, `online()`, `request(event, reason?)` |
+| `lobby` | engine `lobby`, else `session.subsystems.lobby` | `phase()`, `members()`, `launch()` |
+| `loadout` | engine `loadout`, else `session.subsystems.loadout` | `activeName()`, `activeFor(id)`, `notifySpawn(id)` |
+| `matchmaking` | engine `matchmaking`, else `session.subsystems.matchmaking` | `state()`, `waited()`, `roster()` |
+| `spawns`, `replay` | engine, else `session.subsystems` | opaque handles |
+
+Three rules govern this table:
+
+- **No imports.** Every bridge is structural, so `src/game` never depends on
+  `src/session` and still compiles, runs and self-tests with the whole session
+  layer deleted. `NO_META` is what a build with no meta layer resolves to.
+- **Accessors, not fields.** These read live state; a snapshot taken at resolve
+  time would be a lie one frame later.
+- **Most of the meta layer is not a `System`.** A `MatchmakingService` or a
+  `LoadoutBook` has no frame to consume, so it never appears in the engine
+  registry. `SessionSystem.subsystems` is where `installSession` records the raw
+  handles, and it is the fallback for every lookup above.
+
+`session.request()` is a *request*, not a command, in the registry exactly as it
+is on the bus: the host applies it, a client forwards it, and the caller must
+re-read `state()` rather than assume.
 
 ---
 
@@ -420,16 +522,48 @@ files were edited** — every reconciliation is absorbed on the session side.
    owns `time.scale`. Two writers on one clock would fight; the session reports
    and the match decides.
 
+8. **`LobbySystem` is a `System`; `LobbyPort` wanted a plain `view()`.**
+   Neither side changed. `lobbyPortFrom` reaches through `.session` for the
+   `LobbyState` and flattens it (§6.1). The same bridge accepts a bare
+   `LobbySession`, so a build that never registers `LobbySystem` still works.
+
+9. **`MatchmakingService` is ticket-shaped and clocked in absolute seconds;
+   `MatchmakingPort` is search-shaped and clocked in deltas.**
+   `matchmakingPortFrom` owns the translation, including the clock — which is
+   what makes matchmaking deterministic under the session's fixed step rather
+   than dependent on wall time. The mode → playlist choice lives in the bridge
+   because the two modules disagree about what the unit of matchmaking is (a
+   mode vs a playlist); `opts.playlistFor` is the escape hatch.
+
+10. **The loadout module has two faces.** `LoadoutBook` (client, saved classes)
+    and `LoadoutService` (host, grants) are different objects with no common
+    interface. `LoadoutPort` bridges the book; `LoadoutBridge` in
+    `src/game/Services.ts` accepts *either or both* and answers emptily for the
+    half that is absent, so callers never branch on which one a build installed.
+
+11. **Nothing in the meta layer except the lobby is a `System`.**
+    `resolveMetaServices` therefore falls back to `SessionSystem.subsystems`,
+    the record `installSession` keeps of the raw handles it was given. The
+    alternative — asking four other modules to grow a `name`/`order` and a
+    frame they do not need — would have been a worse trade.
+
+12. **`src/main.ts` still does not register the session.** It is not this
+    agent's file. `armSessionLayer()` in `src/game/Services.ts` installs on
+    `game:ready` instead (§7), which is why the session is live in the shipped
+    bundle today. Whoever owns `main.ts` can make it explicit whenever they
+    like; installation is idempotent, so both paths can coexist.
+
 ---
 
 ## 9. Verification
 
 ```bash
-node tools/session-flow.mjs          # 55 checks: journey + failure injection + tsc negative test
+node tools/session-flow.mjs          # 82 checks: journey, failures, bridges, registry, tsc negative test
 node tools/session-flow.mjs --quick  # skip the tsc negative test
+node tools/session-live.mjs --dist dist-s8 --port 4608   # 8 checks in the real browser build
 ```
 
-What it covers:
+What `session-flow` covers:
 
 - the flow table is structurally sound; every state reachable from `boot`, every
   non-terminal state able to reach `lobby` again
@@ -442,7 +576,38 @@ What it covers:
   a throwing director, host loss + successful migration, host loss + failed
   migration, local disconnect, fatal fault + recovery, client authority, and a
   malformed launch order
+- every bridge in §6.1, against fixtures shaped exactly like the real modules:
+  the lobby view flattening, intents leaving as lobby commands, the fallback
+  view, humans-only queueing on the right playlist, roster → launch order,
+  team-index mapping, the matchmaker clocked off the session tick, cancel
+- `installSession`: registration, idempotence, subsystems not degraded, and a
+  full menu → matchmaking → loading → pre-match → live → post-match →
+  after-action → lobby journey driven through those bridges with `starts === 1`
+  on the seed the matchmaker chose
+- `src/game/Services.ts`: `resolveMetaServices` finding the session, the lobby
+  and the non-`System` subsystems, reading live state, forwarding intent, and
+  resolving to all-null on a build with no meta layer
 - the game layer's own `runSelfTest()` as an upstream probe
+- the *real* `LobbySystem`, `MatchmakingService` and `LoadoutBook` binding to
+  their ports, as upstream probes
 
 Upstream probes are reported separately and do not gate the exit code —
-otherwise another agent's mid-edit tree would mask every session result.
+otherwise another agent's mid-edit tree would mask every session result. That is
+not hypothetical: `src/session/matchmaking` was mid-refactor during this pass
+and threw from `Queue.tryForm` for several minutes.
+
+What `session-live` covers, in headless Chrome against `npx vite build`:
+
+- the shipped bundle installs the session and registers it with the engine
+  (`physics, player, weapons, ai, session, director, materials, world, fx,
+  audio, hud, render`)
+- a capture run installs it `passive` and starts nothing — `match=idle`,
+  `screen=main` — so it cannot pollute another module's shots
+- an offline session is the host, and its fallbacks are reported in `degraded`
+  rather than hidden (`net, loadout, lobby, matchmaking, mapLoad`)
+- the engine still steps, and no new console errors appear
+
+Single-player non-regression is also checked visually: `node tools/capture.mjs
+--label s-int --no-build --port 4608 --dist dist-s8 --hud` writes the same 77
+shots, with the same draw-call and triangle counts, before and after the session
+layer was installed.

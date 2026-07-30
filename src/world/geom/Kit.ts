@@ -277,6 +277,15 @@ export interface WindowOptions {
   boarded?: boolean;
   /** Draw curtains behind the glass. */
   curtainKey?: MatKey;
+  /**
+   * Hung shutters. A row of seven windows on an exact pitch with identical
+   * frames is the loudest repeat a procedural facade produces; the structural
+   * rhythm is correct and must stay, so the variation has to go into what is
+   * *hung in* the openings. 'open' folds both leaves back against the render,
+   * 'half' leaves one across the glass, 'closed' shuts the window up.
+   */
+  shutters?: 'none' | 'open' | 'half' | 'closed';
+  shutterKey?: MatKey;
 }
 
 export function windowUnit(chunk: Chunk, frame: WallFrame, o: Opening, opt: WindowOptions = {}): void {
@@ -357,6 +366,38 @@ export function windowUnit(chunk: Chunk, frame: WallFrame, o: Opening, opt: Wind
     const cw = w * rand.range(0.3, 0.5);
     c.box(u0 + cw * 0.55, (y0 + y1) * 0.5 + 0.05, z - 0.09, cw * 0.5, h * 0.45, 0.02, 1.0);
     c.pop();
+  }
+
+  /* ------------------------------------------------------------ shutters */
+  const sh = opt.shutters ?? 'none';
+  if (sh !== 'none' && w > 0.7) {
+    const s = chunk.m(opt.shutterKey ?? 'woodPaint');
+    s.push(frame.matrix);
+    const leafW = w * 0.5;
+    const leafH = h + 0.05;
+    const cy = (y0 + y1) * 0.5;
+    const shutClosed = rand.bool() ? -1 : 1;
+    for (const side of [-1, 1] as const) {
+      // One leaf missing entirely on a fifth of them: a facade where every
+      // pair is complete is still a stamped facade.
+      if (rand.bool(0.16)) continue;
+      const closed = sh === 'closed' || (sh === 'half' && side === shutClosed);
+      // Folded back = ~π about the hinge, off true by a few degrees so the
+      // leaf catches a different value from the wall behind it.
+      const ang = closed ? side * rand.range(-0.05, 0.05) : side * rand.range(2.70, 3.05);
+      const hingeU = o.u + side * (w * 0.5 + 0.035);
+      s.pushTRS(hingeU, cy + rand.range(-0.015, 0.015), half + 0.04, ang, 0, rand.range(-0.02, 0.02));
+      const cx = -side * leafW * 0.5;
+      s.box(cx, 0, 0, leafW * 0.5, leafH * 0.5, 0.021, 0.55);
+      // Louvres: five slats, so the leaf has a silhouette and a shadow ladder
+      // rather than being a flat card.
+      for (let i = 0; i < 5; i++) {
+        const ly = (i / 4 - 0.5) * (leafH - 0.16);
+        s.box(cx, ly, 0.023, leafW * 0.5 - 0.028, 0.021, 0.011, 0.35);
+      }
+      s.pop();
+    }
+    s.pop();
   }
 }
 

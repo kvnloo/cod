@@ -154,12 +154,18 @@ async function main() {
     server: { middlewareMode: true, hmr: false },
   });
 
-  let flowMod, sessionMod, busMod, selfTestMod;
+  let flowMod, sessionMod, busMod, selfTestMod, servicesMod, realMods;
   try {
     flowMod = await server.ssrLoadModule('/src/session/Flow.ts');
     sessionMod = await server.ssrLoadModule('/src/session/SessionSystem.ts');
     busMod = await server.ssrLoadModule('/src/core/EventBus.ts');
     selfTestMod = await server.ssrLoadModule('/src/game/SelfTest.ts').catch((e) => ({ error: e }));
+    servicesMod = await server.ssrLoadModule('/src/game/Services.ts').catch((e) => ({ error: e }));
+    realMods = {
+      lobby: await server.ssrLoadModule('/src/session/lobby/index.ts').catch((e) => ({ error: e })),
+      mm: await server.ssrLoadModule('/src/session/matchmaking/Service.ts').catch((e) => ({ error: e })),
+      loadout: await server.ssrLoadModule('/src/session/loadout/index.ts').catch((e) => ({ error: e })),
+    };
   } catch (err) {
     console.error(err);
     bad('modules load', String(err?.message ?? err));
@@ -471,6 +477,343 @@ async function main() {
     probe('game-layer self-test still passes', false,
       `could not load src/game/SelfTest.ts: ${String(selfTestMod?.error?.message ?? 'unknown')}`,
       'src/game');
+  }
+
+  /* ============================ 5b. the meta layer, actually wired up == */
+
+  /*
+   * Everything above proves the flow. This proves the *integration*: that the
+   * shapes the other six session agents actually shipped bind onto the ports,
+   * that one `installSession` call stands the whole thing up, and that
+   * `src/game/Services.ts` can then find it.
+   *
+   * The gating checks run against fixtures shaped exactly like those modules,
+   * so a teammate mid-edit cannot turn this tool red. The real modules are then
+   * loaded and probed — reported, and not gating, for the same reason.
+   */
+
+  const { installSession, lobbyPortFrom, matchmakingPortFrom, loadoutPortFrom } = sessionMod;
+
+  const lobbyStateFixture = () => ({
+    phase: 'forming',
+    hostId: 'plr_a',
+    members: [
+      { id: 'plr_a', profile: { name: 'VIPER', rank: 41, bot: false }, team: 'alpha',
+        ready: true, loadProgress: 1, host: true, leader: true, ping: 24 },
+      { id: 'bot_1', profile: { name: 'RAVEN', rank: 12, bot: true }, team: 'bravo',
+        ready: true, loadProgress: 1, host: false, leader: false, ping: 0 },
+    ],
+    selection: {
+      mapId: 'blackout', mapName: 'Blackout',
+      modeId: 'tdm', modeName: 'Team Deathmatch', seed: 991,
+    },
+    countdown: { secondsLeft: 7 },
+    connectedCount: 2,
+    capacity: 12,
+    message: 'WAITING FOR PLAYERS',
+  });
+
+  /** Shaped like `src/session/lobby/LobbySession`. */
+  class FixtureLobbySession {
+    constructor() {
+      this.localId = 'plr_a';
+      this.state = lobbyStateFixture();
+      this.cmds = [];
+      this.ticks = 0;
+    }
+    submit(cmd) { this.cmds.push(cmd); return { ok: true }; }
+    ready(r) { this.cmds.push({ t: 'ready', ready: r }); return { ok: true }; }
+    tick(dt) { this.ticks += dt; }
+  }
+
+  /** Shaped like `src/session/lobby/LobbySystem` — a System that owns a session. */
+  class FixtureLobbySystem {
+    constructor() {
+      this.name = 'lobby';
+      this.order = 490;
+      this.session = new FixtureLobbySession();
+      this.lastLaunch = null;
+    }
+    update(dt) { this.session.tick(dt); }
+  }
+
+  /** Shaped like `src/session/matchmaking/Service` — ticket queue, absolute clock. */
+  class FixtureMatchmaking {
+    constructor(formAt = 3) {
+      this.formAt = formAt;
+      this.now = 0;
+      this.joined = [];
+      this.left = 0;
+      this.snap = { state: 'idle', waited: 0, candidates: 0, roster: null };
+    }
+    requestJoin(playlist, party, now) {
+      this.joined.push({ playlist, party, now });
+      this.snap = { state: 'searching', waited: 0, candidates: 3, roster: null };
+      return 't:1';
+    }
+    leaveQueue() {
+      this.left++;
+      this.snap = { state: 'idle', waited: 0, candidates: 0, roster: null };
+    }
+    update(now) {
+      this.now = now;
+      if (this.snap.state !== 'searching') return [];
+      this.snap.waited = now;
+      if (now >= this.formAt) {
+        this.snap.state = 'found';
+        this.snap.roster = {
+          mode: 'tdm', seed: 20260730,
+          slots: [
+            { kind: 'human', playerId: 'plr_a', name: 'VIPER', team: 0 },
+            { kind: 'bot', botId: 'bot_1', name: 'RAVEN', team: 0 },
+            { kind: 'bot', botId: 'bot_2', name: 'HOLLOW', team: 1 },
+            { kind: 'bot', botId: 'bot_3', name: 'ASH', team: 1 },
+          ],
+        };
+      }
+      return [];
+    }
+    snapshot() { return this.snap; }
+  }
+
+  /** Shaped like `src/session/loadout/Classes` `LoadoutBook`. */
+  class FixtureBook {
+    constructor() {
+      this.cur = { name: 'RIFLEMAN', primary: { id: 'ar_stag' }, secondary: { id: 'p_mk9' } };
+    }
+    current() { return this.cur; }
+  }
+
+  /* --- lobby -------------------------------------------------------------- */
+
+  const lobbyFix = new FixtureLobbySystem();
+  const lobbyPort = lobbyPortFrom(lobbyFix);
+  expect('a LobbySystem bridges onto LobbyPort', !!lobbyPort,
+    lobbyPort ? 'via .session' : 'no bridge');
+  if (lobbyPort) {
+    const v = lobbyPort.view();
+    expect('the lobby state flattens into a session view',
+      v.members.length === 2 && v.members[0].name === 'VIPER' && v.members[0].local === true
+      && v.members[1].bot === true && v.members[1].team === 'bravo',
+      `${v.members.length} members, phase=${v.phase}, mode=${v.selection.modeId}`);
+    expect('the view carries countdown, capacity and status line',
+      v.countdown === 7 && v.capacity === 12 && v.connected === 2
+      && v.message === 'WAITING FOR PLAYERS',
+      `countdown=${v.countdown} ${v.connected}/${v.capacity}`);
+    lobbyPort.setMode('operation');
+    lobbyPort.requestLaunch();
+    lobbyPort.requestCancel();
+    const cmds = lobbyFix.session.cmds.map((c) => c.t).join(',');
+    expect('session intents go through the lobby, not around it',
+      cmds === 'pin,ready,start,cancel', cmds);
+    lobbyPort.tick(0.5);
+    expect('the lobby is ticked by the session', Math.abs(lobbyFix.session.ticks - 0.5) < 1e-9,
+      `${lobbyFix.session.ticks.toFixed(2)}s`);
+  }
+
+  const blankLobby = new FixtureLobbySystem();
+  blankLobby.session.state = null;
+  const blankPort = lobbyPortFrom(blankLobby, () => ({ ...lobbyStateFixture(), message: 'BASELINE' }));
+  expect('a lobby with no state yet falls back instead of flashing empty',
+    blankPort?.view().message === 'BASELINE', blankPort?.view().message ?? 'no bridge');
+
+  /* --- matchmaking -------------------------------------------------------- */
+
+  const mmFix = new FixtureMatchmaking(3);
+  const mmPort = matchmakingPortFrom(mmFix, { map: 'blackout' });
+  expect('a MatchmakingService bridges onto MatchmakingPort', !!mmPort);
+  if (mmPort) {
+    mmPort.search({
+      mode: 'tdm',
+      party: [
+        { id: 'plr_a', name: 'VIPER', bot: false, rank: 41 },
+        { id: 'bot_1', name: 'RAVEN', bot: true, rank: 1 },
+      ],
+      patience: 1, seed: 7,
+    });
+    expect('search queues humans only, on the playlist for the mode',
+      mmFix.joined[0]?.playlist === 'core-tdm-6v6' && mmFix.joined[0]?.party.length === 1,
+      `${mmFix.joined[0]?.playlist} with ${mmFix.joined[0]?.party.length} human(s)`);
+    let t = 0;
+    while (t < 10 && !mmPort.result()) { mmPort.tick(DT); t += DT; }
+    const launch = mmPort.result();
+    expect('a formed roster becomes a launch order',
+      !!launch && launch.modeId === 'tdm' && launch.seed === 20260730 && launch.roster.length === 4,
+      launch ? `${launch.roster.length} slots, seed=${launch.seed}, after ${t.toFixed(1)}s` : 'no launch');
+    expect('roster teams land on lobby teams',
+      launch?.roster.filter((r) => r.team === 'bravo').length === 2
+      && launch?.roster.filter((r) => r.bot).length === 3,
+      launch ? launch.roster.map((r) => `${r.name}:${r.team}`).join(' ') : '');
+    expect('the matchmaker is clocked off the session tick, not wall time',
+      Math.abs(mmFix.now - t) < 0.05, `service clock=${mmFix.now.toFixed(2)}s, session=${t.toFixed(2)}s`);
+    mmPort.cancel();
+    expect('cancel leaves the queue', mmFix.left === 1 && mmPort.status().state === 'idle');
+  }
+
+  /* --- loadout ------------------------------------------------------------ */
+
+  const bookPort = loadoutPortFrom(new FixtureBook());
+  expect('a LoadoutBook bridges onto LoadoutPort',
+    bookPort?.activeName() === 'RIFLEMAN' && bookPort?.valid() === true,
+    bookPort ? `${bookPort.activeName()} valid=${bookPort.valid()}` : 'no bridge');
+
+  /* --- installation ------------------------------------------------------- */
+
+  const makeRegistry = () => {
+    const m = new Map();
+    return { m, add(s) { m.set(s.name, s); return s; }, tryGet(n) { return m.get(n); } };
+  };
+
+  const reg = makeRegistry();
+  const wiredBus = new EventBus();
+  const wiredMatch = new FakeMatch();
+  const wiredLobby = new FixtureLobbySystem();
+  const wiredMm = new FixtureMatchmaking(2);
+  const wiredReports = [];
+  const wired = installSession(reg, {
+    bus: wiredBus, seed: 20260730, playerName: 'VIPER', mode: 'tdm', map: 'blackout',
+    lobby: wiredLobby, matchmaking: wiredMm, loadout: new FixtureBook(),
+    ports: { match: wiredMatch },
+    config: {
+      searchPatience: 30, searchTimeout: 20, loadTimeout: 5,
+      preMatch: 0.4, postMatch: 0.4, afterAction: 0.6, publishPeriod: 0.25,
+    },
+  });
+  wiredBus.on('session:report', (r) => wiredReports.push(r));
+  wired.boot();
+
+  expect('installSession registers the session', reg.tryGet('session') === wired);
+  expect('installSession registers subsystems that are Systems',
+    reg.tryGet('lobby') === wiredLobby, [...reg.m.keys()].join(','));
+  const wiredDeg = wired.snapshot().degraded;
+  expect('installed subsystems are not degraded',
+    !wiredDeg.includes('lobby') && !wiredDeg.includes('matchmaking')
+    && !wiredDeg.includes('loadout'),
+    `degraded=${wiredDeg.join(',') || 'none'}`);
+  expect('the wired session shows the lobby roster and the active class',
+    wired.snapshot().members.length === 2 && wired.snapshot().loadoutName === 'RIFLEMAN',
+    `${wired.snapshot().members.length} members, class=${wired.snapshot().loadoutName}`);
+  expect('installSession is idempotent', installSession(reg, {}) === wired);
+
+  const wiredPath = [wired.flow.state];
+  wired.deploy('tdm', 'test');
+  let wt = 0;
+  while (wt < 30 && wired.flow.state !== 'live') {
+    wired.step(DT); wt += DT;
+    if (wiredPath[wiredPath.length - 1] !== wired.flow.state) wiredPath.push(wired.flow.state);
+  }
+  expect('the wired session reaches live through the real bridges',
+    wired.flow.state === 'live', `${wiredPath.join(' → ')} in ${wt.toFixed(1)}s`);
+  expect('the match started once, on the seed the matchmaker chose',
+    wiredMatch.starts === 1 && wiredMatch.seeds[0] === 20260730,
+    `starts=${wiredMatch.starts} seed=${wiredMatch.seeds[0]}`);
+
+  wired.request('finished', 'test');
+  let wr = 0;
+  while (wr < 10 && wired.flow.state !== 'lobby') { wired.step(DT); wr += DT; }
+  expect('the wired session comes back to the lobby with a report',
+    wired.flow.state === 'lobby' && wiredReports.length === 1,
+    `state=${wired.flow.state} reports=${wiredReports.length} in ${wr.toFixed(1)}s`);
+  expect('the lobby survived the round trip',
+    wired.snapshot().members.length === 2, `${wired.snapshot().members.length} members`);
+
+  /* --- src/game/Services.ts ---------------------------------------------- */
+
+  if (servicesMod && !servicesMod.error) {
+    const meta = servicesMod.resolveMetaServices({ engine: { tryGet: (n) => reg.tryGet(n) } });
+    expect('Services resolves the session bridge',
+      !!meta.session && meta.session.state() === wired.flow.state && meta.session.isHost() === true,
+      meta.session ? `state=${meta.session.state()} host=${meta.session.isHost()}` : 'null');
+    expect('Services resolves the lobby bridge',
+      !!meta.lobby && meta.lobby.phase() === 'forming' && meta.lobby.members().length === 2,
+      meta.lobby ? `${meta.lobby.phase()}, ${meta.lobby.members().length} members` : 'null');
+    expect('Services finds non-System subsystems through the session',
+      !!meta.matchmaking && !!meta.loadout && meta.loadout.activeName() === 'RIFLEMAN'
+      && meta.matchmaking.state() === 'found',
+      `matchmaking=${meta.matchmaking?.state()} loadout=${meta.loadout?.activeName()}`);
+    const before = meta.session.state();
+    meta.session.request('leave', 'services');
+    expect('the session bridge reads live state and forwards intent',
+      before === 'lobby' && meta.session.state() === 'mainMenu',
+      `${before} → ${meta.session.state()}`);
+    const bare = servicesMod.resolveMetaServices({ engine: { tryGet: () => undefined } });
+    expect('a build with no meta layer resolves to nothing, not a crash',
+      bare.session === null && bare.lobby === null && bare.loadout === null
+      && bare.matchmaking === null && bare.spawns === null && bare.replay === null);
+  } else {
+    bad('src/game/Services.ts loads',
+      String(servicesMod?.error?.message ?? 'unknown').slice(0, 160));
+  }
+
+  /* --- the modules the other agents actually shipped ----------------------- */
+
+  const realLobby = realMods.lobby;
+  if (realLobby && !realLobby.error && typeof realLobby.LobbySystem === 'function') {
+    try {
+      const sys = new realLobby.LobbySystem({ seed: 7 });
+      sys.init();
+      const port = lobbyPortFrom(sys);
+      const v = port?.view();
+      probe('the real LobbySystem binds to LobbyPort',
+        !!v && v.members.length >= 1 && typeof v.selection.modeId === 'string',
+        v ? `${v.members.length} member(s), ${v.selection.mapName} / ${v.selection.modeName}`
+          : 'no bridge', 'src/session/lobby');
+      sys.dispose();
+    } catch (err) {
+      probe('the real LobbySystem binds to LobbyPort', false,
+        `threw: ${String(err?.message ?? err).slice(0, 120)}`, 'src/session/lobby');
+    }
+  } else {
+    probe('the real LobbySystem binds to LobbyPort', false,
+      `module did not load: ${String(realLobby?.error?.message ?? 'unknown').slice(0, 120)}`,
+      'src/session/lobby');
+  }
+
+  const realMm = realMods.mm;
+  if (realMm && !realMm.error && typeof realMm.MatchmakingService === 'function') {
+    try {
+      const svc = new realMm.MatchmakingService({ seed: 7 });
+      const port = matchmakingPortFrom(svc, { map: 'blackout' });
+      port.search({
+        mode: 'tdm', party: [{ id: 'plr_a', name: 'VIPER', bot: false, rank: 41 }],
+        patience: 1, seed: 7,
+      });
+      let t = 0;
+      while (t < 150 && !port.result()) { port.tick(DT); t += DT; }
+      const launch = port.result();
+      probe('the real MatchmakingService fills a solo search with bots',
+        !!launch && launch.roster.length > 1,
+        launch
+          ? `${launch.roster.length} slots (${launch.roster.filter((r) => r.bot).length} bots)`
+            + ` after ${t.toFixed(0)}s`
+          : `no roster after ${t.toFixed(0)}s`,
+        'src/session/matchmaking');
+    } catch (err) {
+      probe('the real MatchmakingService fills a solo search with bots', false,
+        `threw: ${String(err?.message ?? err).slice(0, 120)}`, 'src/session/matchmaking');
+    }
+  } else {
+    probe('the real MatchmakingService fills a solo search with bots', false,
+      `module did not load: ${String(realMm?.error?.message ?? 'unknown').slice(0, 120)}`,
+      'src/session/matchmaking');
+  }
+
+  const realLoadout = realMods.loadout;
+  if (realLoadout && !realLoadout.error && typeof realLoadout.LoadoutBook === 'function') {
+    try {
+      const book = new realLoadout.LoadoutBook({ storage: null });
+      const port = loadoutPortFrom(book);
+      probe('the real LoadoutBook binds to LoadoutPort',
+        !!port && typeof port.activeName() === 'string' && port.activeName().length > 0,
+        port ? `active class "${port.activeName()}"` : 'no bridge', 'src/session/loadout');
+    } catch (err) {
+      probe('the real LoadoutBook binds to LoadoutPort', false,
+        `threw: ${String(err?.message ?? err).slice(0, 120)}`, 'src/session/loadout');
+    }
+  } else {
+    probe('the real LoadoutBook binds to LoadoutPort', false,
+      `module did not load: ${String(realLoadout?.error?.message ?? 'unknown').slice(0, 120)}`,
+      'src/session/loadout');
   }
 
   await server.close();

@@ -157,10 +157,16 @@ export interface LagCompConfig {
    * server's *current* time — not from the command stamp. That is deliberate.
    * The quantity that matters to the victim is "how long ago was I really
    * there", and that includes the upstream travel time of the command as well
-   * as the downstream and interpolation legs. 300 ms covers a 200 ms-ping
-   * player running a 100 ms interpolation buffer; past that, rewinding starts
-   * taking cover away from people who broke line of sight a third of a second
-   * ago on their own screens.
+   * as the interpolation window. 250 ms covers a 300 ms-ping player running a
+   * 100 ms interpolation buffer (upstream 150 + interp 100); past that,
+   * rewinding starts taking cover away from people who broke line of sight a
+   * quarter of a second ago on their own screens.
+   *
+   * This mirrors `DEFAULT_NET_CONFIG.maxLagCompMs` in src/net/types.ts BY VALUE
+   * — that is the authority-wide contract and it wins. We do not import it,
+   * because nothing in this directory imports anything (see index.ts), so if
+   * you change one, change both. A host that has a `NetConfig` in hand should
+   * pass it through: `configureLagComp({ maxRewindMs: net.maxLagCompMs })`.
    */
   maxRewindMs: number;
   /**
@@ -172,15 +178,28 @@ export interface LagCompConfig {
   rejectStaleRewind: boolean;
 
   /**
-   * Fraction of RTT attributed to the server→client leg. 0.5 assumes a
-   * symmetric link and is correct when the command carries the client's
-   * estimate of server time. Set to 1.0 when it does not — see Rewind.ts.
+   * Fraction of RTT attributed to the client→server (upstream) leg. 0.5 assumes
+   * a symmetric link. Used ONLY for shots whose command carries no client
+   * timestamp; a stamped command has no RTT term at all. See Rewind.ts.
    */
   rttFraction: number;
   /** Clamp on the RTT the server will believe, milliseconds. */
   maxRttMs: number;
   /** Clamp on the interpolation delay the client may claim, milliseconds. */
   maxInterpDelayMs: number;
+  /**
+   * How much older than the host's own RTT estimate a client's command stamp
+   * may be before the host stops believing it, milliseconds.
+   *
+   * Back-dating the stamp is the one way a client can buy itself extra rewind
+   * (docs/NETCODE.md §11). A stamp should be about one upstream leg old; this
+   * is the slack on top of that, and it must cover host-side input buffering
+   * (a few ticks), clock-sync error and RTT jitter, because the penalty for
+   * being wrong lands on an honest player. Exceeding it does not reject the
+   * shot — the stamp is simply ignored in favour of the host's own measurement,
+   * so a liar gains nothing and a spike costs nobody a hit.
+   */
+  maxStampSkewMs: number;
 
   /** Max angle between the claimed shot ray and the replicated aim, degrees. */
   maxAimDivergenceDeg: number;
@@ -214,12 +233,13 @@ export const DEFAULT_LAGCOMP_CONFIG: Readonly<LagCompConfig> = Object.freeze({
   interpolate: true,
 
   historySeconds: 1.0,
-  maxRewindMs: 300,
+  maxRewindMs: 250,
   rejectStaleRewind: true,
 
   rttFraction: 0.5,
   maxRttMs: 400,
   maxInterpDelayMs: 200,
+  maxStampSkewMs: 120,
 
   maxAimDivergenceDeg: 20,
   maxOriginDivergenceM: 1.5,

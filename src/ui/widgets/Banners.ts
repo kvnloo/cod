@@ -184,7 +184,12 @@ export class Banners implements Widget {
     // of a paragraph — the colour says "objective" just as clearly from a pair
     // of hairlines, and the type stays the brightest thing rather than the
     // most saturated.
-    const titleInk: RGB = b.kind === 'objective' ? lift(p.ink, 0.3) : lift(tint, 0.25);
+    // A reward headline used to be painted solid accent, which put a 34 px
+    // block of amber on screen at the exact moment the amber score popup and
+    // the amber tile flare also fired — three clusters of the same hue for one
+    // event. The headline is now near-white for every kind except an outright
+    // warning; the rules, the end caps and the glow carry the semantic.
+    const titleInk: RGB = b.kind === 'warn' ? lift(tint, 0.25) : lift(p.ink, 0.3);
     text(c, b.title, cx, cy, {
       ...titleOpts,
       color: rgba(titleInk, 1),

@@ -165,7 +165,7 @@ const BARRELS: AttachmentEntry[] = [
     id: 'barrel_short', name: 'Short Barrel', slot: 'barrel', classes: LONG_GUNS, minRank: 11,
     mesh: null,
     mods: [
-      m('adsTime', 0.90), m('moveScale', 1.03), m('sprintOut', 0.92), m('hipSpread', 0.95),
+      m('adsTime', 0.90), m('moveScale', 1.02), m('sprintOut', 0.92), m('hipSpread', 0.95),
       m('falloffRange', 0.86), m('muzzleVelocity', 0.93), m('recoilVertical', 1.08),
     ],
     pros: ['Fastest handling barrel', 'Tighter hipfire'],
@@ -305,7 +305,7 @@ const STOCKS: AttachmentEntry[] = [
     id: 'stock_light', name: 'Skeleton Stock', slot: 'stock', classes: ALL, minRank: 7,
     mesh: 'stock_light',
     mods: [
-      m('adsTime', 0.88), m('sprintOut', 0.86), m('moveScale', 1.04),
+      m('adsTime', 0.88), m('sprintOut', 0.86), m('moveScale', 1.03),
       m('recoilVertical', 1.14), m('sway', 1.10),
     ],
     pros: ['Faster everything'],
@@ -327,7 +327,7 @@ const STOCKS: AttachmentEntry[] = [
     id: 'stock_none', name: 'No Stock', slot: 'stock', classes: ['smg', 'assault', 'shotgun'], minRank: 32,
     mesh: 'stock_none',
     mods: [
-      m('adsTime', 0.80), m('sprintOut', 0.70), m('moveScale', 1.08), m('hipSpread', 0.90),
+      m('adsTime', 0.80), m('sprintOut', 0.70), m('moveScale', 1.05), m('hipSpread', 0.90),
       m('recoilVertical', 1.35), m('recoilHorizontal', 1.20), m('sway', 1.30), m('adsSpread', 1.10),
     ],
     pros: ['Best mobility in the game', 'Tighter hipfire'],

@@ -183,8 +183,8 @@ const D: Record<MatKey, MatDef> = {
    * Letting the exterior through is also what gives the threshold its
    * brightness step, and from outside it correctly turns the openings into the
    * dark holes a real facade has rather than pale grey plates. */
-  glass: { archetype: 'glass', surface: 'glass', fallback: 0xb6c8c8, opts: { scale: 1.6, opacity: 0.22 } },
-  glassDirty: { archetype: 'glass', surface: 'glass', fallback: 0x8d9a96, opts: { scale: 1.6, tint: 0x9fb0a8, saturation: 0.6, opacity: 0.34 } },
+  glass: { archetype: 'glass', surface: 'glass', fallback: 0xb6c8c8, opts: { scale: 1.6, opacity: 0.15 } },
+  glassDirty: { archetype: 'glass', surface: 'glass', fallback: 0x8d9a96, opts: { scale: 1.6, tint: 0x9fb0a8, saturation: 0.6, opacity: 0.26 } },
   canvasRed: { archetype: 'fabric', surface: 'fabric', fallback: 0x8c3a30, opts: { scale: 1.0, tint: 0x9c4638, saturation: 1.2, doubleSided: true } },
   canvasGreen: { archetype: 'fabric', surface: 'fabric', fallback: 0x3f5836, opts: { scale: 1.0, tint: 0x516b42, saturation: 1.0, doubleSided: true } },
   canvasCream: { archetype: 'fabric', surface: 'fabric', fallback: 0xa89c7e, opts: { scale: 1.0, tint: 0xc2b694, saturation: 0.7, doubleSided: true } },
@@ -233,10 +233,16 @@ const D: Record<MatKey, MatDef> = {
   },
   /* Backlit sign stock — also the "ink" on fly-posted hoardings, which is why
    * this must be dead in daylight: a glowing cyan poster in a warm 16:00 frame
-   * is the single loudest artificial note on the whole map. */
+   * is the single loudest artificial note on the whole map.
+   *
+   * The photocell only takes the *emission* away. What is left in a daylight
+   * frame is the albedo, and 0xc6d6e0 is a cold pale blue — so an unlit sign
+   * panel still read as the one cold, high-key rectangle on a warm facade.
+   * Sign stock is off-white acrylic that has been in the weather: neutral,
+   * faintly warm, and a good deal darker than the render around it. */
   signGlow: {
-    archetype: 'plastic', surface: 'plastic', fallback: 0xcbd9e2, fixture: 'signage',
-    opts: { scale: 0.5, tint: 0xc6d6e0, saturation: 0.7, emissive: 0xbcd2de, emissiveIntensity: 0.22 },
+    archetype: 'plastic', surface: 'plastic', fallback: 0xb4b2ab, fixture: 'signage',
+    opts: { scale: 0.5, tint: 0xb2b0a8, saturation: 0.35, emissive: 0xbcd2de, emissiveIntensity: 0.22 },
   },
 
   /* ----------------------------------------------------------- backdrop

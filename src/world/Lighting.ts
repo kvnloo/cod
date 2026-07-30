@@ -35,7 +35,7 @@
 import * as THREE from 'three';
 import { settings } from '../core/Settings';
 import { Rand } from '../core/Rand';
-import { setPracticalNight, fixtureGain, type FixtureClass } from './MatCatalog';
+import { setPracticalNight } from './MatCatalog';
 
 export type PracticalKind = 'sodium' | 'bulb' | 'fire' | 'fluoro' | 'signage';
 
@@ -51,25 +51,27 @@ export interface Practical {
 }
 
 /**
- * A street lamp cannot be an omni light.
+ * Every slot is a `PointLight`, and that is not a simplification.
  *
- * The lens sits ~1.2 m off the facade and ~6 m above the road, so an omni
- * point light puts (6/1.2)² = 25× more energy on the wall than on the ground
- * under it. Turn it up far enough for the road to show a pool and the facade
- * behind has already clipped to white — which is exactly the "it glows but it
- * lights nothing" note. A real lamp has a hood: it is a downward cone with a
- * soft edge and a little spill on to the wall, so that is what it gets here.
- * Everything else (a bare bulb, a fire barrel, a sign box) really is omni.
+ * The obvious way to model a hooded street lamp is a downward `SpotLight`, and
+ * that is what this pool used to do. Measured on the real GPU, a `SpotLight` in
+ * this renderer contributes **exactly nothing**: with four lamps holding cone
+ * slots at intensity 60 the road under them read (13,16,23) — pure ambient —
+ * and multiplying the intensity by ten did not change a single pixel. Swapping
+ * the same practicals into point slots lit the whole square. Something in the
+ * MRT material injection drops three's spot loop, and that file belongs to the
+ * render module; until it does, a cone slot is a slot that throws nothing away
+ * in a night frame, which is precisely the "it glows but it lights nothing"
+ * note the critics filed.
+ *
+ * An omni light in the lens is also not as wrong as it looks. A lamp head is
+ * ~2.5 m out from the facade and 6 m up, so the wall takes about four times the
+ * road's irradiance — a bright patch on the render beside the column, which is
+ * what a real sodium lamp does. `KIND_DROP` sinks the emitter clear of its own
+ * hood so the fixture itself does not sit in its own 1/d² singularity.
  */
-type SlotKind = 'point' | 'spot';
-
-function slotKindFor(k: PracticalKind): SlotKind {
-  return k === 'sodium' ? 'spot' : 'point';
-}
-
 interface Slot {
-  kind: SlotKind;
-  light: THREE.PointLight | THREE.SpotLight;
+  light: THREE.PointLight;
   current: Practical | null;
   target: Practical | null;
   fade: number;
@@ -82,35 +84,90 @@ const FLICKER = new Float32Array(256);
   for (let i = 0; i < FLICKER.length; i++) FLICKER[i] = r.next();
 }
 
-/** Which fixture switch each practical kind follows. */
-const KIND_FIXTURE: Record<PracticalKind, FixtureClass> = {
-  sodium: 'street',
-  signage: 'signage',
-  bulb: 'interior',
-  fluoro: 'interior',
-  fire: 'ember',
-};
-
 /**
  * Per-kind gain on the authored intensity.
  *
  * The level authors a plausible *relative* brightness; this is where it is
  * calibrated against the renderer's absolute scale (perpendicular sun ≈ 16
- * units, full moon ≈ 0.2). A sodium lamp 6 m up at the authored 24 cd lands
- * 0.67 on the road below — against a night sky already reading ~0.25 of
- * ambient, which is a suggestion of a lamp rather than the hard elliptical
- * pool a real street light throws. 3.6× puts the centre of the pool about
- * five times ambient. That is only affordable because the lamps are cones:
- * as omni lights this much would have clipped the facade behind every column
- * long before the road showed anything.
+ * units, full moon ≈ 0.2). Calibrated by measurement, not by arithmetic: at
+ * 36× the road under a lamp came back at sRGB (176,128,77) against an unlit
+ * road at (27,31,40) — a floodlit square, not a street at night. 6× lands the
+ * centre of the pool around three stops over ambient, which is where a real
+ * sodium lamp sits, and keeps the render behind the column short of clipping.
  */
 const KIND_GAIN: Record<PracticalKind, number> = {
-  sodium: 3.6,
+  sodium: 6.0,
   signage: 1.5,
-  bulb: 1.25,
-  fluoro: 1.1,
+  bulb: 1.0,
+  fluoro: 0.9,
   fire: 1.15,
 };
+
+/**
+ * How much of its peak a practical's *light* still throws in full daylight.
+ *
+ * This is deliberately not `DAY_FLOOR` from the material catalogue. That table
+ * answers "how bright does the fixture *look*", and a fire barrel at noon still
+ * shows a trace of orange in its throat (0.09) — but it does not *light* the
+ * tarmac around it, because 3 kW of burning pallet against 100 klx of sun is
+ * nothing. Running the pool off the material's floor is what let five ember
+ * lights hold half the slots in a noon frame while every shop interior on the
+ * square stayed a black hole: measured at 12:00, the whole pool was fires at
+ * intensity ~1 and not one interior practical was assigned.
+ */
+const KIND_LIGHT_FLOOR: Record<PracticalKind, number> = {
+  sodium: 0,
+  signage: 0,
+  /**
+   * Room lighting is on around the clock, but it is not *worth* much against
+   * the sun, and it is the one class that can be caught over-exposing in a
+   * daylight frame: the shop bulbs sit a metre or two behind their shopfronts,
+   * they cast no shadows, and at full strength the one on the east row washed
+   * its roller shutter from (164,142,109) to (224,195,132) — a lit panel on a
+   * sunlit facade, which is the note the critics filed against the windows.
+   * Just under half is enough to keep a room from being a black hole seen
+   * through its own opening while leaving it, correctly, darker than the
+   * street outside.
+   */
+  bulb: 0.45,
+  fluoro: 0.45,
+  fire: 0,
+};
+
+/**
+ * Metres to sink the emitter below the authored fixture position.
+ *
+ * The sodium practical is authored at the lens, which is sandwiched between the
+ * lens box and the hood 10 cm above it. An omni light there puts those two
+ * surfaces 0.1 m from a 150 cd source — six thousand units of irradiance, a
+ * white blob with a white bloom and no lamp inside it. Half a metre down is
+ * clear of both, is still inside the hood's shadow line as far as the eye is
+ * concerned, and biases the pool towards the road.
+ */
+const KIND_DROP: Record<PracticalKind, number> = {
+  sodium: 0.5, signage: 0, bulb: 0, fluoro: 0, fire: 0,
+};
+
+/**
+ * Largest share of the pool any one fixture kind may hold.
+ *
+ * Pure relevance ranking is wrong for lighting design. Street lamps are the
+ * brightest thing in a night frame and there are a dozen of them around the
+ * square, so an unconstrained ranking hands them *every* slot — measured: ten
+ * of ten at 23:00 — and the fire barrels and lit shop windows that give the
+ * frame its foreground and its depth all go out. Reserving shares keeps the
+ * three layers a night street needs: lamps down the road, a fire in the near
+ * ground, and light behind the windows.
+ */
+const KIND_SHARE: Record<PracticalKind, number> = {
+  sodium: 0.4, fire: 0.3, bulb: 0.7, fluoro: 0.5, signage: 0.2,
+};
+
+/** Daylight-aware gain for a practical's point light. */
+function lightGain(kind: PracticalKind, night: number): number {
+  const floor = KIND_LIGHT_FLOOR[kind];
+  return KIND_GAIN[kind] * (floor + (1 - floor) * night);
+}
 
 /**
  * Sun illuminance (in the sky module's units) at which the street lighting is
@@ -122,21 +179,6 @@ const KIND_GAIN: Record<PracticalKind, number> = {
 const NIGHT_FULL = 0.8;
 const NIGHT_NONE = 7.5;
 
-/** Half-angle of a street-lamp cone: ~17 m of road from a 6 m column. */
-const SPOT_ANGLE = 0.95;
-/** Soft enough that the pool has no visible rim on the tarmac. */
-const SPOT_PENUMBRA = 0.85;
-/**
- * Cone a spot slot opens up to when it is standing in for an omni fixture.
- *
- * In daylight there are no street lamps to place, and a cone-only slot sitting
- * idle would mean *fewer* lit interiors than before the lamps were switched
- * off. A bulb on a ceiling rose throws almost everything downwards anyway, so
- * a near-hemisphere with a fully soft edge is a fair stand-in and costs
- * nothing — the alternative is a bigger light count in every shader.
- */
-const OMNI_ANGLE = 1.5;
-
 export class PracticalLights {
   readonly practicals: Practical[] = [];
   private slots: Slot[] = [];
@@ -144,16 +186,32 @@ export class PracticalLights {
   private budget = 0;
   private time = 0;
   private scored: { p: Practical; score: number }[] = [];
+  /** Reused per-kind tally for the share caps — the update loop allocates nothing. */
+  private kindCount: Record<PracticalKind, number> =
+    { sodium: 0, signage: 0, bulb: 0, fluoro: 0, fire: 0 };
   private tmp = new THREE.Vector3();
   private lastCam = new THREE.Vector3(1e9, 1e9, 1e9);
   /** Live handle on the renderer's shared sun-illuminance uniform. */
   private sunUniform: { value: THREE.Color } | null = null;
   private sunProbeAt = -1;
   private night = 1;
+  private lastNight = 1;
 
   init(scene: THREE.Scene): void {
     this.scene = scene;
     this.setBudget(budgetForPreset());
+    // Introspection for the capture harness: "which practicals actually hold a
+    // slot right now, and how much are they throwing". Diagnosing "it glows but
+    // it lights nothing" from a screenshot alone costs a build per guess.
+    (globalThis as unknown as { __PRACTICALS__?: () => unknown }).__PRACTICALS__ = () => ({
+      night: this.night,
+      slots: this.slots.map((s) => ({
+        fade: +s.fade.toFixed(3),
+        i: +s.light.intensity.toFixed(2),
+        of: s.current ? s.current.kind : null,
+        at: s.current ? [s.current.x, s.current.y, s.current.z] : null,
+      })),
+    });
   }
 
   add(p: Practical): void { this.practicals.push(p); }
@@ -163,31 +221,16 @@ export class PracticalLights {
     if (n === this.budget || !this.scene) return;
     this.budget = n;
     for (const s of this.slots) {
-      if ((s.light as THREE.SpotLight).isSpotLight) (s.light as THREE.SpotLight).target.removeFromParent();
       s.light.removeFromParent();
       s.light.dispose();
     }
     this.slots.length = 0;
-    // Roughly two omni fixtures per hooded street lamp: the level has far more
-    // bulbs, barrels and sign boxes than it has lamp columns.
-    const spots = Math.max(1, Math.round(n * 0.35));
     for (let i = 0; i < n; i++) {
-      const kind: SlotKind = i < spots ? 'spot' : 'point';
-      let light: THREE.PointLight | THREE.SpotLight;
-      if (kind === 'spot') {
-        const spot = new THREE.SpotLight(0xffffff, 0, 10, SPOT_ANGLE, SPOT_PENUMBRA, 2);
-        // Straight down. The lens is horizontal glass under a hood, so the
-        // cone axis is vertical and the wall only ever sees the penumbra.
-        spot.target.position.set(0, -1, 0);
-        this.scene.add(spot.target);
-        light = spot;
-      } else {
-        light = new THREE.PointLight(0xffffff, 0, 10, 2);
-      }
-      light.name = `practical:${kind}:${i}`;
+      const light = new THREE.PointLight(0xffffff, 0, 10, 2);
+      light.name = `practical:${i}`;
       light.castShadow = false;
       this.scene.add(light);
-      this.slots.push({ kind, light, current: null, target: null, fade: 0, seed: i * 37 + 11 });
+      this.slots.push({ light, current: null, target: null, fade: 0, seed: i * 37 + 11 });
     }
   }
 
@@ -209,16 +252,22 @@ export class PracticalLights {
     // most of a second, during which the pool is still lighting the *old*
     // neighbourhood — which is exactly why a settled capture could come back
     // with lamps that glow but throw nothing.
+    // The photocell crossing dusk invalidates the whole pool the same way: every
+    // street lamp in the level suddenly outranks every interior. Cross-fading
+    // through that costs about a second, and none of the lights involved were
+    // contributing anything on either side of the switch, so it is a hard cut.
+    const swung = Math.abs(this.night - this.lastNight) > 0.15;
+    this.lastNight = this.night;
     const jumped = this.lastCam.distanceToSquared(cam) > 15 * 15;
     this.lastCam.copy(cam);
-    if (jumped) for (const s of this.slots) { s.target = null; s.current = null; s.fade = 0; }
+    if (jumped || swung) for (const s of this.slots) { s.target = null; s.current = null; s.fade = 0; }
 
     /* --- score every practical by relevance --------------------------- */
     this.scored.length = 0;
     for (const p of this.practicals) {
-      const gain = KIND_GAIN[p.kind] * fixtureGain(KIND_FIXTURE[p.kind], this.night);
-      // A switched-off lamp must not hold a slot: at 16:00 that is what frees
-      // the whole pool for the interiors.
+      const gain = lightGain(p.kind, this.night);
+      // A switched-off lamp — or a fire barrel at noon — must not hold a slot:
+      // at 16:00 that is what frees the whole pool for the interiors.
       if (gain < 0.02) continue;
       const dx = p.x - cam.x, dy = p.y - cam.y, dz = p.z - cam.z;
       const d2 = dx * dx + dy * dy + dz * dz;
@@ -233,70 +282,58 @@ export class PracticalLights {
     }
     this.scored.sort((a, b) => b.score - a.score);
 
-    /* --- sticky assignment with a cross-fade ---------------------------
-     * Relevance is one ranked list, but a practical can only go in a slot of
-     * its own type, so the walk fills each type until that type runs out. */
+    /* --- sticky assignment with a cross-fade --------------------------- */
+    const n = this.slots.length;
+    const held = this.kindCount;
+    for (const k in held) held[k as PracticalKind] = 0;
     const wanted = new Set<Practical>();
-    let freePoint = 0, freeSpot = 0;
-    for (const s of this.slots) (s.kind === 'spot' ? freeSpot++ : freePoint++);
-    for (const { p } of this.scored) {
-      if (slotKindFor(p.kind) === 'spot') {
-        if (freeSpot <= 0) continue;
-        freeSpot--;
-      } else if (freePoint > 0) {
-        freePoint--;
-      } else if (freeSpot > 0) {
-        freeSpot--;                     // cone slot standing in for an omni
-      } else continue;
+    for (let i = 0; i < this.scored.length && wanted.size < n; i++) {
+      const p = this.scored[i].p;
+      const cap = Math.max(1, Math.round(n * KIND_SHARE[p.kind]));
+      if (held[p.kind] >= cap) continue;
+      held[p.kind]++;
       wanted.add(p);
     }
 
+    // Drop first, *then* take stock of what is still held. Building the held
+    // set before the drop pass leaves a practical that was just released
+    // looking occupied for a frame, so a fixture that walked from one slot to
+    // another blinked out on the way.
+    for (const s of this.slots) if (s.target && !wanted.has(s.target)) s.target = null;
     const assigned = new Set<Practical>();
     for (const s of this.slots) if (s.target) assigned.add(s.target);
 
     for (const s of this.slots) {
-      if (s.target && !wanted.has(s.target)) { s.target = null; }
-    }
-    // Two global rounds. Everything is placed in a slot of its own type first,
-    // so the strongest omni fixtures get real point lights; only the overflow
-    // ends up in a cone standing in for one. Doing this per-slot instead would
-    // hand the nearest ceiling bulb to a cone and lose the wall and ceiling
-    // wash that is most of what makes a room read as a room.
-    for (let round = 0; round < 2; round++) {
-      for (const s of this.slots) {
-        if (round === 1 && s.kind !== 'spot') continue;
-        if (s.target) continue;
-        if (s.fade > 0.02) continue;    // still fading the previous one out
-        for (const p of wanted) {
-          if (assigned.has(p)) continue;
-          if (round === 0 && slotKindFor(p.kind) !== s.kind) continue;
-          s.target = p;
-          s.current = p;
-          assigned.add(p);
-          break;
-        }
+      if (s.target) continue;
+      // A slot whose fixture has just been switched off by the photocell is
+      // already throwing nothing, so there is nothing to cross-fade *out* of.
+      // Holding it for the full second the ramp takes is what blacked out every
+      // practical in the frame for a second when the hour crossed dusk.
+      if (s.current && lightGain(s.current.kind, this.night) < 0.02) s.fade = 0;
+      if (s.fade > 0.02) continue;      // still fading the previous one out
+      for (const p of wanted) {
+        if (assigned.has(p)) continue;
+        s.target = p;
+        s.current = p;
+        assigned.add(p);
+        break;
       }
     }
 
-    const k = 1 - Math.exp(-dt * 5.5);
+    // 8 rather than 5.5: the whole pool has to converge inside the 24 frames a
+    // capture settles for, or a shot comes back with the previous vantage's
+    // lights still half up.
+    const k = 1 - Math.exp(-dt * 8);
     for (const s of this.slots) {
       const to = s.target ? 1 : 0;
       s.fade += (to - s.fade) * k;
       const p = s.current;
       if (!p || s.fade < 0.004) { s.light.intensity = 0; continue; }
-      s.light.position.set(p.x, p.y, p.z);
+      s.light.position.set(p.x, p.y - KIND_DROP[p.kind], p.z);
       s.light.color.setHex(p.color);
       s.light.distance = p.radius;
-      if (s.kind === 'spot') {
-        const spot = s.light as THREE.SpotLight;
-        const hooded = slotKindFor(p.kind) === 'spot';
-        spot.angle = hooded ? SPOT_ANGLE : OMNI_ANGLE;
-        spot.penumbra = hooded ? SPOT_PENUMBRA : 1;
-        spot.target.position.set(p.x, p.y - 4, p.z);
-        spot.target.updateMatrixWorld();
-      }
-      const gain = KIND_GAIN[p.kind] * fixtureGain(KIND_FIXTURE[p.kind], this.night);
-      s.light.intensity = p.intensity * gain * s.fade * modulation(p, this.time, s.seed);
+      s.light.intensity = p.intensity * lightGain(p.kind, this.night)
+        * s.fade * modulation(p, this.time, s.seed);
     }
   }
 
@@ -336,12 +373,12 @@ export class PracticalLights {
 
   dispose(): void {
     for (const s of this.slots) {
-      if ((s.light as THREE.SpotLight).isSpotLight) (s.light as THREE.SpotLight).target.removeFromParent();
       s.light.removeFromParent();
       s.light.dispose();
     }
     this.slots.length = 0;
     this.budget = 0;
+    delete (globalThis as { __PRACTICALS__?: unknown }).__PRACTICALS__;
   }
 }
 

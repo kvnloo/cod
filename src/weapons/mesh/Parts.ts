@@ -569,11 +569,16 @@ export function handguard(ctx: BuildCtx): void {
 
   b.part('receiver');
 
-  // Support-hand anchor: two thirds of the way down the handguard, which is
-  // where a shooter's hand actually sits — far enough forward to control the
-  // muzzle, far enough back to clear the gas block.
+  // Support-hand anchor.
+  //
+  // A third of the way down the handguard, not two thirds. Further forward is
+  // the modern "C-clamp" and it is what a shooter actually does — but on a
+  // first-person camera it puts the hand 12 cm further from the eye, where it
+  // subtends half the solid angle and disappears behind the receiver. Every
+  // shipped first-person rifle cheats the support hand back toward the magwell
+  // for exactly this reason.
   ctx.support = {
-    at: new THREE.Vector3(0, 0, z0 - len * 0.46),
+    at: new THREE.Vector3(0, 0, z0 - len * 0.32),
     axis: new THREE.Vector3(0, 0, -1),
     radius: R * 1.02,
     node: 'receiver',

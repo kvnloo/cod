@@ -179,6 +179,49 @@ function townHall(chunk: Chunk): BlockResult {
       b.boxMinMax(cx - 0.28, baseY + 1.35, f.z1 - 0.34, cx + 0.28, springY - 0.2, f.z1 - 0.08, 1.0);
     }
   }
+  /* --- arcade piers: plinth, chamfered shaft, impost ---------------------
+   *
+   * Standing under the arcade, one pier is the nearest thing in frame and used
+   * to be a bare render plane meeting its return on a razor-sharp 90° arris —
+   * a metre and a half of unbroken flat value with no edge highlight anywhere
+   * on it. Real arcade piers are dressed: a splayed plinth, a shaft with its
+   * arrises chamfered off at about 8 cm (so a cart does not shatter the
+   * corner), and an impost band at springing. Three mouldings turn the pier
+   * from a card into something with a lit edge and two shadow lines. */
+  const pier = chunk.m('stone');
+  const pierTrim = chunk.m('stoneTrim');
+  const zf = f.z1 + 0.03;
+  const pRand = new Rand(2288);
+  for (let i = 0; i <= bays; i++) {
+    const cx = f.x0 + (pierW + span) * i + pierW * 0.5;
+    // Plinth: proud of the wall and splayed, so the pier has a foot.
+    pierTrim.chamferBox(cx, baseY + 0.29, zf + 0.06, pierW * 0.5 + 0.045, 0.29, 0.115, 0.055, 0.5);
+    // Shaft: the chamfer is the whole point — a 7 cm splay catches the sky and
+    // reads as an edge at any angle, which a mitred 90° corner never does.
+    pier.chamferBox(cx, (baseY + 0.58 + springY - 0.06) * 0.5, zf + 0.045,
+      pierW * 0.5 - 0.055, (springY - 0.06 - baseY - 0.58) * 0.5, 0.09, 0.075, 0.55);
+    // Impost band at springing, carried a little past the shaft.
+    pierTrim.chamferBox(cx, springY + 0.02, zf + 0.075, pierW * 0.5 + 0.05, 0.095, 0.13, 0.035, 0.4);
+    // Bill-poster boards, a stencilled number and old fixings: the flat panel
+    // between plinth and impost needs something on it at reading height.
+    if (pRand.bool(0.55)) {
+      const pl = chunk.m(pRand.bool() ? 'plywood' : 'plank');
+      pl.pushTRS(cx + pRand.range(-0.22, 0.22), baseY + pRand.range(1.15, 1.75), zf + 0.11,
+        0, 0, pRand.range(-0.05, 0.05));
+      pl.box(0, 0, 0, pRand.range(0.24, 0.38), pRand.range(0.3, 0.46), 0.012, 0.6);
+      pl.pop();
+    }
+    if (pRand.bool(0.5)) {
+      const cn = chunk.m('pipe');
+      const cy0 = baseY + 0.6, cy1 = springY - 0.2;
+      const cu = cx + (pRand.bool() ? 1 : -1) * (pierW * 0.5 - 0.16);
+      cn.boxMinMax(cu - 0.026, cy0, zf + 0.09, cu + 0.026, cy1, zf + 0.142, 0.4);
+      for (const cy of [cy0 + 0.5, (cy0 + cy1) * 0.5, cy1 - 0.4]) {
+        cn.box(cu, cy, zf + 0.075, 0.045, 0.022, 0.03, 0.2);
+      }
+    }
+  }
+
   // The terrace runs through the arcade so the hall floor and the terrace are
   // one continuous surface.
   chunk.m('stone').boxMinMax(f.x0 + 0.2, -0.4, f.z1 - 1.2, f.x1 - 0.2, baseY, f.z1 + 0.2, 1.1);
@@ -998,8 +1041,11 @@ function apartmentS(chunk: Chunk): BlockResult {
   archOpening(chunk, north, 'stone', f.x1 - passX, 4.0, 2.4, 4.45, 0.5, 9, 'stoneTrim');
   archOpening(chunk, south, 'stone', passX - f.x0, 4.0, 2.4, 4.45, 0.5, 9, 'stoneTrim');
 
-  const vault = chunk.m('stone');
-  const seg = 9;
+  const vault = chunk.m('stoneTrim');
+  // Fourteen ring courses rather than nine: at nine the soffit read as a row
+  // of joists, which is what put the passage's scale out as much as the block
+  // size did. Fourteen narrow voussoirs read as a turned barrel vault.
+  const seg = 14;
   for (let i = 0; i < seg; i++) {
     const a0 = Math.PI * (i / seg);
     const a1 = Math.PI * ((i + 1) / seg);
@@ -1009,28 +1055,33 @@ function apartmentS(chunk: Chunk): BlockResult {
     const cy = 2.4 + Math.sin(am) * (r + 0.14);
     const w = (Math.PI * r) / seg * 0.62;
     vault.pushTRS(cx, cy, (f.z0 + f.z1) * 0.5, 0, 0, am - Math.PI / 2);
-    vault.box(0, 0, 0, w, 0.14, (f.z1 - f.z0) * 0.5 - 0.4, 0.95);
+    vault.box(0, 0, 0, w, 0.14, (f.z1 - f.z0) * 0.5 - 0.4, 0.45);
     vault.pop();
   }
   // Passage side walls.
   //
-  // The masonry module here used to run at 2.2 m per texture repeat, which put
-  // roughly 80 × 30 cm blocks on a 4 m passage — three courses across the whole
-  // opening, and the single clearest scale error on the map. At 0.95 m the
-  // module is about 35 × 13 cm: small ashlar, which is what a carriage arch in
-  // a provincial apartment block is actually built from, and it gives the eye
-  // ten units across the passage to measure against.
+  // The masonry module.
+  //
+  // Every wall material in the catalogue is *triplanar*, so the per-mesh UV
+  // scale passed to the mesher is ignored and the block size comes entirely
+  // from the archetype's tile. `stone` lays 4 blocks × 7 courses over a 3.2 m
+  // tile — 80 × 46 cm units, so a 4 m passage read as five blocks across and
+  // was the clearest scale error on the map. `stoneTrim` is the same cut-stone
+  // archetype on a 1.4 m tile: 35 × 20 cm dressed ashlar, which is what a
+  // carriage arch is actually built from and gives the eye a dozen units
+  // across the opening to measure the passage against.
+  const ashlar = chunk.m('stoneTrim');
   for (const s of [-1, 1]) {
-    vault.boxMinMax(
+    ashlar.boxMinMax(
       passX + s * 2.0 - (s > 0 ? 0 : 0.35), -0.4, f.z0 + 0.35,
-      passX + s * 2.0 + (s > 0 ? 0.35 : 0), 2.6, f.z1 - 0.35, 0.95,
+      passX + s * 2.0 + (s > 0 ? 0.35 : 0), 2.6, f.z1 - 0.35, 0.4,
     );
     // String course at springing level and a chamfered wheel guard at the foot:
     // two more horizontals to read the passage's height against.
     const trim = chunk.m('stoneTrim');
     trim.boxMinMax(
       passX + s * 2.0 - (s > 0 ? 0.06 : 0.4), 2.52, f.z0 + 0.3,
-      passX + s * 2.0 + (s > 0 ? 0.4 : 0.06), 2.68, f.z1 - 0.3, 0.8,
+      passX + s * 2.0 + (s > 0 ? 0.4 : 0.06), 2.68, f.z1 - 0.3, 0.36,
     );
     trim.boxMinMax(
       passX + s * 2.0 - (s > 0 ? 0.02 : 0.44), 0.0, f.z0 + 0.3,

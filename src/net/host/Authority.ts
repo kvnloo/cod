@@ -356,12 +356,17 @@ export class AuthorityCore implements SimOps {
     }
 
     // 2. respawns — the authority's call, never the client's
-    const spawnRand = this.rand.at(tick, RNG_SALT.SPAWN);
+    //
+    // The stream is derived per *entity*, not shared across the loop. Sharing one
+    // stream made the spawn point depend on `state.players` iteration order, so
+    // two players respawning on the same tick swapped spawn points on a host that
+    // had imported its state from a checkpoint (sorted) versus one that had built
+    // it by admission (insertion order). Proved in tools/net-sim.mjs §1d.
     for (const slot of this.state.players.values()) {
       const e = state.entities.get(slot.entityId);
       if (!e) continue;
       if ((e.flags & ENTITY_FLAG.DEAD) !== 0 && e.respawnTick > 0 && tick >= e.respawnTick) {
-        this.sim.spawnPlayer?.(state, e, spawnRand);
+        this.sim.spawnPlayer?.(state, e, this.rand.at(tick, `${RNG_SALT.SPAWN}:${e.id}`));
         e.flags &= ~ENTITY_FLAG.DEAD;
         e.respawnTick = 0;
         this.emit('respawn', e.id, slot.clientId, e.px, e.py, e.pz, 0);
@@ -404,9 +409,13 @@ export class AuthorityCore implements SimOps {
     const src = this.state.entities.get(byEntityId);
     if (!this.config.friendlyFire && src && src.id !== t.id && src.team !== 0 && src.team === t.team) return false;
 
-    let remaining = amount;
+    // Health and armour replicate as integers (FIELD_SCALE 1), so the authority
+    // keeps them integral. Otherwise the host holds 88.6 and every client
+    // reconstructs 89 — a permanent, silent disagreement about who is alive.
+    // Any connecting hit does at least one point.
+    let remaining = Math.max(1, Math.round(amount));
     if (t.armor > 0) {
-      const absorbed = Math.min(t.armor, remaining * 0.5);
+      const absorbed = Math.min(t.armor, Math.floor(remaining * 0.5));
       t.armor -= absorbed;
       remaining -= absorbed;
     }
@@ -476,7 +485,14 @@ export class AuthorityCore implements SimOps {
   private createPlayerEntity(owner: ClientId, team: number): EntityState {
     const e = this.spawn(ENT.PLAYER, owner);
     e.team = team;
-    this.sim.spawnPlayer?.(this.state, e, this.rand.at(this.state.tick, RNG_SALT.SPAWN) as RandomStream);
+    // Salt with the entity id. `at()` re-seeds, so salting with the tick alone
+    // gave every player admitted on the same tick the *identical* spawn point —
+    // the whole lobby stacked on one spot at match start. Proved in
+    // tools/net-sim.mjs §1e.
+    this.sim.spawnPlayer?.(
+      this.state, e,
+      this.rand.at(this.state.tick, `${RNG_SALT.SPAWN}:${e.id}`) as RandomStream,
+    );
     return e;
   }
 

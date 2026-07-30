@@ -200,6 +200,8 @@ export interface ExposureSettings {
   brightAdapt: number;
   /** EV100 above which `brightAdapt` starts to apply. */
   brightPivot: number;
+  /** EV100 below which `darkAdapt` starts to apply. */
+  darkPivot: number;
   /** Metering weight for pixels on the far plane (sky). */
   skyWeight: number;
   /** Metering weight for distant geometry (backdrop, far haze). */
@@ -240,9 +242,22 @@ export class ExposureSystem {
     // relationship between times of day comes from `darkAdapt`.
     minEV: -8,
     maxEV: 16,
-    darkAdapt: 0.42,
-    brightAdapt: 0.72,
+    // 0.30 / 0.58 rather than 0.42 / 0.72. Measured across the time-of-day
+    // shots the old pair put midday and midnight 3.0 stops apart on the same
+    // tram roof; a real camera walking that cycle at a fixed key would see
+    // eleven. We cannot spend eleven — night has to stay playable — but three
+    // is what makes a day/night cycle read as a colour filter. Widening both
+    // ends buys roughly two more stops of separation while leaving the hero
+    // hour, whose EV100 sits between 0 and `brightPivot`, exactly where it is.
+    darkAdapt: 0.18,
+    brightAdapt: 0.58,
     brightPivot: 1.5,
+    // Golden hour on this level meters at EV100 ≈ −0.4: with the dark rolloff
+    // starting at 0 the hero hour was being *darkened* by the same knob meant
+    // to keep midnight dark, and the square lost a third of a stop. The dead
+    // band between the two pivots is where the whole playable range of the
+    // level's own time of day sits.
+    darkPivot: -0.9,
     skyWeight: 0.10,
     distantWeight: 0.35,
     lowCut: 0.26,
@@ -476,7 +491,7 @@ export class ExposureSystem {
     // opens up, so dusk reads warmer and a stop under noon and night reads as
     // night; above `brightPivot` it only partially stops down, so midday is
     // genuinely brighter than golden hour instead of metering to the same grey.
-    if (ev < 0) ev *= s.darkAdapt;
+    if (ev < s.darkPivot) ev = s.darkPivot + (ev - s.darkPivot) * s.darkAdapt;
     else if (ev > s.brightPivot) ev = s.brightPivot + (ev - s.brightPivot) * s.brightAdapt;
     ev = THREE.MathUtils.clamp(ev, s.minEV, s.maxEV);
     const effective = Math.pow(2, ev) * 12.5 / 100;

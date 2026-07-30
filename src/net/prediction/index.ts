@@ -33,6 +33,41 @@ export {
   type ClientPredictionOptions,
 } from './ClientPrediction';
 
+/* The seam between movement-space, authority-space and the wire. Bridge code
+ * must go through these; a raw button mask crossing a boundary is a bug that
+ * the type system cannot see. */
+export {
+  BUTTON_LAYOUT_HOST_EXT,
+  HOST_EXT_BUTTON_MASK,
+  TickSeqMap,
+  authoritativeUpdateFromEntity,
+  fromHostInput,
+  fromNetInput,
+  hostToPlayerButtons,
+  movementFlags,
+  movementStateFromEntity,
+  netToPlayerButtons,
+  playerToHostButtons,
+  playerToNetButtons,
+  toHostInput,
+  toNetInput,
+  writeEntityFromMovement,
+} from './HostBridge';
+
+/* The client's copy of the host tick clock. Stamping commands from the newest
+ * snapshot tick instead of this is a measurable source of mispredictions. */
+export {
+  TickEstimator,
+  type TickEstimatorOptions,
+} from './TickEstimator';
+
+/* The host's movement step: the identical state machine the client predicts. */
+export {
+  MovementStepper,
+  type MovementStepperOptions,
+  type MovementStepperStats,
+} from './MovementStepper';
+
 export {
   DEFAULT_RECONCILE_OPTIONS,
   createPredictionMetrics,

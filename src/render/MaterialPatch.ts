@@ -24,7 +24,7 @@ import type { RenderUniforms } from './RenderUniforms';
 
 export type MaterialKind = 'standard' | 'lit' | 'unlit' | 'raw';
 
-const PATCH_VERSION = 9;
+const PATCH_VERSION = 10;
 
 /**
  * Diagnostic: replaces the shaded colour with the sun-visibility term
@@ -145,6 +145,13 @@ uniform float boAmbientIntensity;
 uniform mat4 projectionMatrix;
 float boDbgShadow = 1.0;
 float boDbgLit = 0.0;
+
+/**
+ * Diffuse albedo of "the ground", used for the one-bounce fill below. Dusty
+ * asphalt/stone sits around 0.18-0.22 and is slightly warm; the exact number is
+ * not critical, the presence of the term is.
+ */
+const vec3 BO_GROUND_ALBEDO = vec3( 0.20, 0.175, 0.135 );
 `,
 ].join('\n');
 
@@ -211,8 +218,33 @@ const MAPS_REPLACE = /* glsl */ `
 
 	#if defined( STANDARD ) || defined( LAMBERT ) || defined( PHONG )
 
-		iblIrradiance += boShIrradiance( normalize( normal * mat3( viewMatrix ) ), boAmbientSH )
-		               * boAmbientTint * boAmbientIntensity;
+		vec3 boIndN = normalize( normal * mat3( viewMatrix ) );
+
+		// Sky fill, straight off the SH probe.
+		vec3 boIndirect = boShIrradiance( boIndN, boAmbientSH );
+
+		// Ground bounce.
+		//
+		// The SH probe is projected from the sky dome bake alone, so its lower
+		// hemisphere is empty. A wall on the shadow side of a building was
+		// therefore lit by the half of the sky it can see and by absolutely
+		// nothing else, which is why those walls fell away to a couple of per
+		// cent grey a few metres up; the underside of an awning, a balcony or a
+		// vehicle received nothing at all and read as a hole cut in the scene.
+		//
+		// Real streets do not work like that: in daylight the ground is the
+		// second brightest thing in the frame and throws a warm fill straight
+		// back up every vertical surface. One Lambert bounce is enough — the
+		// irradiance landing on the ground (sun, cosine-weighted by its
+		// elevation, plus the sky's own downward irradiance), reflected by a
+		// dusty street albedo, weighted by how much of the receiver's hemisphere
+		// lies below the horizon. Ground-facing-up surfaces get none of it, so
+		// this cannot flatten the cast shadows on the plaza.
+		vec3 boGroundIrr = boShIrradiance( vec3( 0.0, 1.0, 0.0 ), boAmbientSH )
+		                 + boSunColor * max( boSunDirWorld.y, 0.0 );
+		boIndirect += boGroundIrr * BO_GROUND_ALBEDO * max( 0.5 - 0.5 * boIndN.y, 0.0 );
+
+		iblIrradiance += boIndirect * boAmbientTint * boAmbientIntensity;
 
 	#endif
 

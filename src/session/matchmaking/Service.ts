@@ -379,12 +379,17 @@ export class MatchmakingService {
         const mean = bots.length ? bots.reduce((a, s) => a + (s.kind === 'bot' ? s.rating : 0), 0) / bots.length : 1500;
         opponents.push({ rating: mean, rd: 250, vol: 0.06, matches: 30, lastPlayed: now });
       }
+      // How much of this player's own team was human — a win beside five bots
+      // says far less about them than a win beside five people.
+      const ownTeam = roster.slots.filter((s) => s.team === h.team);
+      const ownHumans = ownTeam.filter((s) => s.kind === 'human').length;
       const delta = applyMatch(rec, opponents, {
         won: report.winningTeam === h.team,
         drawn: report.winningTeam < 0,
         combatScore: scoreOf.get(h.playerId) ?? 0,
         lobbyMeanScore: lobbyMean,
         durationSec: report.durationSec,
+        teamHumanFraction: ownTeam.length > 0 ? ownHumans / ownTeam.length : 1,
       }, now);
       this.emit('mm:rating:update', {
         playerId: h.playerId, before: delta.before, after: delta.after,

@@ -233,7 +233,11 @@ function quantise(e: EntityState): number[] {
     const f = ENTITY_FIELDS[i];
     const raw = (e as unknown as Record<string, number>)[f];
     const s = SCALES[i];
-    out[i] = s === 1 ? (raw | 0) : Math.round(raw * s);
+    // Round, never truncate: `|0` biases towards zero, so a host holding 88.6
+    // health would transmit 88 and the client would disagree with the authority
+    // by 0.6 forever. Integral fields are kept integral by the authority itself
+    // (see AuthorityCore.damage); rounding here is the belt to that braces.
+    out[i] = s === 1 ? Math.round(raw) : Math.round(raw * s);
   }
   return out;
 }

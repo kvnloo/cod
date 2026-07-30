@@ -561,7 +561,23 @@ const FRAG_PROLOGUE = /* glsl */ `
         vec3 bNrmT = texture2D(obBlendNrm, buv).xyz * 2.0 - 1.0;
       #endif
 
-      float bw = clamp(vColor.r, 0.0, 1.0);
+      // The mask arrives as a *per-vertex* value, so on a wall built from one
+      // quad it is bilinear at the corners but linear-per-triangle in the
+      // rasteriser: the gradient kinks along the shared diagonal and a smooth
+      // ramp draws that kink as a metres-long straight line — the X across a
+      // facade. Two octaves of world-space noise, at an amplitude larger than
+      // the kink, move the transition off the diagonal entirely and give the
+      // dirt boundary the ragged edge a real one has.
+      float bwv = clamp(vColor.r, 0.0, 1.0);
+      float bwN = obMNoiseN(obWPos * 1.35 + 12.3) * 0.55
+                + obMNoiseN(obWPos * 4.20 + 41.9) * 0.30
+                + obMNoiseN(obWPos * 12.5 + 77.1) * 0.15;
+      // Only the transition band is displaced: a mask of exactly 0 or 1 has to
+      // stay exact, or the second layer leaks onto surfaces that never asked
+      // for it. Inside the band the noise is larger than the crease, so the
+      // boundary follows the noise and there is no straight line left to read.
+      float bwEdge = smoothstep(0.015, 0.30, min(bwv, 1.0 - bwv));
+      float bw = clamp(bwv + (bwN - 0.5) * 0.62 * bwEdge, 0.0, 1.0);
       // Height-aware transition: whichever layer is physically taller wins,
       // so dirt settles into mortar lines instead of fading over them.
       float ha = obOrm.a * (1.0 - bw) + 1e-4;
@@ -570,6 +586,13 @@ const FRAG_PROLOGUE = /* glsl */ `
       float wa = max(ha - mx, 0.0);
       float wb = max(hb - mx, 0.0);
       float bt = wb / max(wa + wb, 1e-5);
+
+      // Dirt takes its hue from what it has settled on: neat, fully saturated
+      // ochre dirt dropped on grey paving reads as spilled paint, not grime.
+      float bLum = dot(bAlb.rgb, vec3(0.2126, 0.7152, 0.0722));
+      float aLum = max(dot(obAlb.rgb, vec3(0.2126, 0.7152, 0.0722)), 1e-3);
+      bAlb.rgb = mix(bAlb.rgb, vec3(bLum), 0.30);
+      bAlb.rgb *= mix(vec3(1.0), obAlb.rgb / aLum, 0.32);
 
       obAlb = mix(obAlb, bAlb, bt);
       obOrm = mix(obOrm, bOrm, bt);
@@ -689,6 +712,7 @@ const FRAG_PROLOGUE = /* glsl */ `
       // Everything below is gravity-driven, so it belongs only on surfaces
       // that actually face up. A wall gets none of it.
       float obUp = clamp(obWNrm.y * 2.4 - 0.7, 0.0, 1.0);
+
       if (obUp > 0.002 && obSurf.y + obSurf.z + obSurf.w > 0.001) {
         // Standing damp in the low, sheltered ground. Wet stone is both much
         // darker and much smoother, so this carries a stop and a half of value
@@ -725,19 +749,59 @@ const FRAG_PROLOGUE = /* glsl */ `
         obAlb.rgb *= mix(1.0, 0.30, obOil);
         obOrm.g = clamp(mix(obOrm.g, 0.18, obOil * 0.9), 0.03, 1.0);
 
-        // Rain-burnished metal. An up-facing steel surface outdoors loses its
-        // paint and its oxide film to weather and traffic, and what is left is
-        // a mirror that takes its colour from the sky — the thing the whole
-        // scene is currently missing.
-        if (obSurf.w > 0.001) {
-          // Long wavelength and a low threshold: a rail running face or a
-          // handrail top is continuously burnished, not polished in 60 cm
-          // patches.
-          float obWash = smoothstep(0.08, 0.48, obMNoiseN(obWPos * 0.55 + 7.9)) * obUp * obSurf.w;
-          obOrm.b = clamp(mix(obOrm.b, 1.0, obWash), 0.0, 1.0);
-          obOrm.g = clamp(mix(obOrm.g, 0.13, obWash * 0.9), 0.02, 1.0);
-          obAlb.rgb = mix(obAlb.rgb, mix(obAlb.rgb, vec3(0.62, 0.63, 0.66), 0.7), obWash);
-        }
+      }
+
+      /* ------------------------------------------------ slab-to-slab tone -- */
+      // A paving run is laid slab by slab out of different batches, polished by
+      // different amounts of traffic, and half of it has been lifted and relaid
+      // at some point. The base map cannot know any of that — it is the same
+      // tile from the player's boots to the end of the street — so the value
+      // spread a real pavement shows inside one frame has to be stamped here.
+      // The lattice is locked to the texture's own tile, so a step lands on a
+      // joint the map already draws instead of laying a second grid over it.
+      // This runs *after* the damp and traffic layers on purpose: those pin the
+      // roughness to one number over the whole wet area, and one number is
+      // exactly the thing that reads as a printed sheet rather than as stone.
+      if (obUp > 0.002 && obSurf.x > 0.001) {
+        vec2 obSc = floor(obWPos.xz * obTileScale + 0.017);
+        float obS0 = obHash1(dot(obSc, vec2(1.0, 137.0)) + 7.31);
+        float obS1 = obHash1(dot(obSc, vec2(53.0, 11.0)) + 91.7);
+        float obS2 = obHash1(dot(obSc, vec2(19.0, 71.0)) + 53.1);
+        // Hard cell edges alias badly once a cell is under a pixel, so the
+        // whole layer fades out with distance and lets the macro drift carry.
+        float obSw = obUp * obSurf.x * (1.0 - smoothstep(26.0, 62.0, obDist));
+        obAlb.rgb *= mix(1.0, mix(0.76, 1.20, obS0), obSw * 0.9);
+        obOrm.g = clamp(obOrm.g + (obS1 - 0.5) * 0.34 * obSw, 0.03, 1.0);
+        // One slab in six is a genuine replacement, a repair or a burnt one.
+        float obRe = step(0.83, obS2);
+        obAlb.rgb *= mix(1.0, mix(0.48, 1.32, obS1), obRe * obSw);
+        obOrm.g = clamp(mix(obOrm.g, mix(0.24, 0.98, obS1), obRe * obSw * 0.75), 0.03, 1.0);
+      }
+
+      /* --------------------------------------------- rain-burnished metal -- */
+      // Steel left outdoors loses its paint and its oxide film to weather,
+      // traffic and hands, and what is left is a blurry mirror that takes its
+      // colour from the sky. This is the single thing that separates "metal"
+      // from "grey card", so it must not be gated on an up-facing normal: a
+      // lamp column, a handrail and a tram flank are all vertical and all of
+      // them are rain-washed and hand-polished.
+      if (obSurf.w > 0.001) {
+        // Long wavelength and a low threshold: a rail running face or a
+        // handrail top is continuously burnished, not polished in 60 cm
+        // patches. Vertical faces get less of it, but never none.
+        float obWFace = mix(0.26, 1.0, obUp);
+        float obWash = smoothstep(0.06, 0.46, obMNoiseN(obWPos * 0.48 + 7.9)) * obWFace * obSurf.w;
+        // Rubbing wear on anything a hand or a sleeve reaches. Kept long and
+        // weak on vertical faces: a metre-scale, half-strength version of this
+        // turns a lamp column into a row of cyan blotches, because a 0.1-rough
+        // metal facing a blue sky is a mirror of a blue sky.
+        float obRub = smoothstep(0.34, 0.78, obMNoiseN(obWPos * vec3(0.38, 0.11, 0.38) + 19.3));
+        obWash = clamp(obWash + obRub * obSurf.w * 0.16 * (1.0 - obUp * 0.4), 0.0, 1.0);
+        obOrm.b = clamp(mix(obOrm.b, 1.0, obWash), 0.0, 1.0);
+        // Weathered steel is a *blurry* mirror. Below about 0.2 it starts
+        // returning the sky as a flat colour instead of as a sheen.
+        obOrm.g = clamp(mix(obOrm.g, mix(0.30, 0.14, obUp), obWash * 0.9), 0.02, 1.0);
+        obAlb.rgb = mix(obAlb.rgb, mix(obAlb.rgb, vec3(0.62, 0.63, 0.66), 0.62), obWash);
       }
 
       /* ------------------------------------------- ground contact band --- */

@@ -63,7 +63,7 @@ export function weaponTexelScale(key: MaterialKey): number {
  *
  * Kept well under 1 deliberately — see the note in `get()`.
  */
-export const WEAPON_ENV_INTENSITY = 0.5;
+export const WEAPON_ENV_INTENSITY = 0.34;
 
 /* ----------------------------------------------------------- shared GLSL */
 
@@ -238,17 +238,21 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
   col = mix(col, obRGB(60, 61, 62), ding * 0.45);
 
   o.albedo = col;
-  o.metal = 0.96;
+  // Parkerising is a *porous conversion coating* over steel, not bare steel.
+  // At 0.96 the receiver behaved like a polished mirror under the view-model
+  // key and threw a single blown highlight down its whole length, which is
+  // what made the rifle the brightest object in a dim room.
+  o.metal = 0.86;
   // Parkerising is matte but not chalky; 0.78 killed every highlight the
   // three-point rig could have put on the receiver. Kept smooth at fine
   // scales for the reason spelled out in the aluminium recipe.
-  float rough = 0.64 + (form - 0.5) * 0.12;
-  rough = mix(rough, 0.70, worn * 0.30);
-  rough -= bare * 0.22;
-  // Floor of 0.44: below that a 96%-metal surface starts resolving the
-  // environment cube per texel, and a parkerised receiver ends up wearing the
-  // sky as blue-and-white speckle.
-  o.rough = clamp(rough, 0.44, 0.88);
+  float rough = 0.68 + (form - 0.5) * 0.12;
+  rough = mix(rough, 0.74, worn * 0.30);
+  rough -= bare * 0.20;
+  // Floor of 0.54: below that the specular lobe narrows enough to clip to
+  // white on a barrel-sized cylinder, and the gun reads as bone rather than
+  // as steel.
+  o.rough = clamp(rough, 0.54, 0.90);
 }`,
 };
 
@@ -305,11 +309,14 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
   col = mix(col, obRGB(66, 68, 72), ding * 0.5);
 
   o.albedo = col;
-  o.metal = 1.0;
-  float rough = 0.34 + (form - 0.5) * 0.08;
-  rough = mix(rough, 0.46, worn * 0.4);
+  o.metal = 0.94;
+  // A blued barrel is the longest single cylinder in the frame, so it is the
+  // part most able to catch one enormous specular streak. Held above 0.38 the
+  // streak stays a soft sheen instead of a white stripe.
+  float rough = 0.42 + (form - 0.5) * 0.08;
+  rough = mix(rough, 0.52, worn * 0.4);
   rough -= bare * 0.12;
-  o.rough = clamp(rough, 0.28, 0.70);
+  o.rough = clamp(rough, 0.38, 0.74);
 }`,
 };
 
@@ -459,13 +466,13 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
   float grime = obSat(d.cavity * 0.18 + (1.0 - d.ao) * 1.0);
   col = mix(col, obRGB(22, 22, 22), grime * 0.26);
   o.albedo = col;
-  o.metal = 0.92;
+  o.metal = 0.84;
   // Roughness is the one channel that must stay smooth. A metal's appearance
   // *is* the environment probe, and per-texel roughness picks a different mip
   // of that probe for every texel — which is how a bead-blasted receiver ends
   // up wearing the colours of the room as speckled camouflage. Variation here
   // is macro (the 8-cycle form field) plus the scratches, and nothing finer.
-  o.rough = clamp(0.52 + (form - 0.5) * 0.10 - bare * 0.34, 0.34, 0.80);
+  o.rough = clamp(0.58 + (form - 0.5) * 0.10 - bare * 0.30, 0.46, 0.84);
 }`,
 };
 
@@ -580,19 +587,19 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
 
   // Black leather is never actually black: it is a very dark warm brown that
   // lifts on every raised pebble because that is where the light lands.
-  vec3 base = obRGB(50, 46, 43);
-  base = mix(base, obRGB(78, 72, 65), obSat(pebble * 1.25 - 0.10) * 0.75);
-  base = mix(base, obRGB(35, 32, 31), obSat(1.0 - pebble * 1.6) * 0.55);
-  base = mix(base, obRGB(62, 58, 53), obSat(form * 1.1 - 0.30) * 0.40);
+  vec3 base = obRGB(31, 29, 28);
+  base = mix(base, obRGB(52, 48, 44), obSat(pebble * 1.25 - 0.10) * 0.75);
+  base = mix(base, obRGB(22, 20, 20), obSat(1.0 - pebble * 1.6) * 0.55);
+  base = mix(base, obRGB(40, 37, 34), obSat(form * 1.1 - 0.30) * 0.40);
 
   // Creases go dark and dusty; the seam thread is a lighter grey.
-  vec3 col = mix(base, obRGB(21, 19, 18), obSat(crease * 1.2) * 0.55);
-  col = mix(col, obRGB(88, 84, 77), obSat(seam * 1.4) * 0.42);
-  col = mix(col, obRGB(48, 46, 45), obSat(weave - 0.55) * 0.30);
+  vec3 col = mix(base, obRGB(13, 12, 12), obSat(crease * 1.2) * 0.55);
+  col = mix(col, obRGB(60, 57, 52), obSat(seam * 1.4) * 0.42);
+  col = mix(col, obRGB(31, 30, 29), obSat(weave - 0.55) * 0.30);
 
   // Dust and concrete rub, by cavity — a glove that has been on the ground.
   float grime = obSat(d.cavity * 0.9 + (1.0 - d.ao) * 0.7);
-  col = mix(col, obRGB(70, 65, 57), grime * 0.24);
+  col = mix(col, obRGB(48, 44, 38), grime * 0.24);
 
   o.albedo = col;
   o.metal = 0.0;
@@ -791,7 +798,7 @@ const FALLBACK: Record<MaterialKey, { color: number; rough: number; metal: numbe
   glass: { color: 0x0d1418, rough: 0.06, metal: 0.0 },
   lens: { color: 0x081418, rough: 0.03, metal: 0.0 },
   black: { color: 0x181819, rough: 0.62, metal: 0.18 },
-  glove: { color: 0x36322f, rough: 0.72, metal: 0.0 },
+  glove: { color: 0x201e1d, rough: 0.72, metal: 0.0 },
   gloveKnuckle: { color: 0x211f1f, rough: 0.66, metal: 0.0 },
   sleeve: { color: 0x504e45, rough: 0.92, metal: 0.0 },
 };
@@ -854,9 +861,9 @@ interface WearTune {
 
 const WEAR: Record<MaterialKey, WearTune> = {
   // Parkerising is thin and wears through on every handled corner.
-  phosphate: { edge: 0.62, edgeRough: 0.14, cavity: 0.34, cavityRough: 0.10, bare: 0xa9adb4, varAlbedo: 0.16, varRough: 0.10, edgeMetal: 0.08, normal: 0.80 },
-  blued: { edge: 0.50, edgeRough: 0.07, cavity: 0.32, cavityRough: 0.10, bare: 0x9fa4ad, varAlbedo: 0.14, varRough: 0.07, edgeMetal: 0.0, normal: 0.60 },
-  alu: { edge: 0.46, edgeRough: 0.09, cavity: 0.30, cavityRough: 0.10, bare: 0xa8acb2, varAlbedo: 0.14, varRough: 0.08, edgeMetal: 0.10, normal: 0.55 },
+  phosphate: { edge: 0.62, edgeRough: 0.14, cavity: 0.34, cavityRough: 0.10, bare: 0x94989f, varAlbedo: 0.16, varRough: 0.10, edgeMetal: 0.08, normal: 0.80 },
+  blued: { edge: 0.50, edgeRough: 0.07, cavity: 0.32, cavityRough: 0.10, bare: 0x8d929b, varAlbedo: 0.14, varRough: 0.07, edgeMetal: 0.0, normal: 0.60 },
+  alu: { edge: 0.46, edgeRough: 0.09, cavity: 0.30, cavityRough: 0.10, bare: 0x93979d, varAlbedo: 0.14, varRough: 0.08, edgeMetal: 0.10, normal: 0.55 },
   black: { edge: 0.15, edgeRough: 0.05, cavity: 0.34, cavityRough: 0.08, bare: 0x63666b, varAlbedo: 0.09, varRough: 0.05, edgeMetal: 0.03, normal: 0.35 },
   // Polymer does not go metallic; it stress-whitens and polishes.
   polymer: { edge: 0.30, edgeRough: 0.20, cavity: 0.32, cavityRough: 0.08, bare: 0x6e6f72, varAlbedo: 0.14, varRough: 0.12, edgeMetal: 0.0, normal: 1.0 },
@@ -867,7 +874,7 @@ const WEAR: Record<MaterialKey, WearTune> = {
   // Cloth and leather have no "bare metal" under them, but they *do* rub pale
   // on every proud fold and darken in every crease — the same two masks, spent
   // on a completely different look.
-  glove: { edge: 0.34, edgeRough: 0.22, cavity: 0.44, cavityRough: 0.06, bare: 0x4c4744, varAlbedo: 0.20, varRough: 0.14, edgeMetal: 0.0, normal: 1.0 },
+  glove: { edge: 0.34, edgeRough: 0.22, cavity: 0.44, cavityRough: 0.06, bare: 0x3a3633, varAlbedo: 0.20, varRough: 0.14, edgeMetal: 0.0, normal: 1.0 },
   gloveKnuckle: { edge: 0.26, edgeRough: 0.20, cavity: 0.42, cavityRough: 0.06, bare: 0x45464a, varAlbedo: 0.16, varRough: 0.12, edgeMetal: 0.0, normal: 1.0 },
   sleeve: { edge: 0.30, edgeRough: 0.10, cavity: 0.46, cavityRough: 0.04, bare: 0x8b877a, varAlbedo: 0.22, varRough: 0.10, edgeMetal: 0.0, normal: 1.0 },
   glass: { edge: 0, edgeRough: 0, cavity: 0, cavityRough: 0, bare: 0xffffff, varAlbedo: 0, varRough: 0, edgeMetal: 0, normal: 1.0 },

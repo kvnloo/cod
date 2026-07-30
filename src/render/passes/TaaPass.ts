@@ -39,7 +39,9 @@ uniform float uFar;
 uniform float uFeedbackMin;
 uniform float uFeedbackMax;
 uniform float uClipGamma;
+uniform float uClipRelax;
 uniform float uFilterAmount;
+uniform float uFilterSharpness;
 uniform float uStationaryGain;
 uniform float uReset;
 layout(location = 0) out vec4 fragColor;
@@ -133,7 +135,7 @@ void main() {
       nmin = min(nmin, c);
       nmax = max(nmax, c);
       vec2 o = d + uJitterPx;
-      float w = exp(-2.29 * dot(o, o));
+      float w = exp(-uFilterSharpness * dot(o, o));
       filtered += c * w;
       fw += w;
     }
@@ -151,8 +153,21 @@ void main() {
 
   vec3 mu = m1 / 9.0;
   vec3 sigma = sqrt(max(m2 / 9.0 - mu * mu, vec3(0.0)));
-  vec3 lo = max(mu - uClipGamma * sigma, nmin);
-  vec3 hi = min(mu + uClipGamma * sigma, nmax);
+
+  /* A 1-2 px cable against the sky is the pathological case for a hard
+     min/max clamp. Its true value is a *partial* coverage that no single
+     jittered frame ever contains: every frame the 3x3 neighbourhood is either
+     "sky" or "sky and cable", so nmin/nmax pin the accumulated history back on
+     to one of the two phases and the edge never converges. Where the pixel is
+     not moving, disocclusion rejection and the depth test already guard against
+     ghosting, so the box can be widened past the instantaneous neighbourhood
+     and let the history hold the sub-pixel value it has actually integrated. */
+  float speedPx = length(velocity);
+  float still = exp(-speedPx * speedPx * 0.75);
+  float relax = mix(1.0, uClipRelax, still);
+  vec3 pad = (nmax - nmin) * 0.5 * (relax - 1.0);
+  vec3 lo = max(mu - uClipGamma * relax * sigma, nmin - pad);
+  vec3 hi = min(mu + uClipGamma * relax * sigma, nmax + pad);
 
   /* --- history --------------------------------------------------------- */
   vec3 history = historyCatmullRom(prevUv);
@@ -177,7 +192,7 @@ void main() {
   }
 
   /* --- feedback weight -------------------------------------------------- */
-  float speed = length(velocity);
+  float speed = speedPx;
   float lumaDiff = abs(current.x - clipped.x) / max(max(current.x, clipped.x), 0.15);
   float dynamic = mix(uFeedbackMax, uFeedbackMin, lumaDiff * lumaDiff);
   /* The Playdead luminance-difference term exists to stop a fast mover dragging
@@ -187,7 +202,7 @@ void main() {
      where the longest accumulation is needed and the edge never converges.
      Gate it on velocity — static pixels keep the full history, movers keep the
      anti-ghosting. */
-  float stationary = exp(-speed * speed * 0.75) * uStationaryGain;
+  float stationary = still * uStationaryGain;
   float feedback = mix(dynamic, uFeedbackMax, stationary);
   feedback *= 1.0 - reject;
   // Long trails on fast movers are the classic ghost; shorten the history there.
@@ -327,6 +342,13 @@ export class TaaPass extends BasePass {
    * while a dozen other things are changing.
    */
   filterOverride = -1;
+  /**
+   * Gaussian falloff of the jittered-sample reconstruction, in 1/px². 2.29 is a
+   * σ of 0.47 px — narrow enough that the centre tap keeps 69% of the weight,
+   * which is why it barely touches a 1px cable. Lower = wider footprint = more
+   * partial coverage on sub-pixel geometry, at the cost of texture bite.
+   */
+  filterSharpness = 2.29;
   /** Micro-contrast recovered after the resolve; see SHARPEN_FRAG. */
   sharpenAmount = 0.16;
   /**
@@ -336,6 +358,13 @@ export class TaaPass extends BasePass {
    * effects start trailing.
    */
   stationaryGain = 1;
+  /**
+   * How far past the instantaneous 3x3 neighbourhood a *stationary* pixel's
+   * history may sit, as a multiple of the neighbourhood range. 1 = the classic
+   * hard clamp; above that, sub-pixel geometry is allowed to converge on a
+   * partial coverage no single jittered frame contains.
+   */
+  stationaryRelax = 1.7;
   private readonly projVec = new THREE.Vector4(1, 1, 0, 0);
 
   constructor(res: PostResources) {
@@ -366,7 +395,9 @@ export class TaaPass extends BasePass {
         uFeedbackMin: { value: 0.86 },
         uFeedbackMax: { value: 0.97 },
         uClipGamma: { value: 1.15 },
+        uClipRelax: { value: 1 },
         uFilterAmount: { value: 1 },
+        uFilterSharpness: { value: 2.29 },
         uStationaryGain: { value: 1 },
         uReset: { value: 1 },
       },
@@ -443,6 +474,8 @@ export class TaaPass extends BasePass {
     u.uFilterAmount.value = this.filterOverride >= 0
       ? this.filterOverride
       : (samples >= 8 ? 0.75 : (samples >= 4 ? 0.5 : 0));
+    u.uFilterSharpness.value = this.filterSharpness;
+    u.uClipRelax.value = Math.max(1, this.stationaryRelax);
     u.uReset.value = ctx.frame < 2 ? 1 : 0;
     u.uStationaryGain.value = this.stationaryGain;
 

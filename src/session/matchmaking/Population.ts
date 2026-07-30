@@ -99,6 +99,12 @@ export interface PopulationOptions {
   /** Fraction of the population in the high tail. */
   eliteFraction?: number;
   eliteOffset?: number;
+  /**
+   * Multiplier on how many matches each player wants this session. 1 models an
+   * evening's play (1–12 matches); raise it to let the rating system be
+   * observed converging over a career rather than a session.
+   */
+  appetiteScale?: number;
 }
 
 export function generatePopulation(
@@ -108,6 +114,7 @@ export function generatePopulation(
   const sigma = opts.skillSigma ?? 260;
   const eliteFraction = opts.eliteFraction ?? 0.07;
   const eliteOffset = opts.eliteOffset ?? 430;
+  const appetiteScale = opts.appetiteScale ?? 1;
 
   const out: SyntheticPlayer[] = [];
   for (let i = 0; i < n; i++) {
@@ -133,7 +140,7 @@ export function generatePopulation(
       connection: conn,
       latentSkill: latent,
       quitChance: clamp(rng.range(0.01, 0.09) + (elite ? 0.02 : 0), 0, 0.2),
-      appetite: rng.int(1, 12),
+      appetite: Math.max(1, Math.round(rng.int(1, 12) * appetiteScale)),
       partySize: size,
     });
   }

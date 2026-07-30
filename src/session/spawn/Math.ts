@@ -13,6 +13,24 @@ export function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
+/**
+ * Deterministic 0..1 hash of two integers.
+ *
+ * Tie-break jitter must be a *function of the candidate*, not the next value
+ * off a shared random stream: a stream makes a point's jitter depend on how
+ * many other points were scored before it, which means the cheap pass and the
+ * visibility pass disagree, a re-scored candidate moves, and the selector loses
+ * the score bound it needs to stop early. Same point + same request salt =
+ * same jitter, every time, on every peer.
+ */
+export function hash01(a: number, b: number): number {
+  let h = (Math.imul(a | 0, 0x27d4eb2d) ^ Math.imul(b | 0, 0x165667b1)) >>> 0;
+  h ^= h >>> 15;
+  h = Math.imul(h, 0x2545f491) >>> 0;
+  h ^= h >>> 13;
+  return (h >>> 8) / 0x1000000;
+}
+
 export function saturate(v: number): number {
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }

@@ -34,6 +34,10 @@ const GRAIN_FRAG = /* glsl */ `
 // the output dither, which is why every gradient read as clean CG.
 #define GRAIN_GAIN 0.080
 
+// Smallest fraction of the shadow grain amplitude that survives into the
+// highlights. See the response curve in main() for why this is not zero.
+#define GRAIN_FLOOR 0.45
+
 in vec2 vUv;
 uniform sampler2D tInput;
 uniform vec2 uTexel;
@@ -110,10 +114,24 @@ void main() {
              + (hash12(gl_FragCoord.xy + uFrame * 37.19) - 0.5) * 0.95;
     float g2 = n.z + n.w - 1.0;
     float lum = luma(color);
-    // Silver-halide response: grain is strongest in the mid-shadows and fades
-    // out of the highlights (visible grain in a bright sky is the wrong-looking
-    // version), with a small toe so crushed blacks are not lifted by it.
-    float response = pow(1.0 - lum, 1.3) * (0.55 + 0.45 * smoothstep(0.0, 0.12, lum));
+    // Silver-halide response: grain is strongest in the mid-shadows and falls
+    // off toward the highlights (heavy grain in a bright sky is the
+    // wrong-looking version), with a small toe so crushed blacks are not lifted
+    // by it.
+    //
+    // The falloff is to a *floor*, not to zero. A pure pow(1-lum) curve leaves
+    // roughly 0.07 levels of variate above 90% white, which is a fifth of the
+    // output dither: every sky gradient, every sunlit wall and every soft
+    // shadow ramp then reads as mathematically clean, and "clean gradient" is
+    // one of the loudest CG tells there is. Emulsion does not work that way —
+    // the grains are still there in the highlights, they are just less visible
+    // against a bright surround. GRAIN_FLOOR keeps about 1.5 levels of sigma in
+    // the brightest parts of the frame — enough that a sky gradient has a
+    // texture instead of being mathematically smooth — against about 2.5 in the
+    // shadows, so grain still reads as a shadow phenomenon at roughly 2:1; it
+    // just never reaches zero.
+    float response = mix(GRAIN_FLOOR, 1.0, pow(1.0 - lum, 1.3))
+                   * (0.55 + 0.45 * smoothstep(0.0, 0.12, lum));
     float amount = uGrain * response * uExposureScale;
     // Grain is overwhelmingly a luminance phenomenon. Giving R and B fully
     // decorrelated noise (which is what independent g1/g2 does) reads as

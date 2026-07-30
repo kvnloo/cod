@@ -9,8 +9,8 @@
 > DOM, not the engine — so they run unchanged in a browser, in a headless Node
 > authority, and in `tools/net-protocol.mjs`.
 >
-> Verify with `node tools/net-protocol.mjs` (82 assertions, prints the
-> bandwidth numbers quoted below).
+> Verify with `node tools/net-protocol.mjs` (100 assertions, prints the
+> bandwidth numbers quoted below and the cross-module drift alarms in §0.1).
 
 ---
 
@@ -40,16 +40,74 @@ out rather than hidden — closing these is the integration work.
 | Topic | This spec | As built | Recommendation |
 |---|---|---|---|
 | **Tick rate** | 60 Hz sim, 20 Hz snapshots (separate rates) | `DEFAULT_AUTHORITY_CONFIG.tickRate = 30`, sim **and** snapshots both 30 Hz | Split the two. 30 Hz sim means 33 ms of input granularity, which is felt in an FPS; 30 Hz snapshots for 16 players costs ~1.5 Mbps of peer uplink (§4). 60/20 costs 1.02 Mbps *and* halves input latency. |
-| **Protocol versioning** | `[MAGIC][VERSION]` on every datagram, `contentHash` in the handshake, clean reject | **absent** — no version byte, no handshake compatibility gate anywhere in `transport/` or `host/` | Highest-value integration. Two mismatched builds currently desync silently, which is exactly the failure this wave was told to prevent. Adopt `PROTOCOL_VERSION`, `checkCompatibility()` and `JsonCodec`'s framing into the existing codec. |
+| **Protocol versioning** | `[MAGIC][VERSION]` on every datagram, `contentHash` in the handshake, clean reject | **partly closed.** `PeerHost` now gates the join on `msg.v !== PROTOCOL_VERSION` and replies `reject`. But it reads a *second*, independently declared `PROTOCOL_VERSION` in `src/net/host/types.ts`, and there is still no `contentHash` gate and no magic byte on the datagram. | Two version constants is the drift trap itself. `src/net/host/types.ts` should become `export { PROTOCOL_VERSION } from '../Protocol';` — one line, additive. Until then §12 of `tools/net-protocol.mjs` fails the build if they ever disagree. `contentHash` still buys the case that matters more: same protocol version, different tuning constants, silent divergence. |
 | **`InputCommand`** | `{seq, clientTick, dtMs, moveX, moveZ, yaw, pitch, buttons, weaponSlot, fireCount}` | `host/types.ts`: `{tick, seq, moveX, moveZ, yaw, pitch, buttons}` | Converge on the as-built shape **plus** `fireCount` and `weaponSlot`. Without `fireCount` firing is level-triggered on a button bit, so a duplicated or reordered input packet can produce an extra bullet (§6 step 7). |
 | **Quantization** | `quantize*()` in `Protocol.ts`, fixed 16-bit ranges | `wire/Quantize.ts`, configurable bit ranges, smallest-three quats | **`wire/Quantize.ts` wins** — it is strictly more capable. Treat the `Protocol.ts` helpers as the reference/spec and the error bounds in `tools/net-protocol.mjs` §6 as the acceptance test. |
 | **Channels** | 5 logical (`control`/`input`/`state`/`event`/`bulk`) | 3 transport channels (`control`, `state`, `sys`) | Keep 3 DataChannels; treat the 5 as message *routing classes* that map onto them (§5). |
 | **Identity** | `ClientId` (number) everywhere | `PeerId` (string, transport) + `StableId` (string, identity) + `ClientId` (number, match slot) | The as-built three-way split is better and should win: transport address, persistent identity and compact slot really are different things. |
-| **Input sanitation** | `sanitizeInput()`, clamps every field, rejects NaN | not centralised | Adopt. It is a security boundary (§11), and it is tested. |
+| **Input sanitation** | `sanitizeInput()`, clamps every field, **rejects NaN outright** | **partly closed.** `host/Authority.ts` clamps `moveX`, `moveZ` and `pitch` inline, and `DefaultSim` clamps again. Neither rejects NaN, and `clamp(NaN, -1, 1)` is `NaN` in every implementation in this tree. | Adopt `sanitizeInput()` at the single point where a command enters the authority. A `NaN` that reaches the integrator poisons a position permanently and replicates to every client. It is a security boundary (§11), it is one call, and it is tested. |
 
 Nothing in `src/net/types.ts` or `src/net/Protocol.ts` imports anything, so
 adopting a piece of it is always additive and can never break what already
 runs. `npx tsc --noEmit` is clean across all of `src/net/`.
+
+### 0.1 The button mask — four definitions, three incompatible
+
+This is the sharpest divergence in the tree and the compiler cannot see it,
+because every button mask in this repo is a bare `number`.
+
+| Bit | `src/net/types.ts` `BUTTON` (**normative**) | `src/session/replay` `BTN` | `src/net/host/types.ts` `BTN` | `src/player/MoveCommand.ts` `BTN` |
+|---|---|---|---|---|
+| 0 | FIRE | fire | FIRE | JUMP |
+| 1 | ADS | ads | ADS | CROUCH |
+| 2 | JUMP | jump | JUMP | PRONE |
+| 3 | CROUCH | crouch | CROUCH | SPRINT |
+| 4 | PRONE | prone | **SPRINT** | ADS |
+| 5 | SPRINT | sprint | **RELOAD** | LEAN_L |
+| 6 | RELOAD | reload | **USE** | LEAN_R |
+| 7 | MELEE | melee | MELEE | **FIRE** |
+| 8 | USE | use | — | RELOAD |
+| 9–13 | GRENADE, TACTICAL, LEAN_LEFT, LEAN_RIGHT, SWITCH | same | — | MELEE, USE, GRENADE, TACTICAL, SWITCH |
+
+`session/replay` is bit-identical to the normative layout and says so in its own
+comment; it is fine. The other two are not, and they sit on either side of the
+prediction seam:
+
+- **`src/net/host/`** simulates with the HOST layout. `NetSystem.ts` builds its
+  command in that same layout, so today the host path is self-consistent.
+- **`src/net/prediction/AuthoritativeMovement.ts`** predicts with the PLAYER
+  layout, because it shares `src/player/Movement.ts`.
+
+Prediction's entire purpose is to run the same movement the host runs. The
+moment anyone wires `NetSystem`'s command into the shared movement sim — which
+is the obvious next integration step, and `NetSystem.predictor` is already the
+hole for it — bit 0 flips meaning: **firing predicts a jump, and jumping
+predicts a shot.** It will look like a physics bug, not a netcode bug.
+
+Because the contracts layer owns none of those three files, the resolution is
+declared here as data and enforced by test:
+
+```ts
+import { BUTTON_LAYOUT_NET, BUTTON_LAYOUT_HOST, BUTTON_LAYOUT_PLAYER,
+         remapButtons } from './net';
+
+// At any seam between two layouts. Never pass a raw mask across.
+cmd.buttons = remapButtons(netMask, BUTTON_LAYOUT_NET, BUTTON_LAYOUT_PLAYER);
+```
+
+`remapButtons` is allocation-free (14 iterations) and **drops** actions the
+target layout cannot express rather than inventing a bit — the host layout has
+no PRONE, and silently granting one would be acting on intent the player never
+sent. `buttonActions(mask, layout)` is the debug counterpart.
+
+`tools/net-protocol.mjs` §12 parses the three foreign `BTN` declarations out of
+their source text on every run and fails if any of them moves a bit away from
+the mirrors in `types.ts`. **If §12 fails, do not "fix" the test** — either
+update the mirror and this table deliberately, or revert the bit that moved.
+
+The long-term fix is one layout. Whoever owns `src/player/MoveCommand.ts` and
+`src/net/host/types.ts` should re-order both onto `BUTTON` and delete the
+bridge; it is a mechanical change, but it is not the contracts layer's to make.
 
 ---
 
@@ -565,9 +623,27 @@ Ownership:
 
 ```bash
 npx tsc --noEmit             # strict types
-node tools/net-protocol.mjs  # 82 assertions + the bandwidth table above
+node tools/net-protocol.mjs  # 100 assertions + the bandwidth table above
 ```
 
-The harness compiles `src/net/*` and `src/core/Rand.ts` standalone — proving
-the contracts really are dependency-free and really do run outside a browser,
-which is the whole premise of §2.
+The harness compiles `src/net/{types,Protocol,index}.ts` and `src/core/Rand.ts`
+standalone — proving the contracts really are dependency-free and really do run
+outside a browser, which is the whole premise of §2. Sections in order:
+
+| § | What it proves |
+|---|---|
+| 1–3 | codec round-trip for every message kind; datagram batching; version + malformed rejection |
+| 4–5 | 16-bit sequence arithmetic across the wrap; the ack window under seeded loss and reordering |
+| 6 | quantization error bounds (position, velocity, yaw, pitch) |
+| 7 | hostile input sanitation — NaN, infinities, out-of-range, wrong types |
+| 8–9 | message origin rules (client-originated vs host-originated); clock sync and prediction lead |
+| 10–11 | the bandwidth model and interest-management scaling quoted in §4 and §8 |
+| 12 | **cross-module drift alarms** — see §0.1 |
+
+§12 is the one that will fail first, and deliberately so: it reads the button
+masks, protocol version and channel names out of *other* agents' source files
+and fails if they drift from what the contracts mirror. Everything else in this
+harness tests code that cannot break, because nothing else imports it.
+
+The seeded RNG comes from `src/core/Rand.ts`; there is no `Math.random()`
+anywhere in the harness, so a failure reproduces exactly.

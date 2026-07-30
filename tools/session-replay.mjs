@@ -24,7 +24,9 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const OUT = path.join(ROOT, '.replay-build');
+// Scratch build lives under this agent's reserved dist dir, which .gitignore
+// already covers, so verifying never leaves an untracked directory behind.
+const OUT = path.join(ROOT, 'dist-s7', 'replay-build');
 
 const argv = process.argv.slice(2);
 const flag = (n, d = null) => {
@@ -65,7 +67,7 @@ export default defineConfig({
     target: 'node20',
     sourcemap: false,
     lib: {
-      entry: ${JSON.stringify(path.join(ROOT, 'src/session/replay/core.ts'))},
+      entry: ${JSON.stringify(path.join(ROOT, 'src/session/replay/index.ts'))},
       formats: ['es'],
       fileName: () => 'replay-core.mjs',
     },
@@ -87,9 +89,183 @@ const core = await import(pathToFileURL(entry).href);
 
 /* -------------------------------------------------------------------- run -- */
 
+/**
+ * Drives `ReplayService` the way a game actually would — record a match through
+ * the facade, die, watch the killcam, fall through to spectate, then open the
+ * whole thing in theater and round-trip it through a file. This is the layer
+ * a caller touches, so it gets exercised rather than merely compiled.
+ */
+function serviceCheck() {
+  const secs = 20;
+  const acts = 8;
+  const sd = seed ^ 0x5f5f;
+  const out = { ok: false, steps: [], reason: '' };
+  const step = (name, pass) => { out.steps.push({ name, pass }); return pass; };
+
+  const auth = core.offlineAuthority(0, 0);
+  const svc = new core.ReplayService(auth, {
+    ...core.theaterRecorderConfig(secs + 2, acts),
+    keyframeSeconds: 5, maxActors: acts, eventCapacity: 8192,
+  });
+  const sim = new core.ProbeSim(sd, acts);
+  const script = new core.ProbeScript(sim, sd);
+  svc.begin(sd, 'probe', 1);
+
+  const frames = [];
+  const ticks = Math.round(secs * core.TICK_HZ);
+  for (let t = 0; t < ticks; t++) {
+    svc.beforeStep(sim);
+    const n = script.frames(t, frames);
+    for (let i = 0; i < n; i++) { core.quantizeInPlace(frames[i]); svc.recordInput(frames[i]); }
+    sim.step(t, frames.slice(0, n));
+    svc.afterStep(sim);
+  }
+  svc.stop();
+
+  step('recorded through the facade', svc.state().bufferedSeconds > secs * 0.9);
+  step('host wrote keyframes', svc.recorder.keyframes.length >= 2);
+
+  // Find a death to show.
+  const ev = core.replayEvent();
+  let victim = -1;
+  for (let k = svc.recorder.events.length - 1; k >= 0; k--) {
+    if (svc.recorder.events.read(k, ev) && ev.kind === 'kill' && ev.a !== ev.b) { victim = ev.b; break; }
+  }
+  step('found a death to show', victim >= 0);
+
+  const shown = victim >= 0 && svc.showKillcam(victim);
+  step('killcam started', shown && svc.state().mode === 'killcam');
+
+  // Play it out; it must end itself and hand over to spectate.
+  let guard = 0;
+  let maxStep = 0;
+  let px = svc.pose.x, py = svc.pose.y, pz = svc.pose.z;
+  while (svc.state().mode === 'killcam' && guard++ < 6000) {
+    svc.update(1 / 60, null);
+    // The handover to spectate is a deliberate cut, so stop measuring at it;
+    // what is under test is continuity *within* the killcam.
+    if (svc.state().mode !== 'killcam') break;
+    const d = Math.hypot(svc.pose.x - px, svc.pose.y - py, svc.pose.z - pz);
+    if (d > maxStep) maxStep = d;
+    px = svc.pose.x; py = svc.pose.y; pz = svc.pose.z;
+  }
+  step('killcam camera stayed continuous', maxStep <= 0.6);
+  step('killcam handed over to spectate', svc.state().mode === 'spectate');
+
+  // Restrictions: free camera is a post-match privilege.
+  step('free camera refused while live', svc.state().canFree === false);
+  auth.endMatch();
+  svc.spectate();
+  step('free camera allowed after match', svc.state().canFree === true);
+
+  step('final killcam planned', svc.showFinalKillcam());
+  svc.skipKillcam();
+
+  // Theater over the live recording, then over a saved file.
+  const liveOk = svc.openTheaterLive();
+  const tsLive = svc.state().theater;
+  step('theater opened on the live recording', liveOk && !!tsLive && tsLive.duration > secs * 0.9);
+  if (tsLive) {
+    svc.theater.scrubFraction(0.5);
+    svc.update(1 / 60, null);
+    const mid = svc.theater.state().time;
+    step('theater scrubbed to the middle', Math.abs(mid - tsLive.duration / 2) < 1);
+  }
+  svc.closeTheater();
+
+  const file = svc.save('service');
+  const decoded = core.decodeReplay(file);
+  step('saved replay decodes', decoded.ok);
+  const openOk = svc.openTheater(file);
+  const ts = svc.state().theater;
+  step('theater opened the saved file', openOk && !!ts && ts.bookmarkCount > 0);
+  step('actors visible in theater', (() => {
+    svc.theater.scrubFraction(0.5);
+    const buf = [];
+    return svc.actorsNow(buf) > 0;
+  })());
+  svc.closeTheater();
+  step('returned to live', svc.state().mode === 'live');
+
+  out.ok = out.steps.every((s) => s.pass);
+  return out;
+}
+
+/**
+ * A killcam ring is sized in *seconds*, not in match length. Run a match four
+ * times longer than the ring and prove the resident cost is identical at the
+ * end to what it was once the ring first filled — and that a killcam can still
+ * be planned from the tail after the head has been overwritten many times.
+ */
+function boundedCheck() {
+  const acts = 8;
+  const ringSeconds = 30;
+  const matchSeconds = 120;
+  const sd = seed ^ 0x1234;
+
+  const svc = new core.ReplayService(core.offlineAuthority(0, 0), {
+    ...core.defaultRecorderConfig(),
+    inputSeconds: ringSeconds, snapshotSeconds: ringSeconds,
+    inputActors: acts, maxActors: acts,
+  });
+  const sim = new core.ProbeSim(sd, acts);
+  const script = new core.ProbeScript(sim, sd);
+  svc.begin(sd, 'probe', 1);
+
+  const frames = [];
+  const ticks = Math.round(matchSeconds * core.TICK_HZ);
+  const atFill = Math.round(ringSeconds * core.TICK_HZ);
+  let bytesAtFill = 0;
+  for (let t = 0; t < ticks; t++) {
+    svc.beforeStep(sim);
+    const n = script.frames(t, frames);
+    for (let i = 0; i < n; i++) { core.quantizeInPlace(frames[i]); svc.recordInput(frames[i]); }
+    sim.step(t, frames.slice(0, n));
+    svc.afterStep(sim);
+    if (t === atFill) bytesAtFill = svc.recorder.stats().totalBytes;
+  }
+  const bytesAtEnd = svc.recorder.stats().totalBytes;
+  const win = svc.recorder.window();
+
+  // A killcam from the tail must still work after the head is long gone.
+  const ev = core.replayEvent();
+  let victim = -1;
+  for (let k = svc.recorder.events.length - 1; k >= 0; k--) {
+    if (svc.recorder.events.read(k, ev) && ev.kind === 'kill' && ev.a !== ev.b) { victim = ev.b; break; }
+  }
+  const killcamOk = victim >= 0 && svc.showKillcam(victim);
+
+  return {
+    ringSeconds, matchSeconds,
+    bytesAtFill, bytesAtEnd,
+    bounded: bytesAtFill > 0 && bytesAtFill === bytesAtEnd,
+    heldSeconds: win.seconds,
+    windowBounded: win.seconds <= ringSeconds + 1,
+    wrapped: svc.recorder.inputs.wrapped,
+    killcamOk,
+  };
+}
+
 const t0 = process.hrtime.bigint();
 const report = core.runVerification({ seed, actors, seconds, keyframes: [] });
 const wallMs = Number(process.hrtime.bigint() - t0) / 1e6;
+
+let service = { ok: false, steps: [], reason: '' };
+try { service = serviceCheck(); } catch (e) { service.reason = String(e && e.stack || e); }
+if (!service.ok) {
+  report.pass = false;
+  report.failures.push(`ReplayService: ${service.reason
+    || service.steps.filter((s) => !s.pass).map((s) => s.name).join(', ')}`);
+}
+report.service = service;
+
+let bounded = { bounded: false, reason: '' };
+try { bounded = boundedCheck(); } catch (e) { bounded.reason = String(e && e.stack || e); }
+if (!bounded.bounded || !bounded.windowBounded || !bounded.wrapped || !bounded.killcamOk) {
+  report.pass = false;
+  report.failures.push(`memory bound: ${bounded.reason || 'ring did not stay fixed'}`);
+}
+report.bounded = bounded;
 
 if (asJson) {
   process.stdout.write(JSON.stringify({ ...report, wallMs }, null, 2) + '\n');
@@ -189,6 +365,24 @@ console.log(`  loaded               ${ok(th.loaded)}  ${th.durationSec.toFixed(1
 console.log(`  bookmarks            ${th.bookmarks} (auto-generated from the event track)`);
 console.log(`  scrub                ${th.scrubSamples} positions sampled  [${ok(th.scrubActorsOk)}]`);
 console.log(`  reverse playback     ${ok(th.reverseOk)}`);
+console.log('');
+
+/* --- service ----------------------------------------------------------- */
+console.log('  REPLAY SERVICE (the facade a game drives)');
+for (const s of service.steps) console.log(`  ${pad(s.name, 38)}${ok(s.pass)}`);
+if (service.reason) console.log(`  threw: ${service.reason.split('\n')[0]}`);
+console.log('');
+
+/* --- bounded ----------------------------------------------------------- */
+const bd = report.bounded;
+console.log('  MEMORY IS BOUNDED, NOT LOGGED');
+console.log(`  ${bd.matchSeconds}s match through a ${bd.ringSeconds}s ring`);
+console.log(`  resident once full   ${kb(bd.bytesAtFill)}`);
+console.log(`  resident at the end  ${kb(bd.bytesAtEnd)}   [${ok(bd.bounded)}] `
+  + `${bd.bounded ? 'identical — the ring overwrote, it did not grow' : 'GREW'}`);
+console.log(`  history held         ${bd.heldSeconds.toFixed(1)}s  [${ok(bd.windowBounded)}]  `
+  + `input ring wrapped: ${bd.wrapped}`);
+console.log(`  killcam from tail    ${ok(bd.killcamOk)}  (head overwritten many times over)`);
 console.log('');
 
 console.log('  ' + '='.repeat(74));

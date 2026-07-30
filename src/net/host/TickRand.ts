@@ -29,8 +29,12 @@ export const RNG_SALT = {
  */
 export class TickRand implements RandomStream {
   private r = new Rand(1);
+  private seed: number;
 
-  constructor(private seed: number) { }
+  // NB: written as an explicit field + assignment rather than a TS parameter
+  // property, because the headless test runner strips types without emitting,
+  // and parameter properties need real emit.
+  constructor(seed: number) { this.seed = seed; }
 
   setSeed(seed: number): void { this.seed = seed; }
 

@@ -71,20 +71,29 @@ export class Vitals implements Widget {
     c.translate(-(1 - this.slide.value) * 28 * s * motion(), 0);
 
     /* ------------------------------------------------------ health ----- */
+    // Aiming *promotes* the two peripheral reads rather than merely sparing
+    // them: the health block grows about its bottom-left anchor by the same
+    // few per cent the ammunition readout grows about its bottom-right one, so
+    // the frame visibly simplifies toward the pair of numbers that matter.
+    c.save();
+    if (m.ads > 0.002) {
+      const k = 1 + Ease.outQuad(clamp01(m.ads)) * 0.07;
+      c.translate(0, d.h);
+      c.scale(k, k);
+      c.translate(0, -d.h);
+    }
     const barW = 258 * s;
     const barH = 8 * s;
     const barY = bottom - barH;
     const frac = m.healthBar.value;
-    // Healthy is *neutral*, not green and not amber. The previous ramp started
-    // bending toward warn at 100% and was already visibly orange at 62%, which
-    // put a large saturated block of the objective hue in the corner of every
-    // frame. Colour now arrives only once there is something to warn about:
-    // near-white above 55%, amber through the middle band, red below a third.
+    // Healthy is *neutral*, not green and not amber, and the ramp it falls down
+    // is the hostile one — a single warm hue (the accent) is reserved for the
+    // objective, so an orange middle band here read as a second objective
+    // marker parked in the corner of every frame. Near-white above 55 %,
+    // crossfading straight to red by 12 %.
     const col: RGB = frac > 0.55
       ? lift(p.ink, 0.25)
-      : frac > 0.3
-        ? mixRGB(p.warn, lift(p.ink, 0.25), clamp01((frac - 0.3) / 0.25))
-        : mixRGB(p.hostile, p.warn, clamp01(frac / 0.3));
+      : mixRGB(p.hostile, lift(p.ink, 0.25), clamp01((frac - 0.12) / 0.43));
 
     meter(c, left, barY, barW, barH, frac, col, {
       segments: 4, track: p.hair, glow: 8 * s, ghost: m.healthGhost,
@@ -122,6 +131,7 @@ export class Vitals implements Widget {
       color: rgba(m.regenerating ? p.good : p.inkDim, m.regenerating ? 0.95 : 0.75),
       shadow: Math.max(1, 1 * s), outline: 2 * s,
     });
+    c.restore();
 
     /* --------------------------------------------------- equipment ----- */
     if (idleAlpha > 0.01) {

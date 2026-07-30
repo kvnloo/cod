@@ -96,6 +96,13 @@ export interface InterpolatorOptions {
   rebaselineBehindMs: number;
   /** How recently a snapshot must have arrived for a rebaseline to be justified, ms. */
   freshnessMs: number;
+  /**
+   * Rate at which an accumulated clock bias is bled back out once the snapshot
+   * stream shows it is no longer needed, as a fraction of real time. Only ever
+   * applied in the direction that moves render time FORWARD, and never past the
+   * delay policy's own target, so it cannot reverse time or starve the buffer.
+   */
+  biasBleedRate: number;
   /** Internal dt clamp, ms. Protects against a backgrounded tab. */
   maxDtMs: number;
   extrapolation: ExtrapolationLimits;
@@ -114,6 +121,7 @@ export const DEFAULT_INTERPOLATOR_OPTIONS: Readonly<InterpolatorOptions> = {
   rebaselineAheadMs: 1_000,
   rebaselineBehindMs: 1_000,
   freshnessMs: 500,
+  biasBleedRate: 0.05,
   maxDtMs: 250,
   extrapolation: DEFAULT_EXTRAPOLATION,
   smoother: DEFAULT_SMOOTHER,
@@ -128,7 +136,16 @@ export interface InterpolatorStats {
   extrapolated: number;
   /** Frames with at least one entity pinned at an extrapolation cap. */
   stalledFrames: number;
-  /** Frames with nothing in the buffer at all. */
+  /**
+   * Frames before the first snapshot ever arrived. Expected: a connecting
+   * client renders nothing for a few frames. Not a fault.
+   */
+  cold: number;
+  /**
+   * Frames where the buffer held snapshots earlier and is now empty. This is a
+   * real fault (the buffer was reset, or every held snapshot aged out) and it
+   * means remote entities vanished. Should be 0 in a healthy session.
+   */
   starved: number;
   /** Frames render time fell behind the oldest held snapshot. */
   behind: number;
@@ -174,6 +191,19 @@ export class Interpolator {
 
   private delay = 0;
   private delayInit = false;
+  /**
+   * Correction for a clock that disagrees with the snapshot stream, ms.
+   *
+   * renderTime = serverNow - bias - delay.
+   *
+   * This is deliberately NOT folded into `delay`. `delay` is owned by the
+   * jitter policy and is continuously slewed towards what the buffer asks for;
+   * anything folded into it is dragged back out again within a second or two,
+   * which would undo a rebaseline and leave render time permanently past the
+   * newest snapshot (every frame extrapolating, every remote player frozen).
+   * The bias is a separate, persistent term that only a rebaseline moves.
+   */
+  private bias = 0;
   private renderTime = 0;
   private renderTimeInit = false;
   private lastServerNow = 0;
@@ -188,8 +218,11 @@ export class Interpolator {
 
   readonly stats: InterpolatorStats = {
     frames: 0, interpolated: 0, extrapolated: 0, stalledFrames: 0,
-    starved: 0, behind: 0, snaps: 0, rebaselines: 0,
+    cold: 0, starved: 0, behind: 0, snaps: 0, rebaselines: 0,
   };
+
+  /** True once any snapshot has ever reached the buffer. Splits cold from starved. */
+  private everFed = false;
 
   /** Scratch — this class must not allocate in the per-frame path. */
   private readonly scratchLinear = vec3();
@@ -221,7 +254,10 @@ export class Interpolator {
    */
   push(snapshot: Snapshot, arrivalMs: number): boolean {
     const ok = this.buffer.push(snapshot, arrivalMs);
-    if (ok) this.lastArrivalMs = Math.max(this.lastArrivalMs, arrivalMs);
+    if (ok) {
+      this.lastArrivalMs = Math.max(this.lastArrivalMs, arrivalMs);
+      this.everFed = true;
+    }
     return ok;
   }
 
@@ -251,9 +287,10 @@ export class Interpolator {
 
     // ---- catastrophic clock check ---------------------------------------
     let forcedSnap = this.applyRebaseline(serverNowMs, target);
+    this.bleedBias(dt);
 
     // ---- render time -----------------------------------------------------
-    let rt = serverNowMs - this.delay;
+    let rt = serverNowMs - this.bias - this.delay;
     if (this.renderTimeInit && rt < this.renderTime) rt = this.renderTime; // monotonic, always
     this.renderTime = rt;
     this.renderTimeInit = true;
@@ -269,7 +306,9 @@ export class Interpolator {
     const sample = this.buffer.sample(rt);
     switch (sample.kind) {
       case 'empty':
-        this.stats.starved++;
+        // Nothing to show. Distinguish "have not connected yet" from "we had
+        // data and lost it" — only the second is a bug worth alerting on.
+        if (this.everFed) this.stats.starved++; else this.stats.cold++;
         this.clearVisible();
         return;
       case 'interpolate':
@@ -315,6 +354,13 @@ export class Interpolator {
   /** Playout delay currently applied, ms. */
   get delayMs(): number { return this.delay; }
 
+  /**
+   * Standing correction between the clock and the snapshot stream, ms.
+   * Non-zero means a rebaseline has fired and the local clock still disagrees
+   * with the host. Useful as a net-debug readout; nothing should depend on it.
+   */
+  get clockBiasMs(): number { return this.bias; }
+
   /** Delay the buffer would like, ms — what `delayMs` is slewing towards. */
   get targetDelayMs(): number {
     return clamp(this.buffer.targetDelayMs, this.opts.minDelayMs, this.opts.maxDelayMs);
@@ -334,9 +380,13 @@ export class Interpolator {
     this.delayInit = false;
     this.renderTimeInit = false;
     this.delay = 0;
+    this.bias = 0;
     this.renderTime = 0;
     this.lastArrivalMs = Number.NEGATIVE_INFINITY;
     this.sourceEpoch = -1;
+    // A reset is a fresh connection as far as playout is concerned: the frames
+    // before the first new snapshot are cold, not starved.
+    this.everFed = false;
     this.epoch++;
   }
 
@@ -355,13 +405,13 @@ export class Interpolator {
     const oldest = this.buffer.oldest;
     if (!newest || !oldest) return false;
     const receiving = serverNowMs - this.lastArrivalMs < this.opts.freshnessMs;
-    const rt = serverNowMs - this.delay;
+    const rt = serverNowMs - this.bias - this.delay;
 
     if (receiving && rt - newest.snapshot.serverTimeMs > this.opts.rebaselineAheadMs) {
-      // Clock believes we are far in the future. Deepen the delay so render time
+      // Clock believes we are far in the future. Shift the bias so render time
       // lands just behind the newest snapshot. This moves render time BACKWARDS,
       // so it is an epoch change by definition.
-      this.delay = serverNowMs - (newest.snapshot.serverTimeMs - targetDelay * 0.5);
+      this.rebaseTo(serverNowMs, newest.snapshot.serverTimeMs - targetDelay * 0.5);
       this.renderTimeInit = false;
       this.epoch++;
       this.stats.rebaselines++;
@@ -370,11 +420,43 @@ export class Interpolator {
     if (oldest.snapshot.serverTimeMs - rt > this.opts.rebaselineBehindMs) {
       // Clock believes we are far in the past. Jumping FORWARD is monotonic-safe
       // and needs no epoch bump, but every entity still moves discontinuously.
-      this.delay = serverNowMs - oldest.snapshot.serverTimeMs;
+      // Land on the delay policy's own target rather than on the oldest held
+      // snapshot: landing on `oldest` would leave playout running a whole buffer
+      // span late for the rest of the match.
+      this.rebaseTo(serverNowMs, newest.snapshot.serverTimeMs - targetDelay);
       this.stats.rebaselines++;
       return true;
     }
     return false;
+  }
+
+  /**
+   * Move render time onto `targetRenderMs` by shifting the clock bias, leaving
+   * the jitter-driven playout delay untouched.
+   */
+  private rebaseTo(serverNowMs: number, targetRenderMs: number): void {
+    this.bias = serverNowMs - this.delay - targetRenderMs;
+  }
+
+  /**
+   * Give back an accumulated bias once the stream proves it is no longer
+   * needed — e.g. the NetClock has since slewed onto the true offset, so the
+   * bias we installed is now double-counting and render time is drifting
+   * further and further behind the newest snapshot.
+   *
+   * Only positive bias is bled, because bleeding it moves render time forward.
+   * A negative bias would have to move render time backwards, which is never
+   * allowed outside an epoch change. The step is additionally capped by how far
+   * render time is behind where the delay policy wants it, so this can neither
+   * overshoot nor eat the jitter buffer.
+   */
+  private bleedBias(dtMs: number): void {
+    if (this.bias <= 0 || dtMs <= 0) return;
+    const newest = this.buffer.newest;
+    if (!newest || !this.renderTimeInit) return;
+    const room = (newest.snapshot.serverTimeMs - this.delay) - this.renderTime;
+    if (!(room > 0)) return;
+    this.bias -= Math.min(this.bias, dtMs * this.opts.biasBleedRate, room);
   }
 
   private resolvePair(
@@ -393,9 +475,16 @@ export class Interpolator {
       const a = from === to ? b : from.index.get(b.id);
 
       if (!a) {
-        // Spawned between the two snapshots — there is no "from" to come from.
-        this.adoptState(track, b);
-        this.commit(track, b, true, fresh, 0, false, dtMs);
+        // Spawned between the two snapshots: there is no "from" to come from,
+        // so hold on `b` until the straddling pair advances past the spawn.
+        //
+        // `snapped` is an EDGE, not a state. Holding still for the rest of the
+        // interval is not a snap, and reporting it as one for every frame of a
+        // 50 ms span makes downstream trails, ribbons and one-shot spawn VFX
+        // retrigger 7 times. Only report the frame the position actually jumps.
+        const jumped = snapped || distance(b.position, track.out.position) > snapThreshold;
+        if (jumped) this.adoptState(track, b);
+        this.commit(track, b, jumped, fresh, 0, false, dtMs);
         continue;
       }
 

@@ -78,6 +78,13 @@ export interface LobbyHostOptions {
   catalog?: LobbyCatalog;
   /** Pass an existing registry to carry a party in from the main menu. */
   parties?: PartyRegistry;
+  /**
+   * Set by `LobbyHost.adopt`. A resumed lobby is the *same* room with a new
+   * authority, so it must not announce itself as a new one — a front end that
+   * treats `lobby:created` as "you are now in a new lobby" would tear its own
+   * screen down mid-migration.
+   */
+  resuming?: boolean;
 }
 
 export class LobbyHost {
@@ -142,9 +149,14 @@ export class LobbyHost {
 
     this.insert(opts.hostProfile ?? makeProfile(opts.hostId, 'Host'));
     this.parties.setLobbyCode(this.code);
-    this.emit('lobby:created', { id: this.id, code: this.code, hostId: this.hostId });
-    this.openVote();
-    this.publish();
+    // A resumed lobby throws all of this away a few lines later in `adopt` —
+    // announcing a new room, a new board and a new state here would only tell
+    // every listener a lie it has to un-hear.
+    if (!opts.resuming) {
+      this.emit('lobby:created', { id: this.id, code: this.code, hostId: this.hostId });
+      this.openVote();
+      this.publish();
+    }
   }
 
   /* ------------------------------------------------------------- reading -- */
@@ -745,8 +757,15 @@ export class LobbyHost {
         if (loading.length === 0 || loaded >= loading.length) { this.goLive(); break; }
         this.loadTimer -= dt;
         if (this.loadTimer <= 0) {
-          for (const m of loading) if (m.loadProgress < 1) this.remove(m.id, 'load-timeout');
-          if (this.humanCount() >= this.settings.minPlayers || this.memberCount > 0) this.goLive();
+          // Stragglers are dropped — but never the host. Evicting the authority
+          // from its own room leaves a lobby with a host and no members, which
+          // is the one state nothing downstream can recover from.
+          for (const m of loading) {
+            if (m.loadProgress >= 1) continue;
+            if (m.id === this.hostId) { m.loadProgress = 1; continue; }
+            this.remove(m.id, 'load-timeout');
+          }
+          if (this.memberCount > 0) this.goLive();
           else { this.setPhase('forming'); this.openVote(); }
         }
         break;
@@ -1037,6 +1056,12 @@ export class LobbyHost {
       catalog?: LobbyCatalog;
       /** Peer that went away; removed from the roster. */
       departed?: PlayerId | null;
+      /**
+       * The successor's own registry. Passing it keeps one party book on this
+       * machine — without it the resumed host and the surrounding session would
+       * each hold a copy and drift apart on the next invite.
+       */
+      parties?: PartyRegistry;
     },
   ): LobbyHost {
     const s = snapshot.state;
@@ -1050,9 +1075,12 @@ export class LobbyHost {
       id: s.id,
       emit: opts.emit,
       catalog: opts.catalog,
+      parties: opts.parties,
+      resuming: true,
     });
 
     host.parties.restore(snapshot.parties);
+    host.parties.setLobbyCode(s.code);
     host.matchIndex = snapshot.matchIndex;
     host.lastMapId = snapshot.lastMapId;
     host.lastResult = s.lastResult;

@@ -52,8 +52,11 @@ export class LoopbackNetwork {
   totalBytes = 0;
   totalDropped = 0;
 
-  constructor(seed = 0xc0ffee, public defaults: LinkConditions = PERFECT_LINK) {
+  defaults: LinkConditions;
+
+  constructor(seed = 0xc0ffee, defaults: LinkConditions = PERFECT_LINK) {
     this.rand = new Rand(seed);
+    this.defaults = defaults;
   }
 
   createPort(id: PeerId): Transport {
@@ -143,7 +146,13 @@ class LoopbackPort implements Transport {
   bytesSent = 0;
   bytesReceived = 0;
 
-  constructor(private net: LoopbackNetwork, readonly localId: PeerId) { }
+  private net: LoopbackNetwork;
+  readonly localId: PeerId;
+
+  constructor(net: LoopbackNetwork, localId: PeerId) {
+    this.net = net;
+    this.localId = localId;
+  }
 
   peers(): readonly PeerId[] { return this.connected; }
 

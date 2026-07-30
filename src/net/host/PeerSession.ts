@@ -106,6 +106,10 @@ export class PeerSession {
   private seq = 0;
   private tickRate: number;
   private everWelcomed = false;
+  /** stableId of the host that last welcomed us — "did the authority change?". */
+  private welcomedHost: StableId = '';
+  /** Peer we have sent a join to and not yet heard a welcome from. */
+  private pendingJoinPeer: PeerId | null = null;
 
   readonly counters = {
     snapshotsReceived: 0, inputsSent: 0, welcomes: 0, checkpoints: 0,
@@ -203,8 +207,15 @@ export class PeerSession {
       while (this.accumulator >= step) {
         this.accumulator -= step;
         this.queueCommand();
+        // Flush per queued command, not per call. `update` is driven from the
+        // engine's fixed step (120 Hz) while the tick rate is 30 Hz, so flushing
+        // once per call sent four identical input packets per tick — upstream
+        // bandwidth proportional to frame rate rather than tick rate, measured at
+        // 59/119/238 packets per second for a 60/120/240 Hz caller and 470 kbit/s
+        // up against a 59 kbit/s budget (docs/NETCODE.md §4). See
+        // tools/net-sim.mjs §9a.
+        this.flushInput();
       }
-      this.flushInput();
     }
     this.migration.update(nowMs);
   }
@@ -260,12 +271,19 @@ export class PeerSession {
         // re-handshake. Going through `noteHostAlive` here would fire `follow`
         // and start the join over again.
         this.migration.adoptHost(this.nowMs, msg.epoch, msg.hostStableId);
+        this.pendingJoinPeer = null;
+        // "Migrated" means the authority actually changed hands. A second
+        // welcome from the *same* host is a re-handshake, not a migration:
+        // reporting it as one would toast the player and reset their prediction
+        // for nothing.
+        const migrated = this.everWelcomed && msg.hostStableId !== this.welcomedHost;
+        this.everWelcomed = true;
+        this.welcomedHost = msg.hostStableId;
         this.sink.onWelcome?.({
           clientId: msg.clientId, epoch: msg.epoch, tick: msg.tick,
           tickRate: msg.tickRate, seed: msg.seed, hostStableId: msg.hostStableId,
-          migrated: this.everWelcomed,
+          migrated,
         });
-        this.everWelcomed = true;
         this.applySnapshot(msg.snapshot);
         this.report();
         return;
@@ -299,8 +317,21 @@ export class PeerSession {
       }
       case 'pong': {
         if (from !== this.hostPeerId) return;
-        // The host's unsolicited pong doubles as an RTT probe; bounce it back.
-        this.send(from, { t: 'ping', id: msg.id, clientMs: this.nowMs }, 'unreliable');
+        // The host's unsolicited pong (`clientMs === 0`, see PeerHost.maybePing)
+        // doubles as an RTT probe; bounce it back exactly once so the host can
+        // time the round trip.
+        //
+        // A pong that echoes a non-zero `clientMs` is the host *answering* that
+        // bounce. Replying to it again is what made ping/pong echo for ever:
+        // maybePing opened a fresh chain every second, no chain ever terminated,
+        // and the message rate grew by ~30/s for every second the match lasted —
+        // 157 050 keepalive messages and 62 % of all encoded bytes over a 30 s
+        // four-player match on a lossless link. Only packet loss broke a chain,
+        // so the better the connection the worse the flood. Measured in
+        // tools/net-sim.mjs §9b.
+        if (msg.clientMs === 0) {
+          this.send(from, { t: 'ping', id: msg.id, clientMs: this.nowMs || 1 }, 'unreliable');
+        }
         this.migration.noteHostAlive(this.nowMs, this.epoch, this.migration.hostStableId);
         return;
       }
@@ -320,6 +351,8 @@ export class PeerSession {
   }
 
   private onPeerLeave(peer: PeerId): void {
+    // Never wait on a join we sent to a peer that has since gone.
+    if (this.pendingJoinPeer === peer) this.pendingJoinPeer = null;
     const entry = this.roster.find((r) => r.peerId === peer);
     if (entry) this.migration.notePeerLost(entry.stableId, this.nowMs);
     if (peer === this.hostPeerId) {
@@ -359,6 +392,7 @@ export class PeerSession {
     };
     this.host = new PeerHost(options);
     this.host.start();
+    this.pendingJoinPeer = null;
     // Re-admit ourselves against our own authority: same stableId, so the same
     // slot, entity, score and team come straight back.
     this.clientId = this.host.core.admit(this.stableId, this.displayName, this.transport.localId, true);
@@ -367,6 +401,8 @@ export class PeerSession {
     this.hostPeerId = this.transport.localId;
     this.pendingCmds.length = 0;
     this.migration.setHosting(this.epoch, this.nowMs);
+    this.everWelcomed = true;
+    this.welcomedHost = this.stableId;
     this.sink.onWelcome?.({
       clientId: this.clientId, epoch: this.epoch, tick: this.host.tick,
       tickRate: this.host.tickRate, seed: this.host.state.seed,
@@ -382,6 +418,11 @@ export class PeerSession {
     const peer = this.peerIdFor(hostStableId);
     if (!peer) { this.sink.onDisconnect?.(`no route to new host ${hostStableId}`); return; }
     this.hostPeerId = peer;
+    // A join already in flight to this same peer is enough. Without this, a
+    // heartbeat that overtakes our welcome restarts the handshake, and the
+    // duplicate welcome resets client prediction mid-join for no reason. Joins
+    // go out on the reliable channel, so there is nothing to retry.
+    if (this.pendingJoinPeer === peer) { this.report(); return; }
     this.pendingCmds.length = 0;
     this.sendJoin(peer);
     this.report();
@@ -414,6 +455,7 @@ export class PeerSession {
   }
 
   private sendJoin(peer: PeerId): void {
+    this.pendingJoinPeer = peer;
     this.send(peer, {
       t: 'join', v: PROTOCOL_VERSION, stableId: this.stableId,
       name: this.displayName, epoch: this.epoch,

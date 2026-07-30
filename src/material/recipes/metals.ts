@@ -129,11 +129,15 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
   // blurry mirror. Anything above ~0.45 stops sampling the sky probe hard
   // enough to read as metal at all, which is why nothing in the level takes
   // its colour from the sky. Paint keeps a broad sheen for the same reason.
-  float rough = mix(0.34, 0.84, rustAmt);
-  rough = mix(rough, 0.56, paint);
-  rough = mix(rough, 0.22, scratch * (1.0 - rustAmt) * 0.8);
+  float rough = mix(0.30, 0.82, rustAmt);
+  // Coachwork paint is a clearcoat, not a matte wall. Even forty years old and
+  // chalked it holds a wide sky reflection; only where the chalk has really
+  // taken hold does it go dead. A flat 0.56 everywhere is exactly why a tram
+  // flank reads as painted card instead of a vehicle.
+  rough = mix(rough, mix(0.20, 0.62, chalk), paint);
+  rough = mix(rough, 0.18, scratch * (1.0 - rustAmt) * 0.8);
   rough += grime * 0.10;
-  o.rough = clamp(rough, 0.08, 1.0);
+  o.rough = clamp(rough, 0.07, 1.0);
 }`,
   },
 };
@@ -468,7 +472,9 @@ void obShadeFn(vec2 uv, vec4 h0, vec4 h1, ObDerived d, inout ObOut o) {
 
   o.albedo = col;
   o.metal = obSat((1.0 - paint) * (1.0 - rust));
-  o.rough = clamp(mix(0.30, 0.86, rust) * (1.0 - paint * 0.2) + paint * 0.22 + grime * 0.1, 0.10, 1.0);
+  // Painted pipework keeps an enamel sheen — a handrail people grab is the
+  // glossiest thing on a street, not the flattest.
+  o.rough = clamp(mix(0.26, 0.84, rust) * (1.0 - paint * 0.25) + paint * 0.18 + grime * 0.1, 0.10, 1.0);
 }`,
   },
 };

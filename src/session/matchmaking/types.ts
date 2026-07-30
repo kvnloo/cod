@@ -258,6 +258,8 @@ export type BackfillRefusal =
   | 'too-late'
   | 'blowout'
   | 'no-slot'
+  /** Candidate is past the absolute ping ceiling; the bot keeps the slot. */
+  | 'ping'
   | 'ranked'
   | 'match-unknown';
 
@@ -284,6 +286,13 @@ export interface WideningParams {
   crossRegionAfter: number;
   /** Seconds before empty slots may be filled with bots. */
   botFillAfter: number;
+  /**
+   * Fraction of the lobby that must still be human at the instant bots first
+   * arm. Decays to `minHumansToStart` by `hardTimeout`. 0 means "bots may take
+   * every free slot the moment they arm" — correct for private lobbies, wrong
+   * for a populated public playlist. See `humansRequired` in `Widening.ts`.
+   */
+  botFillFloor: number;
   /** Seconds after which we launch with whatever we have. */
   hardTimeout: number;
 }

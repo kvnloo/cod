@@ -39,9 +39,22 @@ export interface BackfillPolicy {
   maxScoreGapFraction: number;
   /** Seconds a vacated slot is held for the player who left. */
   graceAfterLeave: number;
-  /** Ping ceiling for a backfill candidate, in ms. Stricter than the queue's
-   *  ceiling because there is no time to renegotiate a host mid-match. */
+  /** Preferred ping ceiling for a backfill candidate, in ms. Candidates above
+   *  it are not refused — they are ranked below closer ones and only taken when
+   *  nothing better is on offer. See `hardMaxPing`. */
   maxPing: number;
+  /**
+   * Absolute ping ceiling. Above this the player genuinely cannot play and we
+   * leave the bot in place.
+   *
+   * The gap between the two matters more than either number. Treating `maxPing`
+   * as a hard refusal means a slot currently occupied by a *bot* gets withheld
+   * from a real human at 180 ms — trading a player who wants to play for a
+   * robot, on the grounds that the player's connection is mediocre. That is
+   * backwards: the bot's "connection" is perfect and its contribution is nil.
+   * So the preferred ceiling only sorts, and the hard ceiling refuses.
+   */
+  hardMaxPing: number;
 }
 
 export const DEFAULT_BACKFILL: BackfillPolicy = {
@@ -51,6 +64,7 @@ export const DEFAULT_BACKFILL: BackfillPolicy = {
   maxScoreGapFraction: 0.5,
   graceAfterLeave: 5,
   maxPing: 170,
+  hardMaxPing: 280,
 };
 
 /** Why a match will or will not take a backfill right now. */
@@ -197,9 +211,15 @@ export class BackfillManager {
       if (host) {
         for (const m of ticket.members) ping = Math.max(ping, effectiveRtt(m.connection, host.connection));
       }
-      if (ping > this.policy.maxPing) { this.count('no-slot'); continue; }
+      if (ping > this.policy.hardMaxPing) { this.count('ping'); continue; }
 
-      const cost = Math.abs(mean - ticket.skill) + ping * 1.5 + (now - e.roster.formedAt) * 0.05;
+      // Over the preferred ceiling is a heavy sort penalty, not a refusal: a
+      // closer match wins outright, but a laggy human still beats a bot.
+      const overshoot = Math.max(0, ping - this.policy.maxPing);
+      const cost = Math.abs(mean - ticket.skill)
+        + ping * 1.5
+        + overshoot * 12
+        + (now - e.roster.formedAt) * 0.05;
       if (cost < bestCost) { bestCost = cost; best = e.roster.matchId; }
     }
     if (!best) this.count('match-unknown');

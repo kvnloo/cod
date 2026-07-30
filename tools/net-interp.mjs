@@ -162,7 +162,7 @@ function peakTruthSpeed() {
 // 1 — clock synchronisation on an ASYMMETRIC link
 // ---------------------------------------------------------------------------
 function testClockAsymmetric() {
-  section('1. Clock sync, asymmetric link (4-timestamp NTP + minimum-RTT filter)');
+  section('1. Clock sync, asymmetric link (min one-way-delay / Marzullo filter)');
   const rand = new Rand(SEED ^ 0x51c0);
   const TRUE_OFFSET = 1_834_562.5;      // host clock is ~30 min ahead
   // 40 ms up / 20 ms down: the symmetry assumption is violated by 20 ms, which
@@ -208,11 +208,17 @@ function testClockAsymmetric() {
 
   check('locks within 1.0 s of the first ping', syncedAt >= 0 && syncedAt < 1000,
     `synced at ${syncedAt.toFixed(0)} ms`);
-  check('steady-state offset error <= 15 ms', maxSettled <= 15,
+  // The estimator cannot beat asymmetry/2 = 10 ms. Anything under 11 ms means
+  // the jitter has been filtered out entirely and only the bias remains.
+  check('offset error converges to the asymmetry floor (10 ms), not above it',
+    maxSettled <= 11,
     `max ${maxSettled.toFixed(2)} ms, mean ${meanSettled.toFixed(2)} ms ` +
     `(irreducible asymmetry bias = 10.00 ms)`);
   check('reported uncertainty bounds the true error', clock.uncertaintyMs >= maxSettled,
     `uncertainty ${clock.uncertaintyMs.toFixed(2)} ms >= error ${maxSettled.toFixed(2)} ms`);
+  check('the interval half-width is a real bound, and tighter than rtt/2',
+    clock.intervalHalfWidthMs >= maxSettled && clock.intervalHalfWidthMs <= clock.rttMs * 0.5 + 1e-9,
+    `half-width ${clock.intervalHalfWidthMs.toFixed(2)} ms, rtt/2 ${(clock.rttMs / 2).toFixed(2)} ms`);
   check('minimum RTT recovered (~60 ms)', Math.abs(clock.rttMs - 60) < 8,
     `rttMin ${clock.rttMs.toFixed(2)} ms, smoothed ${clock.smoothedRttMs.toFixed(2)} ms`);
   check('serverNowMs() monotonic over 4320 frames', mono);
@@ -251,8 +257,14 @@ function testClockSymmetric() {
   }
   const settled = errs.slice(Math.floor(errs.length * 0.5));
   const maxSettled = Math.max(...settled);
-  check('symmetric-link offset error <= 3 ms', maxSettled <= 3,
+  // Symmetric link => no irreducible bias, so the only error left is how close
+  // the per-leg minima got to the true one-way delay. Sub-millisecond.
+  check('symmetric-link offset error <= 1 ms', maxSettled <= 1,
     `max ${maxSettled.toFixed(3)} ms over ${settled.length} frames`);
+  check('symmetric-link uncertainty is honest (>= error, <= rtt/2)',
+    clock.uncertaintyMs >= maxSettled && clock.intervalHalfWidthMs <= clock.rttMs * 0.5 + 1e-9,
+    `uncertainty ${clock.uncertaintyMs.toFixed(2)} ms, half-width ` +
+    `${clock.intervalHalfWidthMs.toFixed(2)} ms, rtt/2 ${(clock.rttMs / 2).toFixed(2)} ms`);
 
   // Host-side identity clock.
   let t = 0;
@@ -623,7 +635,8 @@ for (const cfg of runs) {
   const s = r.stats;
   console.log(`\n  \x1b[36m${r.label}\x1b[0m`);
   console.log(`    frames ${s.frames}  interp ${s.interpolated}  extrap ${s.extrapolated}` +
-    `  starved ${s.starved}  behind ${s.behind}  snaps ${s.snaps}  rebaselines ${s.rebaselines}`);
+    `  cold ${s.cold}  starved ${s.starved}  behind ${s.behind}  snaps ${s.snaps}` +
+    `  rebaselines ${s.rebaselines}`);
   console.log(`    link  sent ${r.link.sentDown}  lost ${r.link.lostDown}  dup ${r.link.dupDown}` +
     `  reordered ${r.buffer.stats.reordered}  tickGaps ${r.buffer.stats.missing}` +
     `  dupRejected ${r.buffer.stats.rejected}`);
@@ -670,11 +683,189 @@ check('the extrapolation cap actually engaged',
   stall.stats.stalledFrames > 0, `${stall.stats.stalledFrames} capped frames`);
 check('recovery leaves no NaN', !stall.nanSeen);
 check('no starvation: the buffer still had snapshots to show',
-  stall.stats.starved === 0, `${stall.stats.starved} starved frames`);
+  stall.stats.starved === 0,
+  `${stall.stats.starved} starved frames (${stall.stats.cold} cold frames before ` +
+  `the first snapshot, which are not starvation)`);
+check('cold frames are bounded by the first snapshot arriving',
+  stall.stats.cold > 0 && stall.stats.cold < 60,
+  `${stall.stats.cold} frames rendered nothing at connect`);
 
 testExtrapolationCaps();
 testBuffer();
 testSlerp();
+
+// ---------------------------------------------------------------------------
+// 7 — entity lifecycle, clock discontinuity, determinism
+//
+// These drive the Interpolator directly on a clean, exactly-known link so the
+// assertions are about the interpolator's own bookkeeping rather than about
+// link statistics. Everything here was previously untested: spawn/despawn is
+// what interest management does at every PVS boundary, and the rebaseline path
+// is what runs after a host migration or a laptop lid closing.
+// ---------------------------------------------------------------------------
+
+/** A scripted 20 Hz host with three entities appearing and disappearing. */
+function lifecycleScenario(clockJumpMs = 0, jumpAtMs = -1) {
+  const interp = new Interpolator();
+  const TICK = 50;
+  const OWD = 30;              // one-way delay, host -> client
+  const DUR = 4_000;
+  const posOf = (id, tMs) => ({
+    x: id * 10 + Math.sin(tMs * 0.001 + id) * 2,
+    y: 1 + id,
+    z: id * -3 + tMs * 0.001,
+  });
+
+  // id 1 lives the whole time; id 2 despawns at 2000 ms; id 3 spawns at 1000 ms.
+  const alive = (id, tMs) =>
+    id === 1 ? true : id === 2 ? tMs < 2_000 : tMs >= 1_000;
+
+  let serverNow = 100_000;     // arbitrary server epoch
+  let nextTick = 0, tick = 0, applied = 0;
+  const pending = [];
+  const trace = [];
+  const seen = new Map();      // id -> { firstVisibleMs, lastVisibleMs, snaps, maxStep }
+  const last = new Map();
+  let maxVisible = 0, nan = false, backwards = 0, prevRt = -Infinity;
+  let epochBumps = 0, prevEpoch = interp.epoch;
+
+  for (let simMs = 0; simMs < DUR; simMs += 1000 / 144) {
+    if (clockJumpMs !== 0 && applied === 0 && simMs >= jumpAtMs && jumpAtMs >= 0) {
+      serverNow += clockJumpMs;
+      applied = 1;
+    }
+    serverNow += 1000 / 144;
+
+    while (simMs >= nextTick) {
+      const entities = [];
+      for (const id of [1, 2, 3]) {
+        if (!alive(id, nextTick)) continue;
+        entities.push({
+          id,
+          position: posOf(id, nextTick),
+          rotation: { x: 0, y: 0, z: 0, w: 1 },
+          teleport: 0,
+        });
+      }
+      // serverTimeMs is the tick's own time on the (unjumped) server timeline.
+      pending.push({
+        arriveAt: simMs + OWD,
+        snap: { tick, serverTimeMs: 100_000 + nextTick, entities },
+      });
+      tick++;
+      nextTick += TICK;
+    }
+    while (pending.length && pending[0].arriveAt <= simMs) {
+      const p = pending.shift();
+      interp.push(p.snap, serverNow);
+    }
+
+    interp.update(serverNow);
+    if (interp.epoch !== prevEpoch) { epochBumps++; prevEpoch = interp.epoch; }
+    const rt = interp.renderTimeMs;
+    if (rt < prevRt && epochBumps === 0) backwards++;
+    prevRt = rt;
+
+    maxVisible = Math.max(maxVisible, interp.transforms.size);
+    for (const id of [1, 2, 3]) {
+      const t = interp.get(id);
+      if (!t) continue;
+      if (!Number.isFinite(t.position.x + t.position.y + t.position.z)) nan = true;
+      let rec = seen.get(id);
+      if (!rec) { rec = { first: simMs, last: simMs, snaps: 0, maxStep: 0, firstPos: null }; seen.set(id, rec); }
+      if (rec.firstPos === null) rec.firstPos = { ...t.position };
+      rec.last = simMs;
+      if (t.snapped) rec.snaps++;
+      const l = last.get(id);
+      if (l) rec.maxStep = Math.max(rec.maxStep, distance(l, t.position));
+      last.set(id, { ...t.position });
+      trace.push(id, Math.round(t.position.x * 1e6), Math.round(t.position.y * 1e6),
+        Math.round(t.position.z * 1e6));
+    }
+  }
+  return { interp, seen, maxVisible, nan, backwards, epochBumps, trace, posOf, DUR };
+}
+
+section('7. Entity lifecycle (spawn / despawn / interest churn)');
+{
+  const r = lifecycleScenario();
+  const e1 = r.seen.get(1), e2 = r.seen.get(2), e3 = r.seen.get(3);
+  check('all three entities were rendered at some point',
+    !!e1 && !!e2 && !!e3, `visible ids ${[...r.seen.keys()].join(',')}`);
+  check('never renders more entities than the host sent', r.maxVisible === 3,
+    `peak ${r.maxVisible}`);
+  check('a persistent entity snaps exactly once, at first sight',
+    e1.snaps === 1, `${e1.snaps} snapped frames for id 1`);
+  check('a late spawn appears at its true position, it does not glide in',
+    distance(e3.firstPos, r.posOf(3, 1_000)) < 0.35,
+    `${distance(e3.firstPos, r.posOf(3, 1_000)).toFixed(3)} m from the spawn point`);
+  check('a late spawn snaps exactly once', e3.snaps === 1, `${e3.snaps} snapped frames for id 3`);
+  // Host stops sending id 2 at t=2000; the client is rendering ~playout delay
+  // in the past, so it should vanish shortly after 2000 + delay, not linger.
+  const vanishMs = e2.last;
+  check('a despawned entity is retired, and within one playout delay',
+    vanishMs > 2_000 && vanishMs < 2_000 + 400,
+    `id 2 last rendered at ${vanishMs.toFixed(0)} ms (host stopped at 2000 ms)`);
+  check('id 2 never reappears after retirement', !r.interp.get(2));
+  check('no entity teleports frame-to-frame during steady interpolation',
+    e1.maxStep < 0.2 && e3.maxStep < 0.2,
+    `worst per-frame step ${Math.max(e1.maxStep, e3.maxStep).toFixed(4)} m`);
+  check('lifecycle churn leaves no NaN', !r.nan);
+  check('render time monotonic across spawn and despawn', r.backwards === 0);
+  check('no spurious rebaseline on a clean link',
+    r.interp.stats.rebaselines === 0 && r.epochBumps === 0,
+    `rebaselines ${r.interp.stats.rebaselines}, epoch bumps ${r.epochBumps}`);
+}
+
+section('7b. Clock discontinuity (host migration / tab wake)');
+{
+  // Server clock jumps 3 s FORWARD mid-match while snapshots keep flowing.
+  // Render time would race past the newest snapshot forever, so the
+  // interpolator must deepen the delay and declare an epoch change.
+  const fwd = lifecycleScenario(3_000, 1_500);
+  check('a 3 s forward clock jump is detected and rebaselined',
+    fwd.interp.stats.rebaselines >= 1, `${fwd.interp.stats.rebaselines} rebaselines`);
+  check('the forward jump raises epoch so consumers can hard-reset',
+    fwd.epochBumps >= 1, `${fwd.epochBumps} epoch bumps`);
+  check('after rebaselining it is interpolating again, not extrapolating forever',
+    fwd.interp.stats.interpolated > fwd.interp.stats.frames * 0.8,
+    `${fwd.interp.stats.interpolated}/${fwd.interp.stats.frames} frames interpolated`);
+  check('forward clock jump leaves no NaN', !fwd.nan);
+  check('render time monotonic before the epoch change', fwd.backwards === 0);
+
+  // ...and 3 s BACKWARD. Jumping render time forward again is monotonic-safe,
+  // so this must recover WITHOUT an epoch change.
+  const back = lifecycleScenario(-3_000, 1_500);
+  check('a 3 s backward clock jump is detected and rebaselined',
+    back.interp.stats.rebaselines >= 1, `${back.interp.stats.rebaselines} rebaselines`);
+  check('backward jump recovers to interpolating',
+    back.interp.stats.interpolated > back.interp.stats.frames * 0.8,
+    `${back.interp.stats.interpolated}/${back.interp.stats.frames} frames interpolated`);
+  check('backward clock jump leaves no NaN', !back.nan);
+  check('the entity is still being rendered after both jumps',
+    !!fwd.interp.get(1) && !!back.interp.get(1));
+}
+
+section('7c. Determinism');
+{
+  const a = lifecycleScenario();
+  const b = lifecycleScenario();
+  let diff = -1;
+  if (a.trace.length !== b.trace.length) diff = -2;
+  else for (let i = 0; i < a.trace.length; i++) if (a.trace[i] !== b.trace[i]) { diff = i; break; }
+  check('two identical runs produce bit-identical output',
+    diff === -1, `${a.trace.length} sampled values compared, first difference ${diff}`);
+
+  // The whole prediction/replay story rests on there being no hidden entropy.
+  const src = await import('node:fs')
+    .then((fs) => ['Clock', 'Extrapolate', 'Interpolator', 'SnapshotBuffer', 'math',
+      'InterpolationSystem', 'types', 'index']
+      .map((f) => fs.readFileSync(path.join(ROOT, 'src', 'net', 'interp', `${f}.ts`), 'utf8'))
+      .join('\n'));
+  check('no Math.random anywhere in src/net/interp', !/Math\s*\.\s*random/.test(src));
+  check('no Date.now in the simulation path (time comes from TimeSource)',
+    !/Date\s*\.\s*now/.test(src));
+}
 
 section('Summary');
 const passed = results.filter((r) => r.ok).length;

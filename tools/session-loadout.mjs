@@ -90,7 +90,10 @@ async function loadModule() {
       lib: { entry, formats: ['es'], fileName: () => 'loadout.bundle.mjs' },
     },
   });
-  return import(pathToFileURL(path.join(BUNDLE_DIR, 'loadout.bundle.mjs')).href);
+  const ns = await import(pathToFileURL(path.join(BUNDLE_DIR, 'loadout.bundle.mjs')).href);
+  // A module namespace is frozen; the harness hangs a couple of derived
+  // lookups off it, so hand back a mutable shallow copy.
+  return { ...ns };
 }
 
 /* ------------------------------------------------------ 1. data integrity */
@@ -202,7 +205,9 @@ const BUILDS = [
   ['ar_vkr7', 'stock', []],
   ['ar_vkr7', 'run-and-gun', ['optic_reddot', 'barrel_short', 'laser_visible', 'mag_quick', 'stock_none']],
   ['ar_vkr7', 'recoil-stack', ['muzzle_comp', 'under_grip', 'stock_heavy', 'barrel_heavy', 'optic_acog']],
-  ['ar_vkr7', 'long-range', ['optic_acog', 'barrel_long', 'muzzle_brake', 'under_grip', 'stock_heavy']],
+  // muzzle_brake is heavy-calibre only (sniper/marksman/lmg/shotgun), so the
+  // long-range AR takes the flash hider — the muzzle an assault rifle can fit.
+  ['ar_vkr7', 'long-range', ['optic_acog', 'barrel_long', 'muzzle_flash', 'under_grip', 'stock_heavy']],
   ['ar_vkr7', 'stealth', ['optic_holo', 'muzzle_suppressor', 'barrel_long', 'mag_extended', 'stock_heavy']],
   ['smg_hornet', 'stock', []],
   ['smg_hornet', 'max-mobility', ['optic_irons', 'barrel_short', 'laser_visible', 'stock_none', 'mag_quick']],
@@ -316,7 +321,14 @@ const SANE_ABS = {
   falloffScale: [0.70, 1.50],
   magnification: [1, 12],
   reloadTactical: [0.40, 6.00],
+  reloadPerShell: [0.15, 1.20],
 };
+/**
+ * A stat whose *base* is zero does not exist on that weapon — a shell-by-shell
+ * shotgun has no tactical reload, a hitscan gun no travel time. Bounds are only
+ * meaningful where the weapon has the stat at all.
+ */
+const absent = (base, key) => !(base[key] > 0);
 /** Rails relative to the same weapon with nothing fitted. */
 const SANE_REL = {
   adsTime: [0.55, 2.00],
@@ -381,6 +393,7 @@ function sweep(L) {
         for (const s of eff.capped) cappedByStat.set(s, (cappedByStat.get(s) ?? 0) + 1);
       }
       for (const [key, [lo, hi]] of Object.entries(SANE_ABS)) {
+        if (absent(base, key)) continue;
         const v = eff[key];
         if (!(v >= lo && v <= hi)) {
           violations.push(`${def.id} [${ids.join(',')}] ${key}=${f(v, 4)} outside [${lo}, ${hi}]`);
@@ -430,7 +443,15 @@ function sweep(L) {
     `${violations.length} violations, first: ${violations[0] ?? ''}`);
   check('resolution is order-independent', orderFails === 0, `${orderFails} of ${orderChecks}`);
   check('the clamp table is a safety net, not the balance',
-    cappedCombos / total < 0.35, `${((cappedCombos / total) * 100).toFixed(1)}% of combos clamped`);
+    cappedCombos / total < 0.15, `${((cappedCombos / total) * 100).toFixed(1)}% of combos clamped`);
+  // A weapon with nothing fitted must never touch a rail. If it does, a rule in
+  // data/balance.ts collides with a catalogue base and the safety net is
+  // silently rewriting the designer's numbers on every single build.
+  const stockClamps = L.WEAPONS
+    .map((d) => [d.id, L.resolveWeapon(d.id, []).capped])
+    .filter(([, c]) => c.length);
+  check('a stock weapon never hits a rail', stockClamps.length === 0,
+    stockClamps.map(([id, c]) => `${id}: ${c.join('/')}`).join(', '));
   if (violations.length) for (const v of violations.slice(0, 12)) console.log(`    ! ${v}`);
   return total;
 }
@@ -738,8 +759,58 @@ function bridge(L) {
 
 /* ------------------------------------------------------------ 12. tuning */
 
+/* ------------------------------------------- 12. reloads, rails, rounding */
+
+/**
+ * Three things that were silently wrong and are easy to break again:
+ *   - shell-by-shell weapons ignoring every reload modifier in the game,
+ *   - reload scales producing durations nobody would sit through,
+ *   - integer rounding being reported as the safety net engaging.
+ */
+function reloadsAndRounding(L) {
+  rule('12. RELOADS, RAILS AND ROUNDING');
+
+  const shotgun = L.resolveWeapon('sg_breaker', []);
+  check('the shotgun is recognised as a shell-by-shell reloader',
+    shotgun.shellReload === true && shotgun.reloadTactical === 0 && shotgun.reloadPerShell > 0,
+    `shellReload=${shotgun.shellReload} tactical=${shotgun.reloadTactical} perShell=${shotgun.reloadPerShell}`);
+
+  const fast = L.resolveWeapon('sg_breaker', [], { perks: ['perk_sleight'] });
+  const gain = 1 - fast.reloadPerShell / shotgun.reloadPerShell;
+  check('reload modifiers actually reach a shell reloader', gain > 0.15,
+    `per-shell ${f(shotgun.reloadPerShell)}s → ${f(fast.reloadPerShell)}s (${(gain * 100).toFixed(1)}%)`);
+  console.log(`  sg_breaker per-shell ${f(shotgun.reloadPerShell)}s → ${f(fast.reloadPerShell)}s with Sleight of Hand`
+    + ` (scale ${f(fast.reloadScale)})`);
+
+  const slow = L.resolveWeapon('lmg_vulcan', ['mag_drum']);
+  check('reload duration is railed in seconds, not just in multiples',
+    slow.reloadTactical <= L.RELOAD_RAILS.tactical.max + 1e-9,
+    `${f(slow.reloadTactical)}s > ${L.RELOAD_RAILS.tactical.max}s`);
+  check('hitting the reload rail is reported', slow.capped.includes('reloadTime'),
+    slow.capped.join(', '));
+  console.log(`  lmg_vulcan + drum reload ${f(slow.reloadTactical)}s`
+    + ` (railed at ${L.RELOAD_RAILS.tactical.max}s), empty ${f(slow.reloadEmpty)}s`);
+
+  // 5-round bolt gun × 1.5 = 7.5 rounds. Rounding to 8 is arithmetic, not a cap.
+  const bolt = L.resolveWeapon('sr_longbow', ['mag_extended']);
+  check('magazine rounding produces a whole number', Number.isInteger(bolt.magSize), String(bolt.magSize));
+  check('rounding an integer stat is not reported as a clamp', !bolt.capped.includes('magSize'),
+    `capped: ${bolt.capped.join(', ')}`);
+  console.log(`  sr_longbow mag 5 → ${bolt.magSize} (×1.5 = 7.5, rounded)`
+    + ` — capped: [${bolt.capped.join(', ') || 'none'}]`);
+
+  // A genuine rail hit must still be reported.
+  const railed = L.resolveWeapon('sr_longbow', [], {
+    extra: [{ id: 'test_absurd_mag', mods: [{ stat: 'magSize', mode: 'mul', value: 40 }] }],
+  });
+  check('a genuine magazine rail hit is still reported', railed.capped.includes('magSize'),
+    `magSize=${railed.magSize} capped=${railed.capped.join(', ')}`);
+  console.log(`  sr_longbow with a ×40 magazine lands at ${railed.magSize}`
+    + ` (rail ${f(L.railsFor('magSize', 5).hi, 0)}) and reports the cap`);
+}
+
 function tuning(L) {
-  rule('12. LIVE TUNING');
+  rule('13. LIVE TUNING');
   const before = L.resolveWeapon('ar_vkr7', ['muzzle_comp']).recoilVerticalScale;
   const notes = L.applyTuningPatch({
     attachments: { muzzle_comp: { recoilVertical: 0.5 } },
@@ -784,6 +855,7 @@ async function main() {
   bookTests(L);
   bars(L);
   bridge(L);
+  reloadsAndRounding(L);
   tuning(L);
 
   rule('RESULT');

@@ -287,6 +287,85 @@ export const BUTTON = {
 } as const;
 export type ButtonMask = number;
 
+/** Canonical action names. `BUTTON` above is the normative bit assignment. */
+export type ButtonAction = keyof typeof BUTTON;
+
+export const BUTTON_ACTIONS: readonly ButtonAction[] = [
+  'FIRE', 'ADS', 'JUMP', 'CROUCH', 'PRONE', 'SPRINT', 'RELOAD',
+  'MELEE', 'USE', 'GRENADE', 'TACTICAL', 'LEAN_LEFT', 'LEAN_RIGHT', 'SWITCH',
+] as const;
+
+/**
+ * A button *layout*: canonical action -> bit value in some module's own mask.
+ * An absent action means that layout cannot express it; remapping drops it.
+ *
+ * WHY THIS EXISTS. Four button masks live in this repo and three of them use
+ * different bit orders for the same actions:
+ *
+ *   src/net/types.ts        BUTTON  FIRE=0 ADS=1 JUMP=2 CROUCH=3 PRONE=4  ...  (normative)
+ *   src/session/replay      BTN     bit-identical to BUTTON                     (OK)
+ *   src/net/host/types.ts   BTN     FIRE=0 ADS=1 JUMP=2 CROUCH=3 SPRINT=4 ...  (diverges from bit 4)
+ *   src/player/MoveCommand  BTN     JUMP=0 CROUCH=1 PRONE=2 SPRINT=3 ADS=4 ... (unrelated order)
+ *
+ * Every mask is a bare `number`, so the compiler cannot catch a mask crossing
+ * between two of them — it shows up as "shooting makes me jump". The two that
+ * matter are already on a collision course: `src/net/prediction` predicts with
+ * the PLAYER layout while `src/net/host` simulates with the HOST layout, and
+ * prediction's whole job is to run the same movement the host runs.
+ *
+ * Rather than reach into files this module does not own, the fix is declared
+ * here as data and enforced by `node tools/net-protocol.mjs` §12, which fails
+ * loudly the moment any of those declarations moves a bit. Bridge code at a
+ * seam must call `remapButtons()`; it must never pass a raw mask across.
+ */
+export type ButtonLayout = Readonly<Partial<Record<ButtonAction, number>>>;
+
+/** Normative layout — the wire format. Identical to `BUTTON`. */
+export const BUTTON_LAYOUT_NET: ButtonLayout = BUTTON;
+
+/** Mirrors `BTN` in `src/net/host/types.ts`. Keep in sync; §12 enforces it. */
+export const BUTTON_LAYOUT_HOST: ButtonLayout = {
+  FIRE: 1 << 0, ADS: 1 << 1, JUMP: 1 << 2, CROUCH: 1 << 3,
+  SPRINT: 1 << 4, RELOAD: 1 << 5, USE: 1 << 6, MELEE: 1 << 7,
+};
+
+/** Mirrors `BTN` in `src/player/MoveCommand.ts`. Keep in sync; §12 enforces it. */
+export const BUTTON_LAYOUT_PLAYER: ButtonLayout = {
+  JUMP: 1 << 0, CROUCH: 1 << 1, PRONE: 1 << 2, SPRINT: 1 << 3, ADS: 1 << 4,
+  LEAN_LEFT: 1 << 5, LEAN_RIGHT: 1 << 6, FIRE: 1 << 7, RELOAD: 1 << 8,
+  MELEE: 1 << 9, USE: 1 << 10, GRENADE: 1 << 11, TACTICAL: 1 << 12, SWITCH: 1 << 13,
+};
+
+/**
+ * Translate a button mask between two layouts. Actions the target layout does
+ * not define are dropped, which is the only safe answer — inventing a bit
+ * would make the receiver act on intent the sender never expressed.
+ *
+ * Allocation-free. 14 iterations; negligible next to a physics step.
+ */
+export function remapButtons(mask: ButtonMask, from: ButtonLayout, to: ButtonLayout): ButtonMask {
+  if (from === to) return mask;
+  let out = 0;
+  for (let i = 0; i < BUTTON_ACTIONS.length; i++) {
+    const action = BUTTON_ACTIONS[i]!;
+    const src = from[action];
+    const dst = to[action];
+    if (src !== undefined && dst !== undefined && (mask & src) !== 0) out |= dst;
+  }
+  return out;
+}
+
+/** Actions set in `mask` under `layout`. Debug/logging only — it allocates. */
+export function buttonActions(mask: ButtonMask, layout: ButtonLayout = BUTTON_LAYOUT_NET): ButtonAction[] {
+  const out: ButtonAction[] = [];
+  for (let i = 0; i < BUTTON_ACTIONS.length; i++) {
+    const action = BUTTON_ACTIONS[i]!;
+    const bit = layout[action];
+    if (bit !== undefined && (mask & bit) !== 0) out.push(action);
+  }
+  return out;
+}
+
 /**
  * One tick of player intent. This is the ONLY thing a client is allowed to
  * send that affects the simulation — never positions, never damage.

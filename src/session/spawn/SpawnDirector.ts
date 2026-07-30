@@ -29,7 +29,7 @@ import { SpawnZones } from './SpawnZones';
 import { LocalAuthority, grantFrom, requestMsgFrom, type SpawnAuthority, type SpawnGrant } from './Authority';
 import {
   boundsOf, emptyDecision, emptyTerms, emptyWorldState,
-  type RandomSource, type SpawnDecision, type SpawnLos, type SpawnPoint,
+  type RandomSource, type SpawnActor, type SpawnDecision, type SpawnLos, type SpawnPoint,
   type SpawnPolicyId, type SpawnRequestSpec, type SpawnTeam, type SpawnVeto,
   type SpawnWorldState, type Vec3,
 } from './types';
@@ -190,19 +190,123 @@ export class SpawnDirector {
   }
 
   /**
-   * Round-start spawn for a whole team. Each grant reserves its point, so the
-   * squad is spread rather than stacked, and S&D's fixed pads are handed out in
-   * a deterministic order.
+   * Round-start spawn for a whole roster, both teams at once.
+   *
+   * The naive version of this — loop and call `request` — is the single worst
+   * bug a spawn system can have, and it is invisible until you measure it:
+   * at a round restart *nobody is alive*, so every request scores against an
+   * empty world, every enemy-proximity and line-of-sight veto is vacuous, and
+   * both squads get placed on whatever the soft terms like best. In S&D, where
+   * both teams want the same bomb site, that reliably put twelve players in one
+   * midfield: 36% of round-start spawns died inside three seconds and 107 of
+   * them landed inside the hard 18 m minimum.
+   *
+   * So a group grant is resolved against *provisional* actors. Each decision
+   * immediately becomes a live body in a scratch world state that the following
+   * decisions score against, and a second pass re-resolves every request now
+   * that the whole roster's positions are known (each request temporarily
+   * hides its own provisional body so it is not repelled by itself). Commits
+   * and grant broadcasts happen once, after both passes have settled.
+   *
+   * Requests are interleaved by team so no team gets every good pad first.
    */
   requestGroup(reqs: readonly SpawnRequestSpec[], state?: SpawnWorldState): SpawnDecision[] {
     if (state) this.state = state;
-    const out: SpawnDecision[] = [];
-    for (const r of reqs) out.push(this.request(r));
+    if (reqs.length === 0) return [];
+    if (!this.authority.isHost) return reqs.map((r) => this.request(r));
+    if (reqs.length === 1) return [this.resolve(reqs[0])];
+
+    const base = this.state;
+    const now = reqs[0].now;
+    const merged: SpawnActor[] = [];
+    for (const a of base.actors) merged.push(a);
+    const groupState: SpawnWorldState = {
+      now,
+      actors: merged,
+      hazards: base.hazards,
+      objectives: base.objectives,
+      observers: base.observers,
+    };
+    this.state = groupState;
+
+    const order = interleaveByTeam(reqs);
+    const out: SpawnDecision[] = new Array(reqs.length);
+    const ghosts: (SpawnActor | null)[] = new Array(reqs.length).fill(null);
+    const hold = this.policy.weights.reservation;
+
+    /* --- pass 1: sequential, each grant becomes visible to the next --- */
+    for (const i of order) {
+      const d = this.select(reqs[i]);
+      out[i] = d;
+      if (!d.ok) continue;
+      const ghost: SpawnActor = {
+        id: reqs[i].actorId,
+        team: reqs[i].team,
+        position: { x: d.position.x, y: d.position.y, z: d.position.z },
+        yaw: d.yaw,
+        alive: true,
+        firing: false,
+        speed: 0,
+      };
+      ghosts[i] = ghost;
+      merged.push(ghost);
+      const p = this.pointById(d.pointId);
+      if (p) p.reservedUntil = Math.max(p.reservedUntil, now + hold);
+    }
+
+    /* --- pass 2: re-resolve with the full roster known --- */
+    for (const i of order) {
+      const prev = out[i];
+      const ghost = ghosts[i];
+      if (!prev.ok || !ghost) continue;
+      ghost.alive = false;
+      const held = this.pointById(prev.pointId);
+      const savedReserve = held ? held.reservedUntil : 0;
+      if (held) held.reservedUntil = -1e9;
+
+      const next = this.select(reqs[i]);
+      if (held) held.reservedUntil = savedReserve;
+      ghost.alive = true;
+      // Only move if the better-informed pass genuinely found somewhere safer.
+      if (next.ok && next.score > prev.score) {
+        out[i] = next;
+        ghost.position.x = next.position.x;
+        ghost.position.y = next.position.y;
+        ghost.position.z = next.position.z;
+        ghost.yaw = next.yaw;
+        if (held) held.reservedUntil = -1e9;
+        const p = this.pointById(next.pointId);
+        if (p) p.reservedUntil = Math.max(p.reservedUntil, now + hold);
+      }
+    }
+
+    this.state = base;
+    for (let i = 0; i < reqs.length; i++) {
+      const d = out[i] ?? emptyDecision();
+      out[i] = d;
+      if (!d.ok) continue;
+      d.seq = ++this.seq;
+      this.commit(reqs[i].actorId, d, now);
+      this.authority.broadcastGrant?.(grantFrom(d, reqs[i].actorId, this.authority.tick));
+    }
     return out;
   }
 
-  /** Host-side selection. Always returns; `outcome` says how hard it had to try. */
+  /** Host-side selection plus commit and broadcast. */
   private resolve(req: SpawnRequestSpec): SpawnDecision {
+    const decision = this.select(req);
+    if (!decision.ok) return decision;
+    decision.seq = ++this.seq;
+    this.commit(req.actorId, decision, req.now);
+    this.authority.broadcastGrant?.(grantFrom(decision, req.actorId, this.authority.tick));
+    return decision;
+  }
+
+  /**
+   * Pure candidate selection: no commit, no reservation, no broadcast. Always
+   * returns; `outcome` says how hard it had to try.
+   */
+  private select(req: SpawnRequestSpec): SpawnDecision {
     const decision = emptyDecision();
     decision.considered = this.points.length;
     if (this.points.length === 0) return decision;
@@ -252,6 +356,14 @@ export class SpawnDirector {
       let best = -Infinity;
       let bestIndex = -1;
       for (const c of this.short) {
+        // The short list is ordered by cheap score, and the visibility pass can
+        // only ever *subtract* (a line-of-sight penalty) — jitter is a hash of
+        // the candidate, not a draw off the stream, so the two passes agree on
+        // every other term. So a candidate whose cheap score already loses to
+        // the best full score cannot win, and neither can anything behind it.
+        // This is an exact bound, not a heuristic: it changes the cost, never
+        // the answer. It typically ends the loop after one or two ray batches.
+        if (bestIndex >= 0 && c.score <= best) break;
         const s = this.scorer.score(this.points[c.index], true, tier);
         if (s === -Infinity) {
           if (tier === 0) this.tallyVeto(this.scorer.veto);
@@ -303,10 +415,6 @@ export class SpawnDirector {
     decision.enemyLos = bestLos;
     decision.outcome = chosenTier === 0 ? 'best' : chosenTier < 3 ? 'relaxed' : 'forced';
     decision.terms = terms;
-    decision.seq = ++this.seq;
-
-    this.commit(req.actorId, decision, now);
-    this.authority.broadcastGrant?.(grantFrom(decision, req.actorId, this.authority.tick));
     return decision;
   }
 
@@ -442,4 +550,29 @@ export class SpawnDirector {
 
   /** Default weights, exposed so callers can build a tuned policy. */
   static defaultWeights(): SpawnWeights { return defaultWeights(); }
+}
+
+/**
+ * Round-robins a batch of requests across the teams present, preserving each
+ * team's internal order. Deterministic — the same roster always produces the
+ * same interleave, which replay and the netcode host both rely on.
+ */
+function interleaveByTeam(reqs: readonly SpawnRequestSpec[]): number[] {
+  const buckets: SpawnTeam[] = [];
+  const byTeam = new Map<SpawnTeam, number[]>();
+  for (let i = 0; i < reqs.length; i++) {
+    const t = reqs[i].team;
+    let list = byTeam.get(t);
+    if (!list) { list = []; byTeam.set(t, list); buckets.push(t); }
+    list.push(i);
+  }
+  if (buckets.length < 2) return byTeam.get(buckets[0]) ?? [];
+  const order: number[] = [];
+  for (let k = 0; order.length < reqs.length; k++) {
+    for (const t of buckets) {
+      const list = byTeam.get(t);
+      if (list && k < list.length) order.push(list[k]);
+    }
+  }
+  return order;
 }

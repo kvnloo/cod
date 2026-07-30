@@ -25,11 +25,12 @@ import { defaultQuery, type SpawnQuery } from './Spawns';
 import { ARCHETYPES } from './Archetypes';
 import type { CombatBridge } from './Combat';
 import type { Emitter, GameServices } from './Services';
-import type { Objective, ObjectiveWorld } from './Objectives';
+import { resetNetIds } from './Objectives';
+import type { Objective, ObjectiveWorld, PresenceProbe } from './Objectives';
 import { GameMode, type MatchHost, type ModeOffer } from './modes/Mode';
 import { OperationMode } from './modes/Operation';
-import { TeamDeathmatchMode } from './modes/TeamDeathmatch';
-import { FirefightMode } from './modes/Firefight';
+import { createMode } from './modes/index';
+import { modeIndexOf, type ModeId } from './modes/ModeDefs';
 import { MASK_MOVE } from '../physics/types';
 import { makeRayHit } from './Services';
 import type {
@@ -113,7 +114,11 @@ export class MatchRunner implements MatchHost, CombatBridge {
     };
 
     this.lifecycle.pickSpawn = (out) => this.pickPlayerSpawn(out);
-    this.lifecycle.onFinalDeath = () => this.finish(false);
+    // Round-based modes keep playing after the player's last life — they get
+    // first refusal on the final death before the match is called.
+    this.lifecycle.onFinalDeath = () => {
+      if (!this.mode.onFinalDeath(this)) this.finish(false);
+    };
   }
 
   /** Marks that this runner created the fallback combat sim. */
@@ -134,15 +139,22 @@ export class MatchRunner implements MatchHost, CombatBridge {
     this.unsubs.length = 0;
   }
 
-  /** Boots a match. The seed makes the whole round reproducible. */
-  start(modeId: GameModeId, seed?: number): void {
+  /**
+   * Boots a match. The seed makes the whole round reproducible.
+   *
+   * Takes the wide `ModeId` — `GameModeId` is a strict subset, so every
+   * existing caller still typechecks while dom/snd/hardpoint/kc/ffa become
+   * reachable. See the note on `GameMode.id` for why the union was not widened
+   * in `types.ts` instead.
+   */
+  start(modeId: ModeId, seed?: number): void {
     this.seed = seed ?? this.seed;
     this.rng = new Rand(this.seed);
     this.services.rng = this.rng;
     this.director.setRng(this.rng);
     this.killstreaks.setRng(this.rng);
 
-    this.mode = makeMode(modeId);
+    this.mode = createMode(modeId);
     this.phase = 'idle';
     this.phaseTime = 0;
     this.matchTime = 0;
@@ -160,16 +172,20 @@ export class MatchRunner implements MatchHost, CombatBridge {
 
     this.log.reset();
     this.log.record(0, 'seed', this.seed, REPLAY_VERSION);
-    this.log.record(0, 'mode', modeIndex(modeId), 0);
+    this.log.record(0, 'mode', modeIndexOf(modeId), 0);
 
     this.progression.load();
-    this.progression.beginMatch(modeId);
+    this.progression.beginMatch(modeId as GameModeId);
     this.scoring.reset();
     this.killstreaks.reset();
     this.lifecycle.reset();
     this.director.reset();
     this.director.buildGraph();
     this.clearObjectives();
+    this.setPresenceProbe(null);
+    // Objective net ids restart with the match so a replay of the same seed
+    // reproduces the same entity ids, not just the same events.
+    resetNetIds();
 
     this.services.setTimeScale(1);
     this.emit('game:start', { mode: modeId });
@@ -389,6 +405,23 @@ export class MatchRunner implements MatchHost, CombatBridge {
     return true;
   }
 
+  /**
+   * Installs the active mode's team-occupancy probe so objectives can ask "how
+   * many of each side are standing in this sphere". Cleared on every start.
+   */
+  setPresenceProbe(probe: PresenceProbe | null): void {
+    this.objectiveWorld.presence = probe ?? undefined;
+  }
+
+  /**
+   * Kill attribution from a layer that knows the shooter — the AI system today,
+   * the authoritative host once `src/net` lands. Two-team modes can infer the
+   * scoring side from the victim; free-for-all cannot, so it needs this.
+   */
+  reportKill(killerId: number, victimId: number): void {
+    this.mode.onKillAttributed(this, killerId, victimId);
+  }
+
   setOffers(offers: ModeOffer[]): void {
     this.offers = offers;
     this.emit('hud:offers', {
@@ -405,6 +438,13 @@ export class MatchRunner implements MatchHost, CombatBridge {
    * sight, on a node that has not just been used.
    */
   pickPlayerSpawn(out: THREE.Vector3): number {
+    // The mode gets first refusal — per-mode spawn rules are the whole reason
+    // S&D and Domination feel different from the same spawn graph.
+    const owned = this.mode.pickPlayerSpawn(this, out);
+    if (owned !== null) {
+      this.log.record(this.tick, 'respawn', -1, 0);
+      return owned;
+    }
     const q = this.query;
     const player = this.services.player;
     q.viewOrigin.copy(player ? player.position : this._p.set(0, 1.6, 0));
@@ -672,18 +712,6 @@ export class MatchRunner implements MatchHost, CombatBridge {
 }
 
 const EMPTY_VECS: readonly THREE.Vector3[] = [];
-
-function makeMode(id: GameModeId): GameMode {
-  switch (id) {
-    case 'tdm': return new TeamDeathmatchMode();
-    case 'firefight': return new FirefightMode();
-    default: return new OperationMode();
-  }
-}
-
-function modeIndex(id: GameModeId): number {
-  return id === 'operation' ? 0 : id === 'tdm' ? 1 : 2;
-}
 
 function phaseIndex(p: MatchPhase): number {
   return ['idle', 'warmup', 'live', 'intermission', 'ending', 'ended'].indexOf(p);

@@ -61,7 +61,12 @@ float computeCoc(float viewZ) {
   // focus-independent, which is what keeps the look stable while autofocus
   // walks from a wall at 3 m to a ridge at 600 m.
   float ratio = z / s;
-  px += deficitFar * smoothstep(1.35, 3.6, ratio);
+  /* The far ramp used to only reach half strength at 2.5x the focus distance,
+     which on a 17 m focus put the whole 30-60 m midground — the part of the
+     frame that reads as "the background" — inside 3 px of blur. Reaching full
+     defocus by ~2.9x is what actually separates a deep street from its subject
+     while still leaving anything near the focal plane crisp. */
+  px += deficitFar * smoothstep(1.15, 2.9, ratio);
   px -= deficitNear * (1.0 - smoothstep(0.30, 0.80, ratio));
 
   return clamp(px * uScale, -uMaxCoc, uMaxCoc);
@@ -345,8 +350,15 @@ export class DofPass extends BasePass {
    * weapon and the near foreground from the world is what aiming is *for*, and
    * a mushy background reads worse than a soft foreground.
    */
-  nearCoc = 9;
-  farCoc = 7;
+  nearCoc = 6.5;
+  farCoc = 10;
+  /**
+   * How hard a defocused highlight is pushed before the gather and pulled back
+   * after it. This is what turns a bright speck into a readable hexagon rather
+   * than a slightly brighter smudge, so it is the knob that makes the aperture
+   * shape visible at all.
+   */
+  bokehBoost = 0.9;
 
   /**
    * Capture-mode tuning handle. The focus distance comes from autofocus, so the
@@ -514,7 +526,7 @@ export class DofPass extends BasePass {
     gu.tColor.value = prep.texture;
     gu.tTile.value = tileNb.texture;
     (gu.uTexel.value as THREE.Vector2).set(1 / hw, 1 / hh);
-    gu.uBokehBoost.value = 0.7;
+    gu.uBokehBoost.value = this.bokehBoost;
     ctx.blit(this.gather, fields);
 
     /* 4 — soften the near field --------------------------------------------*/

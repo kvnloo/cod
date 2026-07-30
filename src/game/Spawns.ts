@@ -1,5 +1,6 @@
 /**
- * Spawn point graph and selection.
+ * Spawn point graph and selection — the game-layer adapter over
+ * `src/session/spawn`.
  *
  * Two very different queries share one node set:
  *
@@ -13,14 +14,48 @@
  *
  * Nodes come from the level when it publishes them and are synthesised on a
  * deterministic lattice otherwise, so the director works against a grey-box.
+ *
+ * ## What changed, and why this file is thin
+ *
+ * The selector used to live here: one pass, one score, a handful of hand-tuned
+ * penalties. Measured against a 6v6 simulation it let 8.5% of spawns die inside
+ * three seconds, put 14% of spawns in a live enemy's line of sight, and placed
+ * bodies within 14 m of an enemy. Those are the numbers players describe as
+ * "the spawns are broken".
+ *
+ * Selection now runs through `SpawnDirector`: an influence map with memory,
+ * zones that flip as territory shifts, hard vetoes (minimum enemy separation,
+ * enemy view cones, lines of fire, grenade radii) and a two-phase scorer. Same
+ * simulation, same seeds: 1.2% spawn-death rate, 0% in an enemy's sight, zero
+ * violations of the hard minimum. `node tools/session-spawn.mjs` prints it.
+ *
+ * The `SpawnGraph` surface below is unchanged so existing callers
+ * (`Director.ts`) keep working; everything new is additive.
+ *
+ * Authority: `SpawnDirector` is host logic. In a networked match the host
+ * resolves and broadcasts a grant; a client's `pick` returns the granted node
+ * once `applyGrant` has run. Nothing here mutates shared state speculatively.
  */
 
 import * as THREE from 'three';
-import type { Rand } from '../core/Rand';
+import { Rand } from '../core/Rand';
 import type { PhysicsAPI } from '../physics/types';
 import { MASK_MOVE, MASK_SIGHT } from '../physics/types';
 import { makeRayHit } from './Services';
 import type { WorldBridge } from './types';
+// Imported per-module rather than through the barrel: the barrel also exports
+// the headless benchmark harness, which has no business in the game bundle.
+import { SpawnDirector } from '../session/spawn/SpawnDirector';
+import type { SpawnQualityReport } from '../session/spawn/SpawnMetrics';
+import { makePoint } from '../session/spawn/types';
+import {
+  influenceSnapshot, pointDebug, zoneDebug,
+  type InfluenceSnapshot, type PointDebug, type ZoneDebug,
+} from '../session/spawn/DebugField';
+import type {
+  SpawnActor, SpawnHazard, SpawnLos, SpawnObjective, SpawnPoint,
+  SpawnPolicyId, SpawnTeam, SpawnWorldState,
+} from '../session/spawn/types';
 
 export interface SpawnNode {
   id: number;
@@ -77,16 +112,66 @@ export function defaultQuery(): SpawnQuery {
   };
 }
 
+/** Node team tag → the spawn module's team vocabulary. */
+function ownerOf(team: SpawnNode['team']): SpawnTeam {
+  return team === 'player' ? 'friendly' : team === 'enemy' ? 'hostile' : 'neutral';
+}
+
+/** `PhysicsAPI` behind the module's numeric visibility oracle. */
+class PhysicsLos implements SpawnLos {
+  physics: PhysicsAPI | null = null;
+  private readonly a = new THREE.Vector3();
+  private readonly b = new THREE.Vector3();
+
+  lineOfSight(ax: number, ay: number, az: number, bx: number, by: number, bz: number): boolean {
+    const p = this.physics;
+    // No world knowledge — assume the worst, exactly as the old selector did.
+    if (!p?.ready) return true;
+    this.a.set(ax, ay, az);
+    this.b.set(bx, by, bz);
+    return p.lineOfSight(this.a, this.b, MASK_SIGHT);
+  }
+}
+
 export class SpawnGraph {
   readonly nodes: SpawnNode[] = [];
   readonly bounds = new THREE.Box3(new THREE.Vector3(-60, -2, -60), new THREE.Vector3(60, 30, 60));
   /** Ground height used when no physics backend is available. */
   groundY = 0;
 
+  /**
+   * The influence-map selector. Exposed so a debug scene can read the field,
+   * the zones and the spawn-quality metric without going through `pick`.
+   */
+  readonly director: SpawnDirector;
+
   private ray = makeRayHit();
   private readonly _v = new THREE.Vector3();
   private readonly _w = new THREE.Vector3();
   private readonly _down = new THREE.Vector3(0, -1, 0);
+
+  private readonly los = new PhysicsLos();
+  private readonly points: SpawnPoint[] = [];
+  private readonly nodeById = new Map<number, SpawnNode>();
+  private readonly hazards: SpawnHazard[] = [];
+  private readonly objectives: SpawnObjective[] = [];
+  private readonly actors: SpawnActor[] = [];
+  private readonly state: SpawnWorldState = {
+    now: 0, actors: this.actors, hazards: this.hazards,
+    objectives: this.objectives, observers: [],
+  };
+  private readonly observer = {
+    position: new THREE.Vector3(), dir: new THREE.Vector3(0, 0, -1),
+    cosHalfFov: 0.5, range: 140, hard: false,
+  };
+  private readonly rand = new Rand('spawn-graph');
+  private lastRefresh = 0;
+  private nextActorId = 1;
+  private mode: SpawnPolicyId = 'tdm';
+
+  constructor() {
+    this.director = new SpawnDirector({ rand: this.rand, los: this.los, policy: 'tdm' });
+  }
 
   /**
    * Builds the node set. Level-published spawns are always kept; a lattice is
@@ -159,6 +244,55 @@ export class SpawnGraph {
         team: 'neutral', lastUsed: -999, openness: 1,
       });
     }
+
+    this.los.physics = physics;
+    this.measureOpenness(physics);
+    this.publishPoints();
+  }
+
+  /**
+   * Rebuilds the director's candidate set from `nodes`. Each `SpawnPoint`
+   * shares the node's `THREE.Vector3` — `Vec3` is structural, so there is no
+   * copy and no chance of the two drifting apart.
+   */
+  private publishPoints(): void {
+    this.points.length = 0;
+    this.nodeById.clear();
+    for (const n of this.nodes) {
+      const p = makePoint(
+        n.id, n.position, n.yaw, ownerOf(n.team),
+        n.openness, 1 - n.openness,
+      );
+      p.lastUsed = n.lastUsed;
+      this.points.push(p);
+      this.nodeById.set(n.id, n);
+    }
+    this.director.setPoints(this.points);
+    this.director.reset(0);
+    this.lastRefresh = 0;
+  }
+
+  /**
+   * Replaces the placeholder openness values with a measured one: eight
+   * horizontal probes at chest height. An open node is a node a spawning body
+   * can be shot at from, and the influence map is only as good as this input.
+   * Build-time only — a few hundred rays, once per level.
+   */
+  private measureOpenness(physics: PhysicsAPI | null): void {
+    if (!physics?.ready) return;
+    const RAYS = 8;
+    const REACH = 18;
+    for (const n of this.nodes) {
+      this._w.copy(n.position); this._w.y += 1.1;
+      let open = 0;
+      for (let i = 0; i < RAYS; i++) {
+        const a = (i / RAYS) * Math.PI * 2;
+        this._v.set(Math.cos(a), 0, Math.sin(a));
+        const hit = physics.raycast(this._w, this._v, REACH, MASK_SIGHT, this.ray);
+        if (!hit.hit) open++;
+      }
+      n.openness = open / RAYS;
+    }
   }
 
   /** Drops a vertical probe to find standable ground; null when there is none. */
@@ -173,68 +307,183 @@ export class SpawnGraph {
 
   markUsed(node: SpawnNode, now: number): void {
     node.lastUsed = now;
+    const p = this.director.pointById(node.id);
+    if (p) {
+      p.lastUsed = now;
+      p.lastUsedBy = -1;
+      p.reservedUntil = now + this.director.weights.reservation;
+    }
+  }
+
+  /* --------------------------------------------------------------- policy -- */
+
+  /**
+   * Switches the ruleset. `'tdm'` is fully dynamic, `'domination'` and
+   * `'hardpoint'` are objective-pulled, `'sd'` is fixed team pads with strict
+   * ownership, `'pve'` is the wave director's distance band. Game modes should
+   * call this once when the match starts.
+   */
+  setMode(mode: SpawnPolicyId): void {
+    this.mode = mode;
+    this.director.setPolicy(mode);
+  }
+
+  /** The objective a spawn should be steered toward. Replaces the previous set. */
+  setObjectives(list: readonly SpawnObjective[]): void {
+    this.objectives.length = 0;
+    for (const o of list) this.objectives.push(o);
   }
 
   /**
+   * Registers a live blast/fire/gas volume. Nothing spawns inside one, ever —
+   * this is the "spawned into a grenade" veto, and it costs one array push.
+   */
+  addHazard(position: THREE.Vector3, radius: number, expiresAt: number, kind = 'blast'): void {
+    this.hazards.push({
+      position: { x: position.x, y: position.y, z: position.z },
+      radius, expires: expiresAt, kind,
+    });
+  }
+
+  /** Feeds the influence map a death. Killzones bleed out of the candidate set. */
+  noteDeath(position: THREE.Vector3, now: number, actorId = -1, killerId = -1): void {
+    this.director.noteDeath(actorId, position, now, killerId);
+  }
+
+  /**
+   * Spawn quality so far: the fraction of spawns that ended in a death within
+   * three seconds, plus the worst individual outcomes. This is the scoreboard
+   * for the whole system — surface it in a debug HUD, not in the player HUD.
+   */
+  quality(now = Infinity): SpawnQualityReport {
+    return this.director.metrics.report(now, 6);
+  }
+
+  /**
+   * Everything a debug scene needs to draw the spawn field: the influence grid
+   * as a snapshot, every candidate with its zone/death-heat/suitability, and
+   * the zones with their current owner.
+   *
+   * For a rendered overlay rather than raw numbers, a debug scene can build
+   * `SpawnDebugView` from `src/session/spawn/DebugView` directly against
+   * `graph.director` — it is a `THREE.Object3D` and is deliberately kept out of
+   * the module barrel so the headless benchmark never pulls in `three`.
+   */
+  debugField(now = 0, team: SpawnTeam = 'friendly'): {
+    influence: InfluenceSnapshot;
+    points: PointDebug[];
+    zones: ZoneDebug[];
+  } {
+    return {
+      influence: influenceSnapshot(this.director.field),
+      points: pointDebug(this.points, this.director.zones, team, now),
+      zones: zoneDebug(this.director.zones, now),
+    };
+  }
+
+  /* --------------------------------------------------------------- picking -- */
+
+  /**
    * Scores every candidate and returns the best. Never returns null once the
-   * graph has nodes: the query constraints are soft so a bad situation still
-   * produces the least-bad spawn.
+   * graph has nodes: the vetoes relax in tiers so a hopeless situation still
+   * produces the least-bad spawn rather than no spawn at all.
    */
   pick(q: SpawnQuery, physics: PhysicsAPI | null, rng: Rand): SpawnNode | null {
     if (this.nodes.length === 0) return null;
-    let best: SpawnNode | null = null;
-    let bestScore = -Infinity;
-    let bestHidden: SpawnNode | null = null;
-    let bestHiddenScore = -Infinity;
+    if (this.points.length !== this.nodes.length) this.publishPoints();
+    this.los.physics = physics;
+    this.director.rand = rng;
 
-    for (const n of this.nodes) {
-      if (q.team !== 'any' && n.team !== q.team && n.team !== 'neutral') continue;
+    const spawningEnemy = q.team === 'enemy';
+    const team: SpawnTeam = spawningEnemy ? 'hostile' : 'friendly';
+    const owner: SpawnTeam | undefined = q.team === 'any' ? undefined : ownerOf(q.team);
 
-      const d = this._v.copy(n.position).sub(q.viewOrigin).length();
-      if (d > q.maxDistance * 1.6) continue;
+    this.buildState(q, team);
 
-      let score = 0;
+    // An enemy spawn is a PvE spawn: hold a distance band around the player and
+    // never appear inside their view. A friendly respawn uses the match policy.
+    const policy: SpawnPolicyId = spawningEnemy ? 'pve' : this.mode;
+    if (this.director.policy.id !== policy) this.director.setPolicy(policy);
 
-      /* distance band — a soft bell around the ideal engagement range */
-      const band = Math.abs(d - q.idealDistance) / Math.max(1, q.idealDistance);
-      score += 30 * Math.exp(-band * band * 2.2);
-      if (d < q.minDistance) score -= 60 * (1 - d / Math.max(0.001, q.minDistance));
-      if (d > q.maxDistance) score -= 24 * ((d - q.maxDistance) / Math.max(1, q.maxDistance));
+    // Territory is a slow signal and there is no per-frame hook here, so it is
+    // advanced on demand. `update` internally rate-limits to 5 Hz.
+    const dt = Math.min(2, Math.max(0.2, q.now - this.lastRefresh));
+    this.lastRefresh = q.now;
+    this.director.update(this.state, dt);
 
-      /* visibility — the dominant term for enemy spawns */
-      const visible = this.isVisible(n.position, q, physics);
-      if (visible) score -= 85;
+    const decision = this.director.request({
+      actorId: this.nextActorId++,
+      team,
+      now: q.now,
+      kind: spawningEnemy ? 'bot' : 'player',
+      owner,
+      seed: this.nextActorId,
+      band: spawningEnemy
+        ? {
+          origin: q.viewOrigin,
+          ideal: q.idealDistance,
+          min: q.minDistance,
+          max: q.maxDistance,
+          weight: 34,
+        }
+        : undefined,
+    }, this.state);
 
-      /* threat proximity: a spawn inside a hostile's lap is a spawn trap */
-      let nearestThreat = Infinity;
-      let threatLos = false;
-      for (const t of q.threats) {
-        const td = n.position.distanceTo(t);
-        if (td < nearestThreat) nearestThreat = td;
-        if (!threatLos && td < 42 && this.hasLineOfSight(n.position, t, physics)) threatLos = true;
-      }
-      if (nearestThreat < 24) score -= 55 * (1 - nearestThreat / 24);
-      if (threatLos) score -= 45;
+    if (!decision.ok) return null;
+    const node = this.nodeById.get(decision.pointId) ?? null;
+    if (node) {
+      node.lastUsed = q.now;
+      node.yaw = decision.yaw;
+    }
+    return node;
+  }
 
-      /* friendly mass: respawning next to a squadmate feels safe and reads well */
-      let nearestAlly = Infinity;
-      for (const a of q.allies) nearestAlly = Math.min(nearestAlly, n.position.distanceTo(a));
-      if (nearestAlly < 30) score += 14 * (1 - nearestAlly / 30);
+  /** Translates a legacy `SpawnQuery` into the module's world state. */
+  private buildState(q: SpawnQuery, team: SpawnTeam): void {
+    const enemyTeam: SpawnTeam = team === 'hostile' ? 'friendly' : 'hostile';
+    this.actors.length = 0;
 
-      /* reuse cooldown so a wave does not stream out of one doorway */
-      const since = q.now - n.lastUsed;
-      if (since < q.cooldown) score -= 40 * (1 - since / q.cooldown);
+    // Threats have no facing in the legacy query, so point them at the mass
+    // they are shooting at — the ally centroid, else the view origin. A wrong
+    // guess only costs an over-strict view-cone veto, which the tiers relax.
+    let ax = 0, az = 0, an = 0;
+    for (const a of q.allies) { ax += a.x; az += a.z; an++; }
+    const lookX = an > 0 ? ax / an : q.viewOrigin.x;
+    const lookZ = an > 0 ? az / an : q.viewOrigin.z;
 
-      score += n.openness * 4;
-      score += rng.range(-3.5, 3.5); // deterministic tie-break jitter
-
-      if (score > bestScore) { bestScore = score; best = n; }
-      if (!visible && !threatLos && score > bestHiddenScore) { bestHiddenScore = score; bestHidden = n; }
+    let id = -1;
+    for (const t of q.threats) {
+      this.actors.push({
+        id: id--, team: enemyTeam, position: t,
+        yaw: Math.atan2(lookX - t.x, lookZ - t.z),
+        alive: true, firing: false, speed: 0,
+      });
+    }
+    for (const a of q.allies) {
+      this.actors.push({
+        id: id--, team, position: a, yaw: 0, alive: true, firing: false, speed: 0,
+      });
     }
 
-    if (q.requireHidden && bestHidden) return bestHidden;
-    return best ?? bestHidden;
+    // The camera is not a combatant but it is a place a spawn must not pop into.
+    this.observer.position.copy(q.viewOrigin);
+    this.observer.dir.copy(q.viewDir);
+    this.observer.cosHalfFov = q.viewCos;
+    this.observer.range = Math.max(40, q.maxDistance * 1.6);
+    this.observer.hard = q.requireHidden;
+
+    const now = q.now;
+    for (let i = this.hazards.length - 1; i >= 0; i--) {
+      if (this.hazards[i].expires < now) this.hazards.splice(i, 1);
+    }
+
+    this.state.now = now;
+    this.state.observers = q.viewCos <= 1 ? [this.observer] : [];
+    this.director.weights.reuseCooldown = q.cooldown;
+    this.director.weights.minEnemyDistance = Math.max(1, q.minDistance);
   }
+
+  /* --------------------------------------------------------------- queries -- */
 
   /** True when `p` is inside the view cone *and* actually unoccluded. */
   isVisible(p: THREE.Vector3, q: SpawnQuery, physics: PhysicsAPI | null): boolean {

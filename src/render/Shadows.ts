@@ -231,13 +231,16 @@ export class ShadowSystem {
     renderer.autoClear = prevAutoClear;
     renderer.setRenderTarget(prevTarget);
 
-    // Sun angular radius: 0.27° physically; `softness` opens it up so shadows
-    // read as soft on screen without needing a 16k shadow map. Opening it 12x
-    // (the old figure) put the penumbra of a 3 m prop at over a third of a metre
-    // and blurred every small shadow out of existence, so the ceiling is now a
-    // little over one degree — still four times the real sun, but the contact
-    // end of a shadow stays legible.
-    const angular = 0.0047 * (1 + 3.5 * THREE.MathUtils.clamp(cfg.softness, 0, 1));
+    // Sun angular radius: 0.265° physically (tan = 0.00463). `softness` opens it
+    // up a little so the penumbra grows visibly with occluder height without
+    // needing a 16k map, but only to ~0.6° — roughly twice the real sun.
+    //
+    // The previous 4.5x opening put the penumbra of a lamppost at 17 cm and of a
+    // roofline at over half a metre. Combined with the old 10 cm filter floor
+    // that turned every shadow in the level into a soft grey field with no
+    // readable edge, which is exactly what "it is daylight and nothing casts a
+    // shadow" describes.
+    const angular = 0.0047 * (1 + 1.2 * THREE.MathUtils.clamp(cfg.softness, 0, 1));
     const info = this.uniforms.boCsmInfo.value;
     info.set(count, Math.tan(angular), far, this.mapSize);
   }
@@ -272,11 +275,18 @@ export class ShadowSystem {
     c.radius = radius;
 
     // --- texel snapping in light space
+    //
+    // `lightBasis` is the light *camera's* world matrix (its columns are the
+    // shadow map's X/Y/Z axes in world space), so world -> light space is the
+    // inverse. Snapping with `lightBasis` instead quantised along the transposed
+    // axes: a perfectly valid grid, just not the one the shadow texels sit on,
+    // so the map still crawled by a fraction of a texel every frame and every
+    // shadow edge shimmered under TAA.
     const texelsPerUnit = this.mapSize / (radius * 2);
-    this.tmpV.copy(this.centre).applyMatrix4(this.lightBasis);
+    this.tmpV.copy(this.centre).applyMatrix4(this.lightBasisInv);
     this.tmpV.x = Math.floor(this.tmpV.x * texelsPerUnit) / texelsPerUnit;
     this.tmpV.y = Math.floor(this.tmpV.y * texelsPerUnit) / texelsPerUnit;
-    this.tmpV.applyMatrix4(this.lightBasisInv);
+    this.tmpV.applyMatrix4(this.lightBasis);
     this.centre.copy(this.tmpV);
 
     // Pull the light back far enough that casters behind the slice still write.

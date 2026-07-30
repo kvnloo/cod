@@ -22,7 +22,7 @@ import { clamp01, Ease, Envelope, motion, Spring, SPRING } from '../Anim';
 import { hairWidth, measureText, text, wash } from '../Draw';
 import type { DrawCtx } from '../Draw';
 import type { HudModel } from '../Model';
-import { ADS_FADE, adsFade, lift, mixRGB, rgba, type Palette, type RGB } from '../Theme';
+import { ADS_FADE, adsFade, lift, rgba, type Palette, type RGB } from '../Theme';
 import { MARGIN } from '../Theme';
 import { ui } from '../UiSettings';
 import { bus } from '../../core/EventBus';
@@ -107,13 +107,18 @@ export class AmmoPanel implements Widget {
     /* ---------------------------------------------------- numbers ------ */
     const magEmpty = w.ammo <= 0;
     const lowMag = w.magSize > 0 && w.ammo / w.magSize <= 0.25;
-    // Healthy magazine is *near-white*, not amber: at 24/30 there is nothing to
-    // warn about, and an orange number here competed with the objective accent.
-    // Colour only arrives as the magazine actually empties.
+    // Healthy magazine is *near-white*. Colour only arrives as the magazine
+    // empties, and the colour it arrives in is **red**, not orange: the palette
+    // has exactly one warm hue reserved for the objective, and an amber "6"
+    // in the corner is indistinguishable from the amber mission timer at a
+    // glance. Depletion is danger, danger is the hostile ramp.
+    // Crossfading red into white gives desaturated *pink*, which reads as a
+    // dying element rather than a warning. The low band therefore steps to a
+    // lifted red and holds it; empty drops to the saturated hostile itself.
     const ammoColor: RGB = magEmpty
       ? p.hostile
       : lowMag
-        ? mixRGB(p.warn, p.ink, clamp01((w.ammo / Math.max(1, w.magSize)) / 0.25) * 0.35)
+        ? lift(p.hostile, 0.3)
         : lift(p.ink, 0.35);
 
     const punch = m.ammoTicker.punch.value;
@@ -135,7 +140,7 @@ export class AmmoPanel implements Widget {
     const flash = lowReserve
       ? 0.55 + 0.45 * Math.sin(this.lowFlashT * 7.4) * motion()
       : 1;
-    const reserveColor = lowReserve ? p.warn : p.inkDim;
+    const reserveColor = lowReserve ? lift(p.hostile, 0.28) : p.inkDim;
 
     const reserveStr = String(Math.round(m.reserveTicker.display));
     const reserveOpts = { size: 25 * s, weight: 600, family: 'cond' as const, tracking: 0.6 * s };
@@ -210,7 +215,7 @@ export class AmmoPanel implements Widget {
     if (!w.reloading && (magEmpty || lowMag)) {
       const beat = 0.62 + 0.38 * Math.sin(this.lowFlashT * (magEmpty ? 8.5 : 5)) * motion();
       const tag = magEmpty ? 'RELOAD  ·  [ R ]' : 'LOW AMMO';
-      const tagCol = magEmpty ? lift(p.hostile, 0.5) : p.warn;
+      const tagCol = magEmpty ? lift(p.hostile, 0.5) : lift(p.hostile, 0.2);
       // Its own row above the weapon name — right-aligned with the rest of the
       // block, so a long "AUTO · SUPPRESSED" line can never run into it.
       const tagY = nameY - 31 * s;
@@ -287,7 +292,7 @@ export class AmmoPanel implements Widget {
       const h = lit ? full : empty;
       if (lit) {
         const edge = i === loaded - 1;
-        const col = low ? p.warn : p.ink;
+        const col = low ? lift(p.hostile, 0.22) : p.ink;
         c.fillStyle = rgba(edge ? lift(col, 0.5) : col, edge ? 1 : 0.92);
       } else {
         c.fillStyle = rgba(p.hair, 0.26);

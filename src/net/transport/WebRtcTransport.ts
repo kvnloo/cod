@@ -79,6 +79,10 @@ export class WebRtcTransport extends BaseTransport {
   private remoteDescSet = false;
   private iceRestartAttempted = false;
   private openChannels = 0;
+  /** An offer is between createOffer and setLocalDescription — do not start another. */
+  private offerPending = false;
+  /** The initial offer has gone out; `negotiationneeded` is noise from here on. */
+  private offerSent = false;
 
   constructor(opts: WebRtcTransportOptions) {
     super('webrtc', opts);
@@ -151,6 +155,13 @@ export class WebRtcTransport extends BaseTransport {
 
     pc.onnegotiationneeded = () => {
       if (this.role !== 'offerer') return;
+      // Every channel is created up front with `negotiated: true` and a fixed id,
+      // so there is never anything to renegotiate. Browsers differ in how many
+      // times they fire this (once coalesced, or once per createDataChannel) and
+      // in whether it lands before or after the answer. Re-offering a session
+      // that is already stable causes SDP glare and can drop a live match, so
+      // once the initial offer is out this event is ignored.
+      if (this.offerSent) return;
       void this.makeOffer(false);
     };
 
@@ -167,13 +178,21 @@ export class WebRtcTransport extends BaseTransport {
     const pc = this.pc;
     if (!pc || isTerminal(this.state)) return;
     if (pc.signalingState !== 'stable') return;
+    // `createOffer` awaits, and signalingState stays 'stable' across that await,
+    // so without a synchronous latch two events landing in the same tick would
+    // both get past the check above and produce two offers.
+    if (this.offerPending) return;
+    this.offerPending = true;
     try {
       const offer = await pc.createOffer(iceRestart ? { iceRestart: true } : undefined);
       if (pc.signalingState !== 'stable') return;
       await pc.setLocalDescription(offer);
+      this.offerSent = true;
       this.signalOut({ kind: 'offer', sdp: pc.localDescription?.sdp ?? offer.sdp ?? '' });
     } catch (err) {
       this.fail(`offer failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      this.offerPending = false;
     }
   }
 
@@ -394,6 +413,11 @@ export class WebRtcHost implements TransportListener {
       rtcConfiguration: this.opts.rtcConfiguration,
       pingIntervalMs: this.opts.pingIntervalMs,
       timeoutMs: this.opts.timeoutMs,
+      // Both of these were declared on WebRtcHostOptions but never forwarded, so
+      // the documented test hook was inert and a headless host could not supply
+      // its own clock. Every accepted player must inherit them.
+      peerConnectionFactory: this.opts.peerConnectionFactory,
+      clock: this.opts.clock,
       signal: (data) => this.opts.signaling.send({ t: 'signal', to: peerId, data }),
     });
     this.byPeer.set(peerId, t);
@@ -452,6 +476,13 @@ export interface WebRtcGuestOptions {
   timeoutMs?: number;
   /** ms to wait for the host's offer and the channels to open. Default 20000. */
   joinTimeoutMs?: number;
+  /**
+   * Injectable so the negotiation state machine can be tested headlessly.
+   * The host side has always had this; without the matching hook here only half
+   * of a peer-to-peer session could be exercised off a browser.
+   */
+  peerConnectionFactory?: (cfg: RTCConfiguration) => RTCPeerConnection;
+  clock?: () => number;
 }
 
 /**
@@ -460,23 +491,45 @@ export interface WebRtcGuestOptions {
  */
 export async function joinAsGuest(opts: WebRtcGuestOptions): Promise<WebRtcTransport> {
   const hello = await opts.signaling.connect();
-  const host = hello.peers.find((p) => p.role === 'host');
+
+  // The host may not be in the room yet — a friend can click join before the
+  // host finishes loading. Rather than freezing "host" in as the remote id and
+  // broadcasting every candidate to the whole room, learn the real peer id from
+  // whichever arrives first: the roster, a later peer-join, or the offer itself.
+  let hostId: PeerId | undefined = hello.peers.find((p) => p.role === 'host')?.peerId;
 
   const t = new WebRtcTransport({
     role: 'answerer',
     localId: hello.peerId,
-    remoteId: host?.peerId ?? 'host',
+    remoteId: hostId ?? 'host',
     channels: opts.channels,
     iceServers: opts.iceServers,
     rtcConfiguration: opts.rtcConfiguration,
     pingIntervalMs: opts.pingIntervalMs,
     timeoutMs: opts.timeoutMs,
-    signal: (data) => opts.signaling.send({ t: 'signal', to: host?.peerId, data }),
+    clock: opts.clock,
+    peerConnectionFactory: opts.peerConnectionFactory,
+    // Read `hostId` at send time, not at construction time.
+    signal: (data) => opts.signaling.send({ t: 'signal', to: hostId, data }),
   });
 
+  const adoptHost = (id: PeerId | undefined): void => {
+    if (!id || hostId) return;
+    hostId = id;
+    t.remoteId = id;
+  };
+
   opts.signaling.onMessage((msg) => {
-    if (msg.t === 'signal') t.handleSignal(msg.data);
-    else if (msg.t === 'peer-leave' && msg.peerId === t.remoteId) t.close('host left');
+    if (msg.t === 'peer-join') {
+      if (msg.peer.role === 'host') adoptHost(msg.peer.peerId);
+      return;
+    }
+    if (msg.t === 'signal') {
+      adoptHost(msg.from);
+      t.handleSignal(msg.data);
+      return;
+    }
+    if (msg.t === 'peer-leave' && msg.peerId === t.remoteId) t.close('host left');
   });
 
   const timeoutMs = opts.joinTimeoutMs ?? 20000;

@@ -32,7 +32,7 @@ const DEG = Math.PI / 180;
  * exactly that reason; this is 2.1×, which reads as a sun at 62–80° of field
  * without becoming a cartoon.
  */
-const SUN_ANGULAR_RADIUS = 0.0100;
+const SUN_ANGULAR_RADIUS = 0.0125;
 
 /**
  * Radiance of the disc relative to the illuminance it delivers.
@@ -43,7 +43,22 @@ const SUN_ANGULAR_RADIUS = 0.0100;
  * over two or three stops, and a specular reflection of it in a window or a wet
  * kerb also clips.
  */
-const SUN_DISC_GAIN = 26;
+const SUN_DISC_GAIN = 34;
+
+/**
+ * Chroma widening applied to the disc/glare colour, at constant luminance.
+ *
+ * Everything within a couple of degrees of the disc is several stops over
+ * display white, so all three channels clip and the core is white — correct.
+ * What makes it read as *a sun* rather than as a hole in the image is the
+ * band where the channels drop below white one at a time: blue first, then
+ * green, leaving an orange ring before the sky colour takes over. The width of
+ * that band in degrees is set by the ratio between the channels, so widening
+ * the ratio widens the rolloff. At golden hour the transmitted R:B is about
+ * 4:1, i.e. two stops of ring; 1.5 takes it to roughly nine to one, which is
+ * three and a half stops and a ring you can actually see at 1080p.
+ */
+const SUN_DISC_CHROMA = 1.5;
 
 /**
  * Brightness of the scattered sky, relative to the direct sun.
@@ -56,7 +71,21 @@ const SUN_DISC_GAIN = 26;
  * The fill the sky used to provide is restored by the level's ambient
  * intensity, which scales the probe without touching what the camera sees.
  */
-const SKY_INTENSITY = 9.5;
+const SKY_INTENSITY = 5.2;
+
+/**
+ * Chroma the dome is authored with, before the tonemapper gets it.
+ *
+ * With the meter anchored to the subject the whole sky sits well above
+ * mid-grey, and AgX plus the grade's highlight bleach desaturate hard up there
+ * — which is how a physically blue zenith and a physically amber horizon both
+ * arrived on screen as the same milky off-white (172,175,174 measured in the
+ * middle of `square-north`). Pre-widening the dome's chroma is what shipped
+ * games do in the grade; doing it in the bake means the SH probe and the PMREM
+ * inherit it too, so the cool sky fill on a shaded wall widens by the same
+ * amount as the sky itself.
+ */
+const SKY_SATURATION = 1.55;
 
 /* --------------------------------------------------- CPU-side atmosphere -- */
 
@@ -179,7 +208,14 @@ vec3 boSkyRadiance( vec3 dir ) {
 		float lum = max( boLuma( uSunLum ), 1e-4 );
 		vec3 tint = uSunLum / lum;
 		float horizon = exp( - max( dir.y, 0.0 ) * uMs.y );
-		float toward = pow( boSat( dot( dir, uSunDir ) * 0.5 + 0.5 ), uMs.z );
+		// Two lobes: a tight one that builds the fire directly around the sun,
+		// and a wide one that washes the whole sun *side* of the dome. The
+		// second is the one that matters for a level whose cameras mostly do
+		// not have the disc in frame — with a single pow-4 lobe the sun was
+		// 73 degrees off the square-north axis and contributed nothing, so
+		// the sky read as one flat tone across the entire frame.
+		float mu = boSat( dot( dir, uSunDir ) * 0.5 + 0.5 );
+		float toward = 0.58 * pow( mu, uMs.z ) + 0.42 * pow( mu, 1.9 );
 		// Only near sunrise/sunset: a high sun has a short enough path that
 		// single scattering is already most of the answer. Full strength below
 		// 12 degrees of elevation, gone by 35.
@@ -219,8 +255,16 @@ vec3 boSkyRadiance( vec3 dir ) {
 	col = mix( col, vec3( boLuma( col ) ) * uFogTint * 1.25, boSat( haze ) );
 	col = mix( col, vec3( boLuma( col ) ) * uFogTint, uWeather.x );
 
+	// --- chroma, widened before the tonemapper gets to compress it. Applied to
+	// the dome only, never to the disc below: the disc is supposed to bleach.
+	col = max( mix( vec3( boLuma( col ) ), col, uWeather.w ), vec3( 0.0 ) );
+
 	if ( uWeather.y > 0.5 ) {
-		col += boSunDisc( dir, uSunDir, uMs.w, uSunDisc, 0.42 );
+		// uNight.z carries the same glare strength the dome pass uses. It used
+		// to be a hardcoded 0.42 here, which meant the cubemap the dome samples
+		// already contained a 25-degree white halo — so lowering the dome's own
+		// glare did nothing and the sun stayed a soft blob.
+		col += boSunDisc( dir, uSunDir, uMs.w, uSunDisc, uNight.z );
 	}
 
 	return max( col, vec3( 0.0 ) );
@@ -366,6 +410,21 @@ export class SkySystem {
   /** Strength of the multiple-scattering warm-up applied at low sun. */
   msAmount = 0.032;
 
+  /**
+   * Circumsolar glare, shared by the cubemap bake and the dome pass.
+   *
+   * The glare term is three exponentials scaled by the disc's own radiance,
+   * which is ~500 in renderer units. At the old 0.42/0.45 even the widest of
+   * them cleared display white, so twenty-five degrees of sky around the sun
+   * was flat paper and the disc inside it could not be picked out — which is
+   * exactly what a critic census reported as "no sun disc anywhere in the sky,
+   * at any hour". At 0.14 only the inner degree clips, the middle term rolls
+   * off through orange over the next three, and the wide term is a sub-white
+   * amber wash. A small hard core inside a large soft glow is what a sun looks
+   * like; one uniform blob is what a bug looks like.
+   */
+  private get sunGlow(): number { return 0.14 * (1 - 0.45 * this.rain); }
+
   readonly sun: SunState = { direction: new THREE.Vector3(0, 1, 0), elevation: Math.PI / 2, azimuth: 0 };
   readonly moon: SunState = { direction: new THREE.Vector3(0, -1, 0), elevation: -Math.PI / 2, azimuth: 0 };
 
@@ -438,7 +497,7 @@ export class SkySystem {
       uAtmo: { value: new THREE.Vector4(SKY_INTENSITY, 13e-6, 0.76, this.altitude) },
       uNight: { value: new THREE.Vector4(0, 0, 0, 1) },
       uGround: { value: new THREE.Vector4(0.21, 0.19, 0.16, 1) },
-      uWeather: { value: new THREE.Vector4(0, disc, 0.05, 0) },
+      uWeather: { value: new THREE.Vector4(0, disc, 0.05, SKY_SATURATION) },
       uMs: { value: new THREE.Vector4(0.032, 3.2, 4.0, SUN_ANGULAR_RADIUS) },
       uFogTint: { value: new THREE.Color(0.72, 0.74, 0.78) },
     });
@@ -586,7 +645,13 @@ export class SkySystem {
     // Disc radiance: far brighter than the illuminance so it blows out on
     // camera the way a real sun does, but still tonemappable.
     if (dayMask > 0.001) {
-      this.sunDiscColor.copy(this.sunIlluminance).multiplyScalar(SUN_DISC_GAIN);
+      const { r, g, b } = this.sunIlluminance;
+      const l = Math.max(0.2126 * r + 0.7152 * g + 0.0722 * b, 1e-5);
+      this.sunDiscColor.setRGB(
+        Math.max(l + (r - l) * SUN_DISC_CHROMA, 0),
+        Math.max(l + (g - l) * SUN_DISC_CHROMA, 0),
+        Math.max(l + (b - l) * SUN_DISC_CHROMA, 0),
+      ).multiplyScalar(SUN_DISC_GAIN);
     } else {
       this.sunDiscColor.setRGB(0, 0, 0);
     }
@@ -628,16 +693,46 @@ export class SkySystem {
       (u.uAtmo.value as THREE.Vector4).set(
         SKY_INTENSITY * (1 - 0.35 * this.rain),
         this.betaM,
-        0.76 + 0.06 * this.fogAmount,
+        // Mie asymmetry. 0.70 rather than 0.76: g sets how sharply the aerosol
+        // phase function spikes forward, and at 0.76 the twenty degrees of sky
+        // around a low sun were several stops over display white — a wall of
+        // paper with the disc lost somewhere inside it. Softening the peak
+        // brings the near-sun sky back under white, which is the only way the
+        // disc is ever distinguishable from its own halo.
+        0.70 + 0.06 * this.fogAmount,
         this.altitude,
       );
-      (u.uNight.value as THREE.Vector4).set(this.nightFactor, moonUp, 0, 1);
+      // Airglow 0.55 rather than 1: the night sky's radiance is a fixed set of
+      // constants, so every time the daytime dome came down (SKY_INTENSITY is
+      // now 6.4, from 22 originally) midnight got relatively brighter, until
+      // 23:12 metered and read as late dusk with the streetlights losing to
+      // the sky. Night should be the hour where the practicals win.
+      (u.uNight.value as THREE.Vector4).set(this.nightFactor, moonUp, this.sunGlow, 0.55);
       (u.uGround.value as THREE.Vector4).set(
         this.groundAlbedo.r, this.groundAlbedo.g, this.groundAlbedo.b, this.groundBounce,
       );
       const w = u.uWeather.value as THREE.Vector4;
       w.x = this.rain * 0.55 + this.fogAmount * 0.35;
       w.z = 0.045 + this.fogAmount * 0.55 + this.rain * 0.3;
+      // Chroma: full at a clear day, pulled back at night (where the airglow
+      // palette is already saturated and a 1.55 would go electric) and under
+      // weather (overcast really is grey).
+      //
+      // Only on the cubemap bake. The equirect bake is the SH source, and the
+      // SH probe is the *fill* — pushing its chroma the same way tipped every
+      // horizontal surface in the level amber, because a widened dome is
+      // warm-biased overall even though its two halves pull opposite ways.
+      // What the camera sees wants more colour; what the shading integrates
+      // wants the physical answer.
+      const sat = mat === this.atmosMaterial
+        ? 1 + (SKY_SATURATION - 1)
+          * (1 - 0.72 * this.nightFactor)
+          * Math.max(1 - 0.6 * this.rain - 0.4 * this.fogAmount, 0.15)
+        // The probe still gets a little, or the zenith blue never survives the
+        // projection and every up-facing surface takes its fill from the warm
+        // half of the dome — which is the beige-everywhere look.
+        : 1 + (SKY_SATURATION - 1) * 0.40 * (1 - 0.72 * this.nightFactor);
+      w.w = sat;
       // Aerosol load feeds the multiple-scattering term: haze and smoke are what
       // make a low sun paint the whole western sky rather than just its halo.
       (u.uMs.value as THREE.Vector4).set(
@@ -785,7 +880,7 @@ export class SkySystem {
       // from there. That rolloff is what still reads as a sun on the days the
       // disc itself is behind the ridge, which at 11 degrees of elevation is
       // most of them.
-      0.45 * (1 - 0.45 * this.rain),
+      this.sunGlow,
       this.nightFactor * moonUp * 3.2,
       moonPhase,
     );

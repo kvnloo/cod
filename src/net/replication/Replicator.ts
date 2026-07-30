@@ -166,8 +166,14 @@ export class ClientReplicationState {
   acksApplied = 0;
   baselineResets = 0;
 
-  constructor(clientId: ClientId, private maxPending: number) {
+  private maxPending: number;
+
+  // Written out longhand rather than as a TS parameter property: node's
+  // strip-only type stripping cannot compile those, and the headless netcode
+  // tests under tools/ import this source directly.
+  constructor(clientId: ClientId, maxPending: number) {
     this.clientId = clientId;
+    this.maxPending = maxPending;
   }
 
   record(snap: PendingSnapshot): void {
@@ -299,8 +305,24 @@ export class Replicator {
   /* ------------------------------------------------------------- capture */
 
   /**
+   * Opens a network tick for PUSH-style producers.
+   *
+   * `write()` stamps changes with `this.tick`, so gameplay code that pushes
+   * values (rather than implementing `ReplicationSource`) must open the tick
+   * first, otherwise its writes are attributed to the previous tick and the
+   * interest grid runs a tick behind the world. The full order is:
+   *
+   *     rep.beginTick(t);   // 1. open
+   *     ...game pushes...   // 2. push whatever changed
+   *     rep.capture(t);     // 3. pull the rest, refresh interest positions
+   *
+   * Pure pull-style hosts can skip straight to `capture`.
+   */
+  beginTick(tick: NetTick): void { this.tick = tick; }
+
+  /**
    * Samples every source and refreshes interest positions. Call once per network
-   * tick, before building snapshots.
+   * tick, after any push-style writes and before building snapshots.
    */
   capture(tick: NetTick): void {
     this.tick = tick;

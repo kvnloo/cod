@@ -555,6 +555,123 @@ section('11. interest management makes larger counts possible');
       .every(([, v]) => (T.SNAP_FIELD.ALL & v) === v));
 }
 
+/* ----------------------------------------- 12. cross-module drift alarms --- */
+/**
+ * TypeScript cannot catch these. A button mask, a protocol version and a
+ * channel name are all bare `number`/`string`, so two modules can disagree
+ * completely and still compile. These checks read the OTHER modules' source
+ * text — the contracts layer owns none of those files — and fail the moment
+ * a declaration there moves away from what `src/net/types.ts` mirrors.
+ *
+ * If one of these fails: either the other module changed deliberately (update
+ * the mirror in types.ts AND docs/NETCODE.md §0) or it changed by accident.
+ */
+section('12. cross-module drift alarms (source-level)');
+{
+  const canon = (n) => {
+    // camelCase (`leanLeft`) and SNAKE_CASE (`LEAN_L`) both reduce to LEAN_LEFT.
+    const u = n.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toUpperCase();
+    return u === 'LEAN_L' ? 'LEAN_LEFT' : u === 'LEAN_R' ? 'LEAN_RIGHT' : u === 'SWAP' ? 'SWITCH' : u;
+  };
+  function readSrc(rel) {
+    try { return readFileSync(join(ROOT, rel), 'utf8'); } catch { return null; }
+  }
+  function parseBitTable(rel, constName) {
+    const src = readSrc(rel);
+    if (!src) return null;
+    const m = new RegExp(`export const ${constName}\\s*=\\s*\\{([\\s\\S]*?)\\}\\s*as const`).exec(src);
+    if (!m) return null;
+    const body = m[1].replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+    const out = {};
+    const entry = /([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:1\s*<<\s*(\d+)|(\d+))/g;
+    let e;
+    while ((e = entry.exec(body)) !== null) {
+      out[canon(e[1])] = e[2] !== undefined ? (1 << Number(e[2])) : Number(e[3]);
+    }
+    return out;
+  }
+  const sameTable = (a, b) => {
+    if (!a || !b) return false;
+    const ka = Object.keys(a).sort(), kb = Object.keys(b).sort();
+    return ka.length === kb.length && ka.every((k, i) => k === kb[i] && a[k] === b[k]);
+  };
+  const diffOf = (a, b) => Object.keys({ ...a, ...b })
+    .filter((k) => a?.[k] !== b?.[k])
+    .map((k) => `${k}:${a?.[k] ?? '-'}!=${b?.[k] ?? '-'}`).join(' ') || 'identical';
+
+  /* -- the mirrors in types.ts must match the real declarations ------------ */
+  const hostBtn = parseBitTable('src/net/host/types.ts', 'BTN');
+  const playerBtn = parseBitTable('src/player/MoveCommand.ts', 'BTN');
+  const replayBtn = parseBitTable('src/session/replay/types.ts', 'BTN');
+
+  check('src/net/host/types.ts BTN was found', hostBtn !== null);
+  check('src/player/MoveCommand.ts BTN was found', playerBtn !== null);
+  check('src/session/replay/types.ts BTN was found', replayBtn !== null);
+
+  check('BUTTON_LAYOUT_HOST mirrors src/net/host/types.ts BTN',
+    sameTable(hostBtn, T.BUTTON_LAYOUT_HOST), diffOf(hostBtn, T.BUTTON_LAYOUT_HOST));
+  check('BUTTON_LAYOUT_PLAYER mirrors src/player/MoveCommand.ts BTN',
+    sameTable(playerBtn, T.BUTTON_LAYOUT_PLAYER), diffOf(playerBtn, T.BUTTON_LAYOUT_PLAYER));
+  check('src/session/replay BTN is still bit-identical to BUTTON (its own stated invariant)',
+    sameTable(replayBtn, T.BUTTON), diffOf(replayBtn, T.BUTTON));
+
+  /* -- the layouts really are incompatible, so bridges MUST remap ---------- */
+  const hostDiffers = ['SPRINT', 'RELOAD', 'USE'].some((a) => T.BUTTON[a] !== T.BUTTON_LAYOUT_HOST[a]);
+  const playerDiffers = T.BUTTON_LAYOUT_PLAYER.FIRE !== T.BUTTON.FIRE;
+  check('HOST and PLAYER layouts are NOT interchangeable with BUTTON (raw pass-through is a bug)',
+    hostDiffers && playerDiffers,
+    `host SPRINT ${T.BUTTON.SPRINT}->${T.BUTTON_LAYOUT_HOST.SPRINT}, player FIRE ${T.BUTTON.FIRE}->${T.BUTTON_LAYOUT_PLAYER.FIRE}`);
+
+  /* -- remapButtons is correct -------------------------------------------- */
+  const full = T.BUTTON_ACTIONS.reduce((m, a) => m | T.BUTTON[a], 0);
+  check('remapButtons NET->PLAYER->NET is lossless (PLAYER defines all 14 actions)',
+    T.remapButtons(T.remapButtons(full, T.BUTTON_LAYOUT_NET, T.BUTTON_LAYOUT_PLAYER),
+      T.BUTTON_LAYOUT_PLAYER, T.BUTTON_LAYOUT_NET) === full,
+    `mask 0x${full.toString(16)}`);
+
+  const hostRound = T.remapButtons(T.remapButtons(full, T.BUTTON_LAYOUT_NET, T.BUTTON_LAYOUT_HOST),
+    T.BUTTON_LAYOUT_HOST, T.BUTTON_LAYOUT_NET);
+  const hostSupported = Object.keys(T.BUTTON_LAYOUT_HOST).reduce((m, a) => m | T.BUTTON[a], 0);
+  check('remapButtons drops actions the target layout cannot express, never invents them',
+    hostRound === hostSupported,
+    `kept [${T.buttonActions(hostRound).join(',')}], dropped [${T.buttonActions(full & ~hostRound).join(',')}]`);
+
+  const fireOnly = T.remapButtons(T.BUTTON.FIRE, T.BUTTON_LAYOUT_NET, T.BUTTON_LAYOUT_PLAYER);
+  check('the concrete bug this prevents: FIRE in the NET layout is JUMP in the PLAYER layout',
+    (T.BUTTON.FIRE & T.BUTTON_LAYOUT_PLAYER.JUMP) !== 0 && fireOnly === T.BUTTON_LAYOUT_PLAYER.FIRE,
+    `raw 0x${T.BUTTON.FIRE.toString(16)} would read as JUMP; remapped 0x${fireOnly.toString(16)} reads as FIRE`);
+
+  check('remapButtons is identity when both layouts are the same object',
+    T.remapButtons(0x2a55, T.BUTTON_LAYOUT_NET, T.BUTTON_LAYOUT_NET) === 0x2a55);
+  check('remapButtons(0) is 0', T.remapButtons(0, T.BUTTON_LAYOUT_NET, T.BUTTON_LAYOUT_HOST) === 0);
+
+  /* -- one protocol version, not two -------------------------------------- */
+  const hostSrc = readSrc('src/net/host/types.ts') ?? '';
+  const hostVer = /export const PROTOCOL_VERSION\s*=\s*(\d+)/.exec(hostSrc);
+  check('src/net/host/types.ts declares its own PROTOCOL_VERSION (known duplicate)', hostVer !== null);
+  check('the two PROTOCOL_VERSION constants agree',
+    hostVer !== null && Number(hostVer[1]) === P.PROTOCOL_VERSION,
+    `host ${hostVer ? hostVer[1] : '?'} vs contract ${P.PROTOCOL_VERSION}`);
+
+  /* -- the host's inline clamp is not a NaN gate --------------------------- */
+  // Both host clamps are `v < l ? l : v > h ? h : v`, which returns NaN for NaN.
+  // A NaN that reaches the integrator poisons a position forever and replicates.
+  const hostClamp = (v, l, h) => (v < l ? l : v > h ? h : v);
+  check('a host-style clamp passes NaN straight through', Number.isNaN(hostClamp(NaN, -1, 1)));
+  check('sanitizeInput() rejects the same command outright',
+    P.sanitizeInput({ ...sampleCommand(1), moveX: NaN }, T.DEFAULT_NET_CONFIG) === null,
+    'this is why it belongs at the authority boundary');
+
+  /* -- transport channels map onto contract channels ----------------------- */
+  const tSrc = readSrc('src/net/transport/Transport.ts') ?? '';
+  const chans = [...tSrc.matchAll(/export const CH_[A-Z_]+\s*=\s*'([^']+)'/g)].map((m) => m[1]);
+  check('every transport channel routes to a declared contract channel',
+    chans.length > 0 && chans.every((c) => c === 'sys' || T.ALL_CHANNELS.includes(c)),
+    `transport [${chans.join(',')}] vs contract [${T.ALL_CHANNELS.join(',')}]`);
+  check('control and state exist on both sides (the two that carry gameplay)',
+    chans.includes('control') && chans.includes('state'));
+}
+
 /* -------------------------------------------------------------- summary --- */
 
 console.log(`\n${'-'.repeat(70)}`);

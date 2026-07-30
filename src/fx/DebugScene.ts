@@ -230,14 +230,14 @@ const UP = new THREE.Vector3(0, 1, 0);
  * the sightline so the beam crosses in front of the camera on its way down, and
  * the shader ends it on whatever the depth buffer says is there.
  */
-function installSunShafts(count = 7): void {
+function installSunShafts(count = 11): void {
   const fx = fxRef;
   if (!fx) return;
   const cam = fx.camera;
   const travel = fx.sunDirection().negate().normalize();
   // A beam that is not descending has nowhere to land; bail rather than lay a
   // horizontal slab of haze across the whole frame.
-  if (travel.y > -0.12) return;
+  if (travel.y > -0.07) return;
 
   const fwd = new THREE.Vector3();
   cam.getWorldDirection(fwd);
@@ -249,24 +249,30 @@ function installSunShafts(count = 7): void {
   const rand = new Rand('fx:shafts');
   const groundY = fx.floorUnder(cam.position.x, cam.position.y, cam.position.z);
   // Height of the "window" the beam comes through — a roofline, near enough.
+  // Capped in *length*, not in height: as the sun drops the run to a roofline
+  // grows without bound, and a sixty-metre box of haze laid across the square
+  // is a slab of fog rather than a beam.
   const drop = 8.0;
-  const run = drop / -travel.y;
+  const run = Math.min(26, drop / -travel.y);
   for (let i = 0; i < count; i++) {
     // Anchor each beam by where it *lands*, spread down the sightline. A shaft
     // that ends on the ground in front of you reads as a beam; one that floats
     // in mid-air reads as fog.
     const land = cam.position.clone()
-      .addScaledVector(fwd, 6 + i * 2.9)
-      .addScaledVector(side, (i % 2 === 0 ? -1 : 1) * (0.8 + rand.next() * 3.0));
+      .addScaledVector(fwd, 4.5 + i * 1.9)
+      .addScaledVector(side, (i % 2 === 0 ? -1 : 1) * (0.6 + rand.next() * 3.6));
     land.y = groundY;
     const origin = land.clone().addScaledVector(travel, -run);
     fx.addLightShaft(origin, travel, UP, {
-      width: 0.7 + rand.next() * 1.2,
-      height: 0.9 + rand.next() * 1.1,
+      // Narrow and bright beats wide and faint. A two-metre-wide beam at a
+      // sixth of the scene's brightness is a smear of glare; a half-metre one
+      // at three times that is a shaft of light with an edge you can point at.
+      width: 0.34 + rand.next() * 0.42,
+      height: 0.42 + rand.next() * 0.5,
       // Stop just past the ground; the depth test trims the rest.
       length: run + 2.5,
-      color: 0xffe0ab,
-      intensity: 0.16,
+      color: 0xffdca2,
+      intensity: 0.52,
       // Barely any axial decay: a beam this short is not losing much to
       // extinction, and fading it out mid-air is what makes a shaft read as a
       // smear of glare instead of light landing on the floor.
@@ -704,7 +710,12 @@ export function registerFxDebugScene(fx: FXSystem, engine: EngineContext['engine
       // A low sun is the whole point: shafts are additive, so they only read
       // against a scene that has some shadow in it, and a near-horizontal beam
       // crosses the frame instead of stabbing straight down out of shot.
-      position: [4.0, 1.80, 2.0], yaw: 105, pitch: 2, fov: 62, hour: 15.6, viewModel: false,
+      // A low sun is the difference between a beam and a smear: it rakes the
+      // sightline instead of stabbing down out of frame, it drops the square
+      // into shadow so an additive beam has something dark to read against, and
+      // it puts the key close enough to the view ray for the forward-scattering
+      // lobe — which is most of a shaft's brightness — to actually fire.
+      position: [4.0, 1.70, 2.0], yaw: 105, pitch: -3, fov: 62, hour: 17.1, viewModel: false,
       setup: stage(4.0, () => { /* ambient dust only */ }, () => {
         if (fxRef) { fxRef.environment.dust = 1.0; fxRef.environment.litter = 0.35; }
         installSunShafts();

@@ -26,6 +26,7 @@ import type { DamageStop, WeaponDef } from '../../weapons/types';
 import { ModifierStack } from './Modifiers';
 import { attachmentEntry, isBaseline } from './data/attachments';
 import { perkDef } from './data/perks';
+import { RELOAD_RAILS, type DurationRail } from './data/balance';
 import { LOADOUT_SLOTS } from './types';
 import type {
   AttachmentEntry, EffectiveWeaponStats, LoadoutFlag, LoadoutSlot, Modifier,
@@ -137,6 +138,17 @@ export function resolveWeapon(
     if (f.capped) capped.push(stat);
     return f.value;
   };
+  /**
+   * Reload timings are railed in seconds, not in multiples — see
+   * `RELOAD_RAILS`. A weapon with no such reload (base 0) stays at 0.
+   */
+  const reloadSeconds = (base: number, scale: number, rail: DurationRail): number => {
+    if (!(base > 0)) return 0;
+    const v = base * scale;
+    if (v > rail.max) { capped.push('reloadTime'); return rail.max; }
+    if (v < rail.min) { capped.push('reloadTime'); return rail.min; }
+    return v;
+  };
 
   const h = def.handling;
   const r = def.recoil;
@@ -165,8 +177,13 @@ export function resolveWeapon(
     sprintOut: round(fold('sprintOut', h.sprintOut), 4),
     drawTime: round(fold('drawTime', h.drawTime), 4),
     holsterTime: round(fold('holsterTime', h.holsterTime), 4),
-    reloadTactical: round(def.reload.tactical * reloadScale, 4),
-    reloadEmpty: round(def.reload.empty * reloadScale, 4),
+    reloadTactical: round(reloadSeconds(def.reload.tactical, reloadScale, RELOAD_RAILS.tactical), 4),
+    reloadEmpty: round(reloadSeconds(def.reload.empty, reloadScale, RELOAD_RAILS.empty), 4),
+    shellReload: def.reload.tactical <= 0 && (def.reload.perShell ?? 0) > 0,
+    reloadPerShell: round(reloadSeconds(def.reload.perShell ?? 0, reloadScale, RELOAD_RAILS.perShell), 4),
+    reloadShellIn: round((def.reload.shellIn ?? 0) * reloadScale, 4),
+    reloadShellOut: round((def.reload.shellOut ?? 0) * reloadScale, 4),
+    reloadScale: round(reloadScale, 4),
     moveScale: round(fold('moveScale', h.moveScale), 4),
     adsMoveScale: round(fold('adsMoveScale', h.adsMoveScale), 4),
     swayScale: round(fold('sway', def.view.swayScale), 4),
@@ -264,7 +281,9 @@ export function toResolvedStats(eff: EffectiveWeaponStats): ResolvedStats {
     moveScale: eff.moveScale,
     adsMoveScale: eff.adsMoveScale,
     magSize: eff.magSize,
-    reloadScale: safe(eff.reloadTactical, def.reload.tactical),
+    // Shell reloaders have no tactical reload to divide by — the scale is
+    // carried directly so shotguns still respond to reload modifiers.
+    reloadScale: eff.reloadScale,
     muzzleVelocity: eff.muzzleVelocity,
     penetration: eff.penetration,
     rangeScale: eff.falloffScale,

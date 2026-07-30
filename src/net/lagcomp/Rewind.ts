@@ -23,28 +23,43 @@
  *   2. The client deliberately draws D further into the past, because it
  *      interpolates between two received snapshots rather than extrapolating.
  *
- * So, when the fire command carries the client's estimate of server time C
- * (which it does here — the clock-sync layer hands every client a server-clock
- * estimate, and the command is stamped with it), the upstream leg is already
- * paid for by C itself, and:
+ * The canonical formula, the one in every lag-compensation write-up, is
  *
- *      shooterRenderTime = C - RTT * rttFraction - D
- *                        = C - RTT/2 - D              (symmetric link)
+ *      shooterRenderTime = S - RTT/2 - D
  *
- * This is the formula in the brief, and it is the one used below.
- * `rttFraction` exists because "half of RTT" is an *assumption* of a symmetric
- * link, not a measurement; asymmetric connections can be tuned without touching
- * code.
+ * and it is the NO-STAMP case: the host knows only that the command turned up
+ * at S, so it has to guess when the client authored it — one upstream leg ago,
+ * which on a symmetric link is RTT/2. `rttFraction` exists because "half of
+ * RTT" is an *assumption* about link symmetry, not a measurement, so an
+ * asymmetric deployment can be tuned without touching code:
  *
- * When no command stamp is available (a transport that cannot stamp, or an
- * AI/host-local shot) the upstream leg has not been accounted for anywhere, and
- * the base becomes S:
+ *      shooterRenderTime = S - RTT * rttFraction - D        (no stamp)
  *
- *      shooterRenderTime = S - RTT - D
+ * When the command *is* stamped with the client's own server-clock estimate C —
+ * which is the normal path here, because the clock-sync layer gives every
+ * client an NTP-style estimate of server time — there is nothing left to guess:
  *
- * which is the same expression with the missing upstream share RTT*(1-fraction)
- * added back. `computeRewindTime` handles both, so callers never have to pick a
- * formula — they just supply what they know.
+ *      shooterRenderTime = C - D                            (stamped)
+ *
+ * NO RTT TERM. This is worth being emphatic about, because subtracting RTT/2
+ * from C as well is an easy and very expensive mistake: it rewinds every shot
+ * an extra half-RTT into the past (75 ms at 150 ping), which shows up as
+ * "I was already behind cover and still died".
+ *
+ * Why no RTT term survives: what the client draws for a remote player is not
+ * "the newest packet" but an explicit interpolation of the snapshot stream at
+ * the server timestamp `renderTime = serverNow - D` (see
+ * `src/net/interp/Interpolator.ts`, which computes exactly that off
+ * `NetClock.serverNowMs()`). Snapshot timestamps are server-clock values, so
+ * the world the client drew is identified by a server-clock time regardless of
+ * how long the packets took to arrive. L_down is already inside D: D has to be
+ * large enough to cover it or interpolation starves. Paying for it twice is
+ * double counting.
+ *
+ * D must therefore be the shooter's *effective* delay — `Interpolator.delayMs`
+ * plus its bias, which is adaptive — so the client reports it and the host
+ * clamps it to `maxInterpDelayMs`. `computeRewindTime` handles both branches,
+ * so callers never have to pick a formula; they supply what they know.
  *
  * ============================================================================
  * WHY NOT MOVE THE PHYSICS COLLIDERS
@@ -84,9 +99,16 @@ export interface RewindTiming {
    * whenever the transport has it — it removes the upstream latency guess.
    */
   commandServerTimeSec?: number;
-  /** Host-measured round trip to the shooter, milliseconds. */
+  /**
+   * Host-measured round trip to the shooter, milliseconds. Used only when
+   * `commandServerTimeSec` is absent — a stamped command needs no RTT guess.
+   */
   rttMs: number;
-  /** Interpolation delay the shooter renders with, milliseconds. */
+  /**
+   * The shooter's *effective* interpolation delay, milliseconds: what its
+   * `Interpolator` actually rendered behind server-now (delay + bias), not the
+   * nominal setting. Client-reported, host-clamped to `maxInterpDelayMs`.
+   */
   interpDelayMs: number;
 }
 
@@ -104,7 +126,7 @@ export interface RewindPlan {
   ageMs: number;
   /** serverTime - rawRenderTime, milliseconds. */
   rawAgeMs: number;
-  /** Latency share subtracted, milliseconds (downstream + any upstream). */
+  /** Latency subtracted, milliseconds. Always 0 when a command stamp was used. */
   rttTermMs: number;
   /** Interpolation delay subtracted, milliseconds. */
   interpTermMs: number;
@@ -112,6 +134,12 @@ export interface RewindPlan {
   clamped: boolean;
   /** True when a client command stamp was used as the base instead of "now". */
   usedCommandStamp: boolean;
+  /**
+   * True when a command stamp was supplied but discarded as implausible — it
+   * claimed to be older than the host's own RTT measurement allows, so the
+   * host fell back to the unstamped formula. See `maxStampSkewMs`.
+   */
+  stampClamped: boolean;
 }
 
 export function createRewindPlan(): RewindPlan {
@@ -119,7 +147,7 @@ export function createRewindPlan(): RewindPlan {
     compensated: false, reason: 'ok',
     renderTimeSec: 0, rawRenderTimeSec: 0,
     ageMs: 0, rawAgeMs: 0, rttTermMs: 0, interpTermMs: 0,
-    clamped: false, usedCommandStamp: false,
+    clamped: false, usedCommandStamp: false, stampClamped: false,
   };
 }
 
@@ -137,18 +165,32 @@ export function computeRewindTime(
   out.clamped = false;
   out.compensated = cfg.enabled;
 
-  const hasStamp = t.commandServerTimeSec !== undefined && Number.isFinite(t.commandServerTimeSec);
-  out.usedCommandStamp = hasStamp;
+  out.stampClamped = false;
 
   // Never believe a client's numbers unconditionally: clamp before use.
   const rtt = clamp(Number.isFinite(t.rttMs) ? t.rttMs : 0, 0, cfg.maxRttMs);
   const interp = clamp(Number.isFinite(t.interpDelayMs) ? t.interpDelayMs : 0, 0, cfg.maxInterpDelayMs);
+  const upstreamMs = rtt * cfg.rttFraction;
 
-  const downstreamMs = rtt * cfg.rttFraction;
-  // Without a command stamp the upstream leg has not been paid for anywhere.
-  const upstreamMs = hasStamp ? 0 : rtt * (1 - cfg.rttFraction);
+  let useStamp = t.commandServerTimeSec !== undefined && Number.isFinite(t.commandServerTimeSec);
+  if (useStamp) {
+    // Back-dating the stamp is the one lever a client has on how far the world
+    // rewinds. A stamp should be about one upstream leg old; anything much
+    // older than the host's own RTT measurement allows is not believed. The
+    // response is to ignore it, not to reject the shot, so an honest player
+    // caught by a latency spike still gets a fair (host-computed) rewind.
+    if (S - (t.commandServerTimeSec as number) > (upstreamMs + cfg.maxStampSkewMs) / 1000) {
+      useStamp = false;
+      out.stampClamped = true;
+    }
+  }
+  out.usedCommandStamp = useStamp;
 
-  out.rttTermMs = downstreamMs + upstreamMs;
+  // A stamped command already says *when* it was authored, so no part of the
+  // RTT is subtracted: the only remaining delay is the interpolation window.
+  // Unstamped, the host must guess the authoring time from the arrival time,
+  // and the guess is one upstream leg.
+  out.rttTermMs = useStamp ? 0 : upstreamMs;
   out.interpTermMs = interp;
 
   if (!cfg.enabled) {
@@ -161,7 +203,7 @@ export function computeRewindTime(
     return out;
   }
 
-  const base = hasStamp ? (t.commandServerTimeSec as number) : S;
+  const base = useStamp ? (t.commandServerTimeSec as number) : S;
   const raw = base - (out.rttTermMs + out.interpTermMs) / 1000;
   out.rawRenderTimeSec = raw;
   out.rawAgeMs = (S - raw) * 1000;

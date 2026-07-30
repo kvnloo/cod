@@ -25,6 +25,7 @@ import { RatingStore } from './Store';
 import { DEFAULT_WIDENING, describeCurve } from './Widening';
 import type {
   BackfillRefusal, HumanSlot, LiveMatchView, MatchId, MatchRoster, PlayerId, PlaylistId,
+  WideningParams,
 } from './types';
 
 /* ----------------------------------------------------------------- config -- */
@@ -43,6 +44,17 @@ export interface SimConfig {
   step: number;
   /** Safety valve on the virtual clock. */
   maxSeconds: number;
+  /** Live-ops widening override — the axis `tools/session-mm-sweep.mjs` walks. */
+  widening?: Partial<WideningParams>;
+  /** Matches each synthetic player wants, as a multiple of an evening's play. */
+  appetiteScale?: number;
+  /**
+   * Seconds a fresh ticket searches for a *new* lobby before it also becomes
+   * eligible to be dropped into a live one. Low values give individuals fast
+   * games; they also drain the pool that new lobbies are built from, so this
+   * trades one player's queue time against everybody's bot count.
+   */
+  joinInProgressAfter: number;
 }
 
 export const DEFAULT_SIM: SimConfig = {
@@ -55,6 +67,7 @@ export const DEFAULT_SIM: SimConfig = {
   scoreLimit: 75,
   step: 0.5,
   maxSeconds: 4000,
+  joinInProgressAfter: 10,
 };
 
 /* ------------------------------------------------------------------ stats -- */
@@ -82,8 +95,19 @@ export interface SimStats {
   skillSpread: Dist;
   teamDelta: Dist;
   hostPing: Dist;
-  /** Fraction of all match slots filled by a bot. */
+  /** Fraction of match slots filled by a bot *at the instant of formation*. */
   botFillRate: number;
+  /**
+   * Fraction of slot-seconds across every live match spent occupied by a bot —
+   * what a player actually experiences.
+   *
+   * This is the number to judge the system on, and it is markedly lower than
+   * `botFillRate`, because a slot bot-filled at formation is handed to the
+   * first human the queue can route in and stays human afterwards. Formation
+   * is a snapshot of the worst instant in a match's life; occupancy integrates
+   * over the whole thing.
+   */
+  botOccupancy: number;
   botSlots: number;
   totalSlots: number;
   matchesWithBots: number;
@@ -95,6 +119,10 @@ export interface SimStats {
   refusals: Record<string, number>;
   /** Pearson correlation of final rating vs latent skill (>= 3 matches). */
   ratingCorrelation: number;
+  /** The same correlation sliced by games played — the convergence curve. */
+  ratingCorrelationByExperience: Array<{ minMatches: number; r: number; n: number }>;
+  /** Mean games played by the rated cohort. */
+  meanMatchesPlayed: number;
   ratedPlayers: number;
   meanRd: number;
   events: Record<string, number>;
@@ -151,7 +179,7 @@ function pearson(xs: number[], ys: number[]): number {
 export function runSimulation(partial: Partial<SimConfig> = {}): SimStats {
   const cfg: SimConfig = { ...DEFAULT_SIM, ...partial };
   const rng = new Rand(cfg.seed);
-  const pop = generatePopulation(cfg.population, rng, {});
+  const pop = generatePopulation(cfg.population, rng, { appetiteScale: cfg.appetiteScale });
   const byId = new Map<PlayerId, SyntheticPlayer>(pop.map((p) => [p.id, p]));
   const events: Record<string, number> = {};
   const emit: MmEmitter = <K extends EventKey>(key: K, _payload: GameEvents[K]): void => {
@@ -163,7 +191,8 @@ export function runSimulation(partial: Partial<SimConfig> = {}): SimStats {
     seed: cfg.seed ^ 0x9e37,
     store,
     emit,
-    joinInProgressAfter: 10,
+    joinInProgressAfter: cfg.joinInProgressAfter,
+    queue: cfg.widening ? { widening: cfg.widening } : undefined,
   });
 
   const idle = new Set<PlayerId>(pop.map((p) => p.id));
@@ -185,6 +214,9 @@ export function runSimulation(partial: Partial<SimConfig> = {}): SimStats {
   let leavers = 0;
   let playersMatched = 0;
   let backfillPlacements = 0;
+  // Slot-seconds, integrated every step over every live match.
+  let botSlotSeconds = 0;
+  let allSlotSeconds = 0;
 
   let t = 0;
   const seen = new Set<MatchId>();
@@ -250,6 +282,11 @@ export function runSimulation(partial: Partial<SimConfig> = {}): SimStats {
     /* ------------------------------------------------------------ matches -- */
     for (const [id, m] of [...live]) {
       if (m.done) continue;
+      // Integrate occupancy before anything mutates the roster this step.
+      for (const s of m.roster.slots) {
+        allSlotSeconds += cfg.step;
+        if (s.kind === 'bot') botSlotSeconds += cfg.step;
+      }
       m.view.elapsed += cfg.step;
       for (let team = 0; team < m.scores.length; team++) {
         m.scores[team] += m.rate[team] * cfg.step * rng.range(0.7, 1.3);
@@ -294,13 +331,35 @@ export function runSimulation(partial: Partial<SimConfig> = {}): SimStats {
   const ys: number[] = [];
   let rdSum = 0;
   let rated = 0;
+  let matchesPlayedSum = 0;
   for (const rec of store.all()) {
     const p = byId.get(rec.id);
     if (!p || rec.rating.matches < 3) continue;
     xs.push(rec.rating.rating);
     ys.push(p.latentSkill);
     rdSum += rec.rating.rd;
+    matchesPlayedSum += rec.rating.matches;
     rated++;
+  }
+
+  /**
+   * Correlation as a function of games played. A rating system is judged on
+   * where this curve *goes*, not on one point of it: Glicko-2 starting every
+   * player at 1500/RD 350 cannot know anything after three matches, so a low
+   * number there is convergence speed, whereas a flat curve means the update is
+   * actually broken.
+   */
+  const byExperience: Array<{ minMatches: number; r: number; n: number }> = [];
+  for (const minMatches of [3, 5, 8, 12, 20]) {
+    const bx: number[] = [];
+    const by: number[] = [];
+    for (const rec of store.all()) {
+      const p = byId.get(rec.id);
+      if (!p || rec.rating.matches < minMatches) continue;
+      bx.push(rec.rating.rating);
+      by.push(p.latentSkill);
+    }
+    byExperience.push({ minMatches, r: bx.length > 2 ? pearson(bx, by) : NaN, n: bx.length });
   }
 
   const refusals: Record<string, number> = {};
@@ -321,6 +380,7 @@ export function runSimulation(partial: Partial<SimConfig> = {}): SimStats {
     teamDelta: dist(deltas),
     hostPing: dist(pings),
     botFillRate: totalSlots > 0 ? botSlots / totalSlots : 0,
+    botOccupancy: allSlotSeconds > 0 ? botSlotSeconds / allSlotSeconds : 0,
     botSlots,
     totalSlots,
     matchesWithBots,
@@ -331,6 +391,8 @@ export function runSimulation(partial: Partial<SimConfig> = {}): SimStats {
     leavers,
     refusals,
     ratingCorrelation: pearson(xs, ys),
+    ratingCorrelationByExperience: byExperience,
+    meanMatchesPlayed: rated > 0 ? matchesPlayedSum / rated : 0,
     ratedPlayers: rated,
     meanRd: rated > 0 ? rdSum / rated : 0,
     events,
@@ -536,7 +598,13 @@ export function runBackfillPolicyProbe(playlistId: PlaylistId = 'core-tdm-6v6'):
   const duration = 420;
   const limit = 75;
   return rows.map(([label, ef, gap]) => {
-    const lead = label === 'near score limit' ? limit * 0.85 : limit * 0.4;
+    // Build the scores *up* from the trailing team so the requested gap is
+    // actually representable. Anchoring the leader at 40% of the limit and
+    // subtracting silently clamped every gap wider than 0.4 to zero, so the
+    // blowout row was quietly probing an even match.
+    const lead = label === 'near score limit'
+      ? limit * 0.85
+      : limit * 0.1 + limit * gap;
     const view: LiveMatchView = {
       matchId: 'probe', phase: 'live',
       elapsed: duration * ef, duration, scoreLimit: limit,

@@ -36,10 +36,13 @@ export { LOADOUT_SLOTS, STAT_KEYS } from './types';
 
 /* --- the algebra -------------------------------------------------------- */
 export {
-  ModifierStack, clampToRule, railsFor,
+  ModifierStack, clampToRule, railBounds, railsFor,
   type Contribution, type StatFold,
 } from './Modifiers';
-export { STAT_RULES, LIMITS, FLAG_LABEL, FLAG_SIDE, type StatRule } from './data/balance';
+export {
+  STAT_RULES, LIMITS, RELOAD_RAILS, FLAG_LABEL, FLAG_SIDE,
+  type StatRule, type DurationRail,
+} from './data/balance';
 
 /* --- resolution --------------------------------------------------------- */
 export {

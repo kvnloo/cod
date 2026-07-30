@@ -163,6 +163,9 @@ export class MigrationCoordinator {
   migrations = 0;
   lastReason = 'init';
 
+  readonly selfStableId: StableId;
+
+  private hooks: MigrationHooks;
   private lastHostMs: number;
   private electionStartedMs = 0;
   private candidate: StableId | null = null;
@@ -171,12 +174,16 @@ export class MigrationCoordinator {
   private checkpoint: HostCheckpoint | null = null;
   private rejectedCheckpoints = 0;
 
+  // NB: explicit fields rather than TS parameter properties — the headless test
+  // runner strips types without emitting, and parameter properties need emit.
   constructor(
-    readonly selfStableId: StableId,
-    private hooks: MigrationHooks,
+    selfStableId: StableId,
+    hooks: MigrationHooks,
     policy: Partial<MigrationPolicy> = {},
     nowMs = 0,
   ) {
+    this.selfStableId = selfStableId;
+    this.hooks = hooks;
     this.policy = { ...DEFAULT_MIGRATION_POLICY, ...policy };
     this.lastHostMs = nowMs;
   }

@@ -789,6 +789,84 @@ section('8. Determinism');
 }
 
 /* -------------------------------------------------------------------------- */
+/* 9. join under loss — the cost of betting on an unacked baseline             */
+/* -------------------------------------------------------------------------- */
+
+section('9. Join with the first baselines dropped');
+
+/**
+ * The encoder assumes an unacked baseline arrived and deltas against it. This
+ * is the case where that bet is WRONG: the first `dropFirst` packets are lost,
+ * so the client holds nothing and every delta against the lost baseline is
+ * undecodable. It must recover in bounded time and never, ever diverge.
+ */
+function runJoinLoss(dropFirst, retry) {
+  const world = buildWorld(SEED);
+  const enc = new DeltaEncoder({ historyTicks: 64, registry, baselineRetryTicks: retry });
+  const dec = new DeltaDecoder({ historyTicks: 64, registry });
+  const dt = 1 / HZ;
+  const lat = 2;
+  const inFlight = [], ackFlight = [];
+  let wasted = 0, baselines = 0, syncTick = -1, divergence = null, checked = 0, bytes = 0;
+
+  for (let tick = 0; tick < 200; tick++) {
+    stepWorld(world, dt, tick);
+    for (let i = ackFlight.length - 1; i >= 0; i--) {
+      if (ackFlight[i].arriveTick <= tick) { enc.ack(ackFlight[i].tick); ackFlight.splice(i, 1); }
+    }
+    const w = new BitWriter({ capacity: 1400 });
+    const res = enc.encode(w, tick, views(world));
+    const pkt = w.toBytes();
+    bytes += pkt.length;
+    if (res.isBaseline) baselines++;
+    if (tick >= dropFirst) inFlight.push({ arriveTick: tick + lat, bytes: pkt });
+
+    for (let i = inFlight.length - 1; i >= 0; i--) {
+      if (inFlight[i].arriveTick > tick) continue;
+      const p = inFlight[i]; inFlight.splice(i, 1);
+      const snap = dec.decode(new BitReader(p.bytes));
+      if (!snap) { wasted++; continue; }         // undecodable: client stays silent
+      if (syncTick < 0) syncTick = snap.tick;
+      ackFlight.push({ arriveTick: tick + lat, tick: snap.tick });
+      const diff = worldsIdentical(enc.expectedView(snap.tick), snap.entities);
+      checked++;
+      if (diff && !divergence) divergence = `tick ${snap.tick}: ${diff}`;
+    }
+  }
+  return { wasted, baselines, syncTick, divergence, checked, bytes };
+}
+
+{
+  const r = runJoinLoss(3, 8);
+  console.log(`  first 3 packets dropped, retry=8`);
+  console.log(`  undecodable packets ......... ${r.wasted}`);
+  console.log(`  baselines sent .............. ${r.baselines}`);
+  console.log(`  client synced at tick ....... ${r.syncTick}`);
+  check('a lost join baseline still syncs the client', r.syncTick >= 0, `tick ${r.syncTick}`);
+  check('recovery is bounded by baselineRetryTicks', r.syncTick <= 3 + 8 + 1, `tick ${r.syncTick}`);
+  check('a wrong bet wastes only the undecodable window', r.wasted <= 8, `${r.wasted} packets`);
+  check('never diverges after recovering from a lost baseline',
+    r.divergence === null, r.divergence || `${r.checked} snapshots bit-exact`);
+
+  // The whole point of the optimism: a clean join must cost exactly one world.
+  const clean = runJoinLoss(0, 8);
+  check('a clean join costs exactly one full world', clean.baselines === 1,
+    `${clean.baselines} baselines`);
+  // retry=0 disables the bet: a full world every tick until the first ack.
+  // That is the cost the optimism removes, and it scales with RTT.
+  const spammy = runJoinLoss(0, 0);
+  const saved = spammy.bytes - clean.bytes;
+  console.log(`  join burst, 4-tick RTT: optimistic=${clean.baselines} baseline(s), ` +
+    `pessimistic=${spammy.baselines}`);
+  console.log(`  bytes saved per joining client .. ${saved}` +
+    `   (12 clients at match start: ${(saved * 12 / 1024).toFixed(1)} KiB)`);
+  check('optimism removes the per-RTT baseline burst', clean.baselines === 1 && spammy.baselines > 1,
+    `${clean.baselines} vs ${spammy.baselines} baselines`);
+  check('pessimistic mode never hands out an undecodable delta', spammy.wasted === 0,
+    `${spammy.wasted} wasted`);
+}
+
+/* -------------------------------------------------------------------------- */
 
 console.log(`\n${failed === 0 ? 'PASS' : 'FAIL'}  ${passed} passed, ${failed} failed`);
 if (failed) {

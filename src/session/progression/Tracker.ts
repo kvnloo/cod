@@ -29,11 +29,22 @@ export interface XpSink {
   award(amount: number, reason: string): void;
 }
 
-/** XP for sources nothing else in the game awards yet. */
+/**
+ * XP for sources nothing else in the game awards yet.
+ *
+ * `Scoring` owns kills, headshots, longshots, multikills and killstreak
+ * call-outs; `Match` owns objective completion and the match-result bonus.
+ * Everything below was unpaid before this tracker existed — a Firefight wave and
+ * a capture tick were worth literally nothing.
+ */
 export const TRACKER_XP = {
   firstBlood: 300,
   revenge: 100,
   pointblank: 25,
+  /** Surviving and clearing a Firefight wave. */
+  waveCleared: 400,
+  /** Each 10% of an objective captured *while the player is in the volume*. */
+  captureTick: 15,
 } as const;
 
 export class MatchEventTracker {
@@ -49,6 +60,8 @@ export class MatchEventTracker {
   private ads = false;
   /** Weapon XP accumulated per weapon, mirrored so events can report a total. */
   private mirror = new Map<string, number>();
+  /** Objective id → highest capture progress already paid for. */
+  private captured = new Map<string, number>();
 
   constructor(
     private readonly session: MatchSession,
@@ -111,8 +124,30 @@ export class MatchEventTracker {
 
     push(p.on('streak:multikill', (e) => { this.session.noteMultikill(e.count); }));
     push(p.on('killstreak:activated', () => { this.session.noteKillstreakUsed(); }));
-    push(p.on('objective:complete', () => { this.session.noteObjective(); }));
-    push(p.on('wave:cleared', (e) => { this.session.noteWave(e.index + 1); }));
+    push(p.on('objective:complete', (e) => {
+      this.session.noteObjective();
+      this.captured.delete(e.id);
+    }));
+
+    // Capture ticks. `contested` is true only while the local player is inside
+    // the objective volume, so this pays for work the player actually did and
+    // never for a teammate capping alone. Progress is ratcheted, so an
+    // objective that decays and is re-taken is not paid for twice.
+    push(p.on('objective:update', (e) => {
+      const last = this.captured.get(e.id) ?? 0;
+      const now = Math.max(0, Math.min(1, e.progress));
+      if (now <= last) return;
+      if (e.contested) {
+        const bands = Math.floor(now * 10) - Math.floor(last * 10);
+        if (bands > 0) this.sink.award(TRACKER_XP.captureTick * bands, 'Captures');
+      }
+      this.captured.set(e.id, now);
+    }));
+
+    push(p.on('wave:cleared', (e) => {
+      this.session.noteWave(e.index + 1);
+      this.sink.award(TRACKER_XP.waveCleared, 'Waves Cleared');
+    }));
     push(p.on('hud:score', (e) => { this.session.noteScore(e.total); }));
   }
 
@@ -128,6 +163,7 @@ export class MatchEventTracker {
     this.origin.valid = false;
     this.ads = false;
     this.mirror.clear();
+    this.captured.clear();
   }
 
   /**

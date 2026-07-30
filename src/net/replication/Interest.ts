@@ -240,6 +240,11 @@ export class InterestManager {
    */
   evaluate(clientId: ClientId, tick: NetTick, degradeLevel = 0): RelevanceEntry[] {
     this.refresh(tick);
+    // Bind the per-client last-sent table BEFORE any `consider` call. Without
+    // this every lookup fell through to client -1, which has no table, so every
+    // entity looked "never sent": rate limiting never fired and every candidate
+    // got the x4 first-sight priority bonus.
+    this.activeClient = clientId;
     const cfg = this.config;
     const view = this.views.get(clientId);
     let out = this.results.get(clientId);
@@ -334,9 +339,7 @@ export class InterestManager {
     lod = Math.min(3, lod + lodBias);
     if (forced && forceScore >= 1e6) lod = 0;
 
-    const last = this.lastSent(view.controlled === e.id ? -1 : -1, e.id);
-    void last;
-    const lastSentTick = this.lastSentFor(e.id, view);
+    const lastSentTick = this.lastSent(this.activeClient, e.id);
     const since = lastSentTick < 0 ? 1e4 : tick - lastSentTick;
 
     // Rate tier: distant things update less often. Forced entities bypass it.
@@ -364,13 +367,13 @@ export class InterestManager {
     out.push({ id: e.id, priority: score, lod, forced, distance: dist });
   }
 
-  /** Per-client last-sent lookup bound through the active view. */
+  /**
+   * Client whose set is being evaluated right now. `evaluate` sets it; nothing
+   * else should need to.
+   */
   private activeClient: ClientId = -1;
-  private lastSentFor(id: EntityId, _view: ClientView): NetTick {
-    return this.lastSent(this.activeClient, id);
-  }
 
-  /** @internal set by evaluate — see the wrapper below. */
+  /** @internal escape hatch for tests that call `consider` paths directly. */
   setActiveClient(clientId: ClientId): void { this.activeClient = clientId; }
 }
 

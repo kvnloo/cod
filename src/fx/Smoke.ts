@@ -52,7 +52,7 @@ export class SmokeFX {
     // brightly lit. Authored at 0.75 it clips the tonemapper everywhere at once,
     // which is why the screen used to have no bright side, no dark side and no
     // apparent thickness — every pixel of it was already past white.
-    tint: [number, number, number] = [0.46, 0.465, 0.48],
+    tint: [number, number, number] = [0.38, 0.385, 0.395],
   ): void {
     let slot = this.screens.find((s) => !s.active);
     if (!slot) slot = this.screens.reduce((a, b) => (a.age > b.age ? a : b));
@@ -62,7 +62,7 @@ export class SmokeFX {
     slot.age = 0;
     slot.duration = duration;
     slot.emitAcc = 0;
-    slot.rate = 50;
+    slot.rate = 170;
     slot.tint = tint;
     slot.floorY = w.floorUnder(point.x, point.y, point.z);
 
@@ -73,7 +73,7 @@ export class SmokeFX {
     g.begin({
       cell: CELL.SMOKE, frames: CELL.SMOKE_FRAMES, model: MODEL.MEDIA,
       flags: FLAG.ANIM | FLAG.FADEIN | FLAG.SHADOW,
-      r: tint[0], g: tint[1], b: tint[2], opacity: 0.62,
+      r: tint[0], g: tint[1], b: tint[2], opacity: 3.2,
       drag: 1.1, gravity: -0.05, turbulence: 1.3,
     });
     g.pushMany(26, (d) => {
@@ -189,22 +189,34 @@ export class SmokeFX {
       g.begin({
         cell: CELL.SMOKE, frames: CELL.SMOKE_FRAMES, model: MODEL.MEDIA,
         flags: FLAG.ANIM | FLAG.FADEIN | FLAG.SHADOW,
-        r: s.tint[0], g: s.tint[1], b: s.tint[2], opacity: 0.78,
-        drag: 1.3, gravity: -0.055, turbulence: 0.9,
+        // Over 1 on purpose: `opacity` is an alpha gain the render shader clamps
+        // per fragment. A screen has to be optically thick, and the atlas puff
+        // alone is nowhere near it.
+        r: s.tint[0], g: s.tint[1], b: s.tint[2], opacity: 10.0,
+        drag: 1.35, gravity: -0.030, turbulence: 0.85,
       });
       for (let i = 0; i < n; i++) {
         const d = g.desc;
         const a = rand.range(0, Math.PI * 2);
-        const rr = rand.next() * s.radius * 0.45;
+        // Emit across the whole footprint and low down. A canister screen is a
+        // *bank*: wide, packed at knee height, three or four metres at the top.
+        // Spawning in a narrow column with 1.7 m/s of lift made a billowing
+        // tower whose base thinned out to nothing, so the wall it was meant to
+        // block was clearly readable underneath it.
+        const rr = Math.sqrt(rand.next()) * s.radius * 0.55;
         d.px = s.x + Math.cos(a) * rr;
-        d.py = s.y + rand.range(-0.2, 1.5);
+        d.py = s.y + rand.range(-0.15, 0.85);
         d.pz = s.z + Math.sin(a) * rr;
-        const sp = 0.7 + rand.next() * 1.8;
+        const sp = 0.9 + rand.next() * 2.1;
         d.vx = Math.cos(a) * sp;
-        d.vy = 0.5 + rand.next() * 1.2;
+        d.vy = 0.15 + rand.next() * 0.5;
         d.vz = Math.sin(a) * sp;
-        d.sizeBegin = s.radius * 0.18;
-        d.sizeEnd = s.radius * (0.48 + rand.next() * 0.55);
+        // Smaller pufflets, many more of them. Half a dozen five-metre balls
+        // average out to one smooth translucent dome you can read a window
+        // through; three hundred two-metre ones stack into an optical depth the
+        // wall behind genuinely disappears into, and they keep a silhouette.
+        d.sizeBegin = s.radius * 0.14;
+        d.sizeEnd = s.radius * (0.30 + rand.next() * 0.34);
         d.lifetime = 7 + rand.next() * 6;
         d.rot = rand.range(0, 6.28);
         d.spin = rand.signed() * 0.22;

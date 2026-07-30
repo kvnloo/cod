@@ -143,7 +143,7 @@ export class SnapshotPlayback {
       const dst = out[n++];
       const slot1 = this.ring.slotOf(k1, this.a.id);
       if (slot1 >= 0 && this.ring.read(k1, slot1, this.b)) {
-        lerpSample(this.a, this.b, alpha, dst);
+        lerpSample(this.a, this.b, alpha, dst, (t1 - t0) * TICK_DT);
       } else {
         copySample(this.a, dst);
       }
@@ -173,7 +173,7 @@ export class SnapshotPlayback {
     const t1 = this.ring.frameTick(k1);
     if (s1 < 0 || t1 <= t0) { copySample(this.a, out); return true; }
     this.ring.read(k1, s1, this.b);
-    lerpSample(this.a, this.b, clamp01((tick - t0) / (t1 - t0)), out);
+    lerpSample(this.a, this.b, clamp01((tick - t0) / (t1 - t0)), out, (t1 - t0) * TICK_DT);
     return true;
   }
 
@@ -198,9 +198,43 @@ export function lerpAngle(a: number, b: number, t: number): number {
   return a + d * t;
 }
 
-function lerpSample(a: ActorSample, b: ActorSample, t: number, out: ActorSample): void {
+/**
+ * Fastest a player can plausibly travel, metres/second. Anything quicker
+ * between two snapshots did not *move* — it was teleported (a respawn, a
+ * killstreak insertion, a host correction).
+ *
+ * Generous on purpose: it only has to sit above real locomotion and below a
+ * map-scale jump, and being generous keeps genuine fast motion smooth.
+ */
+export const TELEPORT_SPEED = 40;
+
+/** True when `a`→`b` over `seconds` is a teleport rather than locomotion. */
+export function isTeleport(a: ActorSample, b: ActorSample, seconds: number): boolean {
+  if (!(seconds > 0)) return false;
+  const dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+  const limit = TELEPORT_SPEED * seconds;
+  return dx * dx + dy * dy + dz * dz > limit * limit;
+}
+
+/**
+ * `seconds` is the real time the two samples are apart. When they are further
+ * apart than a player could have moved in it, position is *held* on the earlier
+ * sample and changes over in one step at the boundary, exactly like the flags.
+ * Smearing a respawn across the interval would drag the camera across the map.
+ */
+function lerpSample(
+  a: ActorSample, b: ActorSample, t: number, out: ActorSample, seconds = 0,
+): void {
   out.id = a.id;
   out.team = a.team;
+  if (isTeleport(a, b, seconds)) {
+    const s = t >= 1 ? b : a;
+    out.x = s.x; out.y = s.y; out.z = s.z;
+    out.yaw = s.yaw; out.pitch = s.pitch; out.health = s.health;
+    out.flags = s.flags;
+    out.weapon = s.weapon;
+    return;
+  }
   out.x = a.x + (b.x - a.x) * t;
   out.y = a.y + (b.y - a.y) * t;
   out.z = a.z + (b.z - a.z) * t;

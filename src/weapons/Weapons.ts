@@ -221,10 +221,20 @@ export class WeaponSystem implements System {
     const slot = this.slots[this.index];
     if (!slot) return;
     const mag = Math.max(1, slot.stats.magnification);
-    // A 4× optic does not literally quarter the FOV — that is unplayable. This
-    // is the standard shooter compromise: a strong but bounded squeeze.
-    const zoom = slot.runtime.def.view.scopeZoom * (1 / (1 + (mag - 1) * 0.11));
-    settings.game.adsFovScale = THREE.MathUtils.clamp(this.baseAdsFovScale * zoom, 0.12, 1);
+    // A magnified optic has to actually magnify.
+    //
+    // The old curve (1 / (1 + (mag−1)·0.11)) turned a 4× prism into 1.33× of
+    // extra squeeze on top of the iron-sight ADS zoom — about 1.8× against the
+    // hip frame. The result was measurable: the image inside the ACOG's glass
+    // carried the same local contrast as the wall beside it, so the optic was
+    // decoration rather than a sight. A 4× should pull ~3.4× and a 9× ~7.4×,
+    // which is what a shipped shooter gives you; the 0.80 term is the only
+    // concession to playability.
+    const optical = mag > 1 ? 1 + (mag - 1) * 0.80 : 1;
+    // Never *less* zoom than the plain ADS pull the player has configured.
+    const base = this.baseAdsFovScale * slot.runtime.def.view.scopeZoom;
+    const scale = mag > 1 ? Math.min(base, 1 / optical) : base;
+    settings.game.adsFovScale = THREE.MathUtils.clamp(scale, 0.11, 1);
   }
 
   get current(): WeaponRuntime { return this.slots[this.index].runtime; }

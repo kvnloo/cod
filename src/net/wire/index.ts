@@ -68,6 +68,7 @@ export {
   type StateOf,
   type PositionCodecOptions,
   type TieredVec3Options,
+  type AngleCodecOptions,
   C,
   Schema,
   SchemaBuilder,

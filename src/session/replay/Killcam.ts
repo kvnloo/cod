@@ -24,7 +24,7 @@
  */
 
 import { CameraSolver, distance, forwardFrom, lerp, smooth, yawPitchTo } from './CameraSolver';
-import { SnapshotPlayback, clamp01, lerpAngle } from './Playback';
+import { SnapshotPlayback, clamp01, isTeleport, lerpAngle } from './Playback';
 import type { ReplayRecorder } from './Recorder';
 import type { StringTable } from './Hash';
 import {
@@ -161,14 +161,25 @@ export function planKillcam(
 
   const oldest = Math.max(0, recorder.snapshots.oldestTick);
   const wantStart = dTick - Math.round(options.preRoll / TICK_DT);
-  const startTick = Math.max(oldest, wantStart);
-  const endTick = dTick + Math.round(options.postRoll / TICK_DT);
+  const rawStart = Math.max(oldest, wantStart);
+  const rawEnd = dTick + Math.round(options.postRoll / TICK_DT);
 
   // A killcam shorter than half a second is worse than none: it reads as a
-  // glitch. Better to tell the caller than to show it.
-  if ((dTick - startTick) * TICK_DT < 0.5) {
+  // glitch. Better to tell the caller than to show it. This is about the
+  // *recording* — a ring that no longer reaches back has nothing to show.
+  if ((dTick - rawStart) * TICK_DT < 0.5) {
     return emptyPlan('recording does not reach back far enough', options);
   }
+
+  // Never span a break in the killer's track — see `continuousWindow`.
+  const win = continuousWindow(recorder, killer, rawStart, dTick, rawEnd);
+  const startTick = win.startTick;
+  // A break is not a failure, it just makes the clip shorter. Give back on the
+  // tail what it took off the front, so a kill by someone who spawned a moment
+  // earlier still holds on the body long enough to read — but never past the
+  // break that follows the kill.
+  const lost = startTick - rawStart;
+  const endTick = Math.min(win.maxEndTick, rawEnd + lost);
 
   const playback = new SnapshotPlayback(recorder.snapshots);
   const killerSample = actorSample();
@@ -202,6 +213,63 @@ export function planKillcam(
     clipped: startTick > wantStart,
     options,
   };
+}
+
+/**
+ * A killcam must not span a break in the killer's track. If he was teleported
+ * inside the window — he respawned, a killstreak inserted him, the host
+ * corrected him — a camera locked to his eyes would streak across the map and
+ * the clip would read as a bug rather than as evidence.
+ *
+ * So the window is trimmed to the continuous run of his track that contains the
+ * kill: the start is pulled forward past the last break before the shot, and
+ * the end is pushed back to the first break after it. The kill itself is never
+ * trimmed away — only the parts of the window that were never really his.
+ */
+function continuousWindow(
+  recorder: ReplayRecorder,
+  killer: number,
+  startTick: number,
+  deathTick: number,
+  endTick: number,
+): { startTick: number; endTick: number; maxEndTick: number } {
+  const ring = recorder.snapshots;
+  const a = actorSample();
+  const b = actorSample();
+  let s = startTick;
+  let e = endTick;
+  /** Hard ceiling: the clip may never be extended past a post-kill break. */
+  let maxEnd = Number.MAX_SAFE_INTEGER;
+  let prevTick = -1;
+
+  const first = Math.max(0, ring.frameAtOrBefore(startTick));
+  for (let k = first; k < ring.length; k++) {
+    const tick = ring.frameTick(k);
+    if (tick < startTick) continue;
+    if (tick > endTick) break;
+    const slot = ring.slotOf(k, killer);
+    if (slot < 0) continue;
+    if (prevTick < 0) {
+      ring.read(k, slot, a);
+      prevTick = tick;
+      continue;
+    }
+    ring.read(k, slot, b);
+    if (isTeleport(a, b, (tick - prevTick) * TICK_DT)) {
+      // Before the shot: the pre-roll starts after the break instead.
+      if (tick <= deathTick) s = Math.max(s, tick);
+      // After the shot: hold on the last frame that was still him.
+      else { e = Math.min(e, prevTick); maxEnd = prevTick; break; }
+    }
+    ring.read(k, slot, a);
+    prevTick = tick;
+  }
+
+  // The kill must survive the trim even if the track is a mess around it.
+  if (e < deathTick) e = Math.min(endTick, deathTick);
+  if (s > deathTick) s = Math.min(startTick, deathTick);
+  if (maxEnd < e) maxEnd = e;
+  return { startTick: s, endTick: e, maxEndTick: maxEnd };
 }
 
 /**
@@ -281,6 +349,13 @@ export class KillcamDirector {
     this.solver.reset();
     this.solver.tuning.rotationHalfLife = plan.options.lookHalfLife;
     this.solver.tuning.positionHalfLife = 0.06;
+    // The camera is locked to a man's eye. He sprints at ~7 m/s and the
+    // pull-back adds ~6, so 30 m/s is four times more than this shot can
+    // legitimately need — and it is the backstop that guarantees no residual
+    // discontinuity in the track (a gap in the snapshots, an actor dropping out
+    // and returning) can ever become a visible teleport. The solver's generic
+    // 220 m/s default exists for deliberate target switches, not for this.
+    this.solver.tuning.maxSpeed = 30;
     this.frame.done = false;
     this.frame.killer = plan.killer;
     this.frame.victim = plan.victim;

@@ -16,7 +16,7 @@
 import { rolldown } from 'rolldown';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -49,6 +49,194 @@ async function bundle() {
   await b.write({ file: OUT_FILE, format: 'esm' });
   await b.close();
   return import(`file://${OUT_FILE}?t=${Date.now()}`);
+}
+
+const ADAPTER_FILE = path.join(OUT_DIR, 'game-spawns.mjs');
+const ADAPTER_ENTRY = path.join(OUT_DIR, 'adapter-entry.ts');
+
+/**
+ * Bundles the *game-layer* adapter (`src/game/Spawns.ts`) through a generated
+ * entry that also re-exports `Rand`, so the harness never has to rely on node
+ * being able to import TypeScript directly.
+ */
+async function bundleAdapter() {
+  await mkdir(OUT_DIR, { recursive: true });
+  await writeFile(ADAPTER_ENTRY,
+    "export * from '../src/game/Spawns';\nexport { Rand } from '../src/core/Rand';\n");
+  const b = await rolldown({ input: ADAPTER_ENTRY, external: ['three'], logLevel: 'warn' });
+  await b.write({ file: ADAPTER_FILE, format: 'esm' });
+  await b.close();
+  return import(`file://${ADAPTER_FILE}?t=${Date.now()}`);
+}
+
+/* ------------------------------------------------------- adapter test rig -- */
+
+/** A handful of solid blocks, enough that line of sight means something. */
+const BLOCKS = [];
+for (let i = -2; i <= 2; i++) {
+  for (let j = -2; j <= 2; j++) {
+    if ((i + j) % 2 !== 0) continue;
+    BLOCKS.push({ x: i * 22, z: j * 22, hx: 7, hz: 7, hy: 5 });
+  }
+}
+
+function segmentBlocked(ax, ay, az, bx, by, bz) {
+  for (const b of BLOCKS) {
+    // Slab test against the box, in the segment's parameter space.
+    let t0 = 0, t1 = 1;
+    const lo = [b.x - b.hx, 0, b.z - b.hz];
+    const hi = [b.x + b.hx, b.hy, b.z + b.hz];
+    const o = [ax, ay, az];
+    const d = [bx - ax, by - ay, bz - az];
+    let out = false;
+    for (let k = 0; k < 3; k++) {
+      if (Math.abs(d[k]) < 1e-9) {
+        if (o[k] < lo[k] || o[k] > hi[k]) { out = true; break; }
+        continue;
+      }
+      let n = (lo[k] - o[k]) / d[k];
+      let f = (hi[k] - o[k]) / d[k];
+      if (n > f) { const t = n; n = f; f = t; }
+      if (n > t0) t0 = n;
+      if (f < t1) t1 = f;
+      if (t0 > t1) { out = true; break; }
+    }
+    if (!out) return true;
+  }
+  return false;
+}
+
+function insideBlock(x, z, margin = 0) {
+  for (const b of BLOCKS) {
+    if (Math.abs(x - b.x) < b.hx + margin && Math.abs(z - b.z) < b.hz + margin) return true;
+  }
+  return false;
+}
+
+/** Minimal `PhysicsAPI` — only the three calls `SpawnGraph` actually makes. */
+const stubPhysics = {
+  ready: true,
+  raycast(origin, dir, maxDist, _mask, out) {
+    if (dir.y < -0.5) {                      // ground probe
+      out.hit = !insideBlock(origin.x, origin.z, 0.5);
+      out.distance = origin.y;
+      out.point.set(origin.x, 0, origin.z);
+      out.normal.set(0, 1, 0);
+      return out;
+    }
+    const bx = origin.x + dir.x * maxDist;
+    const bz = origin.z + dir.z * maxDist;
+    out.hit = segmentBlocked(origin.x, origin.y, origin.z, bx, origin.y, bz);
+    out.distance = out.hit ? maxDist * 0.5 : maxDist;
+    out.point.set(bx, origin.y, bz);
+    out.normal.set(0, 1, 0);
+    return out;
+  },
+  lineOfSight(a, b) {
+    return !segmentBlocked(a.x, a.y, a.z, b.x, b.y, b.z);
+  },
+};
+
+/**
+ * Drives `SpawnGraph` — the surface `src/game/Director.ts` actually calls —
+ * through a few hundred respawns and enemy insertions, and checks the two
+ * promises that matter at the game layer: a friendly respawn is never handed a
+ * pad in a live hostile's lap, and an enemy never materialises inside the
+ * player's view.
+ */
+function runAdapter(mod, THREE, Rand, requests = 400) {
+  const graph = new mod.SpawnGraph();
+  const rng = new Rand('adapter');
+  const world = {
+    bounds: new THREE.Box3(new THREE.Vector3(-60, 0, -60), new THREE.Vector3(60, 12, 60)),
+    spawns: [],
+  };
+  for (let x = -50; x <= 50; x += 10) {
+    for (let z = -50; z <= 50; z += 10) {
+      if (insideBlock(x, z, 1.5)) continue;
+      world.spawns.push({
+        position: new THREE.Vector3(x, 0, z),
+        yaw: Math.atan2(-x, -z),
+        team: x < -16 ? 'player' : x > 16 ? 'enemy' : 'neutral',
+      });
+    }
+  }
+  graph.build(world, stubPhysics, rng, 32);
+  graph.setMode('tdm');
+
+  const q = mod.defaultQuery();
+  const eye = new THREE.Vector3(0, 1.6, 30);
+  const threats = [];
+  for (let i = 0; i < 5; i++) threats.push(new THREE.Vector3(0, 0, 0));
+  const allies = [new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, 0)];
+
+  let friendlyPicks = 0, friendlyTooClose = 0, friendlyNull = 0, minFriendly = Infinity;
+  let enemyPicks = 0, enemyVisible = 0, enemyNull = 0, outOfBand = 0;
+  let t0 = 0;
+  const now0 = performance.now();
+
+  for (let i = 0; i < requests; i++) {
+    const now = i * 0.7;
+    // Hostiles wander; the camera looks at the middle of the map.
+    for (let k = 0; k < threats.length; k++) {
+      const a = rng.range(-Math.PI, Math.PI);
+      const r = rng.range(6, 46);
+      threats[k].set(Math.cos(a) * r, 0, Math.sin(a) * r);
+    }
+    for (const a of allies) a.set(rng.range(-50, -20), 0, rng.range(-50, 50));
+    eye.set(threats[0].x, 1.6, threats[0].z);
+
+    q.now = now;
+    q.threats = threats;
+    q.allies = allies;
+    q.viewOrigin = eye;
+    q.viewDir.set(-eye.x, 0, -eye.z).normalize();
+
+    /* --- friendly respawn --- */
+    q.team = 'any';
+    q.requireHidden = false;
+    q.minDistance = 16;
+    q.maxDistance = 78;
+    const t = performance.now();
+    const f = graph.pick(q, stubPhysics, rng);
+    t0 += performance.now() - t;
+    if (!f) friendlyNull++;
+    else {
+      friendlyPicks++;
+      let d = Infinity;
+      for (const th of threats) d = Math.min(d, f.position.distanceTo(th));
+      minFriendly = Math.min(minFriendly, d);
+      if (d < 16) friendlyTooClose++;
+      graph.markUsed(f, now);
+    }
+
+    /* --- enemy insertion, must not appear on camera --- */
+    q.team = 'enemy';
+    q.requireHidden = true;
+    q.idealDistance = 34;
+    q.minDistance = 18;
+    const e = graph.pick(q, stubPhysics, rng);
+    if (!e) enemyNull++;
+    else {
+      enemyPicks++;
+      if (graph.isVisible(e.position, q, stubPhysics)) enemyVisible++;
+      const d = e.position.distanceTo(eye);
+      if (d < q.minDistance || d > q.maxDistance) outOfBand++;
+      graph.markUsed(e, now);
+    }
+
+    if (i % 9 === 0) graph.noteDeath(threats[0], now);
+    if (i % 17 === 0) graph.addHazard(threats[1], 8, now + 3, 'frag');
+  }
+
+  return {
+    nodes: graph.nodes.length,
+    friendlyPicks, friendlyTooClose, friendlyNull, minFriendly,
+    enemyPicks, enemyVisible, enemyNull, outOfBand,
+    usPerPick: (t0 / Math.max(1, requests)) * 1000,
+    wallMs: performance.now() - now0,
+    quality: graph.quality(requests * 0.7),
+  };
 }
 
 /* ------------------------------------------------------------------- run -- */
@@ -110,6 +298,14 @@ async function main() {
   console.log(`ok (${Date.now() - t0} ms)`);
 
   const { runSpawnSim, asciiInfluence, asciiHeat } = mod;
+
+  // Warm the JIT before anything is timed. Without this the us/pick column is
+  // mostly a measurement of how long V8 took to tier up the scorer, and short
+  // runs read 2x slower than long ones for no reason anybody can act on.
+  for (const mode of ['tdm', 'domination', 'sd']) {
+    runSpawnSim({ seed: 1, mode, selector: 'influence', duration: 60, teamSize: 6, dt: 0.1 });
+  }
+
   const table = new Map();          // `${mode}/${selector}` -> aggregate
   let fieldDump = null;
   let heatDump = null;
@@ -173,7 +369,8 @@ async function main() {
     const rnd = table.get(`${mode}/random`);
     const ratio = old.earlyRate > 0 ? nu.earlyRate / old.earlyRate : 0;
     worstRatio = Math.max(worstRatio, ratio);
-    const better = nu.earlyRate < old.earlyRate;
+    // A mode where neither selector ever lost a spawn is a tie, not a regression.
+    const better = nu.earlyRate < old.earlyRate || (nu.earlyRate === 0 && old.earlyRate === 0);
     allBetter = allBetter && better;
     console.log(
       `  ${pad(mode, 12)} spawn-death rate ${padL(pct(nu.earlyRate), 8)} vs ${padL(pct(old.earlyRate), 8)} baseline`
@@ -218,9 +415,33 @@ async function main() {
     console.log(asciiHeat(heatDump.snap, heatDump.deaths, 60));
   }
 
+  /* ------------------------------------------- game-layer adapter check -- */
+
+  let adapter = null;
+  let adapterError = null;
+  try {
+    const [gm, three] = await Promise.all([bundleAdapter(), import('three')]);
+    adapter = runAdapter(gm, three, gm.Rand, 400);
+  } catch (err) {
+    adapterError = err;
+  }
+
+  console.log('');
+  console.log('GAME ADAPTER (src/game/Spawns.ts — the surface src/game/Director.ts calls)');
+  if (adapter) {
+    console.log(`  nodes ${adapter.nodes}   ${adapter.friendlyPicks} friendly respawns, ${adapter.enemyPicks} enemy insertions in ${num(adapter.wallMs, 0)} ms`);
+    console.log(`  friendly respawn inside 16 m of a hostile : ${adapter.friendlyTooClose}   (closest ${num(adapter.minFriendly)}m)`);
+    console.log(`  enemy inserted inside the player's view   : ${adapter.enemyVisible}`);
+    console.log(`  enemy outside the requested distance band : ${adapter.outOfBand}`);
+    console.log(`  requests that returned nothing            : ${adapter.friendlyNull + adapter.enemyNull}`);
+    console.log(`  ${num(adapter.usPerPick, 0)} us per respawn`);
+  } else {
+    console.log(`  SKIPPED — ${adapterError?.message ?? 'unavailable'}`);
+  }
+
   /* ------------------------------------------------------------ verdict -- */
 
-  const agg = { early: 0, measured: 0, insideMin: 0, spawns: 0, losCount: 0, oldEarly: 0, oldMeasured: 0 };
+  const agg ={ early: 0, measured: 0, insideMin: 0, spawns: 0, losCount: 0, oldEarly: 0, oldMeasured: 0 };
   for (const mode of MODES) {
     const nu = table.get(`${mode}/influence`);
     const old = table.get(`${mode}/baseline`);
@@ -237,7 +458,13 @@ async function main() {
     ['no spawn inside the 18 m hard minimum', agg.insideMin === 0, `${agg.insideMin} violations in ${agg.spawns} spawns`],
     ['fewer than 12% of spawns visible to an enemy', agg.losCount / Math.max(1, agg.spawns) < 0.12, pct(agg.losCount / Math.max(1, agg.spawns))],
     ['selection under 250 us per request', tdm.meanSelectMs < 0.25, `${num(tdm.meanSelectMs * 1000, 0)} us`],
-    ['every mode improved on the baseline', allBetter, allBetter ? 'yes' : 'no'],
+    ['no mode regressed against the baseline', allBetter, allBetter ? 'yes' : 'no'],
+    ['game adapter never spawns an enemy on camera',
+      !!adapter && adapter.enemyVisible === 0,
+      adapter ? `${adapter.enemyVisible} of ${adapter.enemyPicks}` : 'adapter did not run'],
+    ['game adapter always returns a spawn',
+      !!adapter && adapter.friendlyNull + adapter.enemyNull === 0,
+      adapter ? `${adapter.friendlyNull + adapter.enemyNull} empty` : 'adapter did not run'],
   ];
 
   console.log('');

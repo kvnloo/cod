@@ -96,9 +96,12 @@ uniform float uFar;
 uniform float uScale;
 uniform float uMaxLength;
 uniform float uFrame;
+uniform float uJitter;
+uniform float uBgBoost;
+uniform float uDepthScale;
 layout(location = 0) out vec4 fragColor;
 
-float softDepthCompare(float za, float zb) { return sat(1.0 - (za - zb) / 0.6); }
+float softDepthCompare(float za, float zb) { return sat(1.0 - (za - zb) / uDepthScale); }
 float coneWeight(float dist, float speed) { return sat(1.0 - dist / max(speed, 1e-4)); }
 float cylinderWeight(float dist, float speed) {
   return 1.0 - smoothstep(0.95 * speed, 1.05 * speed, dist);
@@ -124,7 +127,7 @@ void main() {
   vec2 wX = vX / vXlen;
   if (dot(wX, wN) < 0.0) wX = -wX;
 
-  float jitter = blueNoise1T(gl_FragCoord.xy, uFrame) - 0.5;
+  float jitter = (blueNoise1T(gl_FragCoord.xy, uFrame) - 0.5) * uJitter;
 
   float weight = float(MB_SAMPLES) / (40.0 * vXlen);
   vec3 sum = centre * weight;
@@ -141,12 +144,23 @@ void main() {
     vec2 vY = texture(tVelocity, uv).xy * uScale;
     float vYlen = max(length(vY), 0.5);
 
-    float f = softDepthCompare(zX, zY);
-    float b = softDepthCompare(zY, zX);
+    /* depthAt() returns a *positive* distance, the opposite sign convention to
+       McGuire's view-space z. fg must therefore be 1 when the tap is in front
+       of the centre (a mover smearing over us) and bg 1 when it is behind
+       (us smearing over it). With the two swapped — which is what this pass
+       shipped with — the first term fires for taps that are *further away* than
+       the centre, and it trusts their velocity while reading their depth.
+       Alpha particles are exactly that pathological case: smoke writes a motion
+       vector but leaves the depth of whatever is behind it, so every static
+       pixel found a 20-pixel-distant "fast mover" at sky depth and dragged its
+       colour across the frame. That is the horizontal streaking over the tram
+       and the dither speckle in the shadowed geometry. */
+    float fg = softDepthCompare(zY, zX);
+    float bg = softDepthCompare(zX, zY);
     float dist = abs(T);
 
-    float w = f * coneWeight(dist, vYlen) * sat(dot(normalize(vY + vec2(1e-5)), dir))
-            + b * coneWeight(dist, vXlen) * sat(dot(wX, dir))
+    float w = uBgBoost * fg * coneWeight(dist, vYlen) * sat(dot(normalize(vY + vec2(1e-5)), dir))
+            + bg * coneWeight(dist, vXlen) * sat(dot(wX, dir))
             + cylinderWeight(dist, vYlen) * cylinderWeight(dist, vXlen) * 2.0;
 
     weight += w;
@@ -168,7 +182,32 @@ export class MotionBlurPass extends BasePass {
   private neighbour!: THREE.ShaderMaterial;
   private reconstruct!: THREE.ShaderMaterial;
 
-  constructor(res: PostResources) { super(res); }
+  /**
+   * Longest blur trail, in pixels at 1080p. The reconstruction spends a fixed
+   * sample budget over this span, so the span is what sets the noise floor —
+   * and because this pass runs *after* TAA, that noise is never resolved away.
+   */
+  maxRadius = 10;
+  /** Reconstruction taps. */
+  sampleCount = 24;
+  /** Amplitude of the per-pixel dither on the tap positions, 0..1. */
+  jitterAmount = 1;
+  /**
+   * Weight of the "a fast mover reaches over this static pixel" term. Alpha
+   * particles write velocity at the depth of whatever is *behind* them, which
+   * makes this term smear smoke across static geometry.
+   */
+  backgroundBoost = 1;
+  /** Metres of depth difference over which the fg/bg classification softens. */
+  depthScale = 0.6;
+
+  constructor(res: PostResources) {
+    super(res);
+    const params = new URLSearchParams(globalThis.location?.search ?? '');
+    if (params.get('capture') === '1') {
+      (globalThis as unknown as Record<string, unknown>).__MB__ = this;
+    }
+  }
 
   protected override onSetup(): void {
     this.tileX = this.makeMaterial({
@@ -215,6 +254,9 @@ export class MotionBlurPass extends BasePass {
         uScale: { value: 1 },
         uMaxLength: { value: TILE },
         uFrame: { value: 0 },
+        uJitter: { value: 1 },
+        uBgBoost: { value: 1 },
+        uDepthScale: { value: 0.6 },
       },
     });
   }
@@ -230,7 +272,7 @@ export class MotionBlurPass extends BasePass {
 
     // Shutter: velocity is per-frame, so strength maps directly to shutter angle.
     const scale = Math.min(2, g.motionBlurStrength);
-    const maxLength = TILE;
+    const maxLength = Math.max(2, Math.min(TILE, this.maxRadius * (ctx.height / 1080)));
 
     const tx = pool.get('mb.tilex', tw, ctx.height, velSpec);
     const ty = pool.get('mb.tiley', tw, th, velSpec);
@@ -253,7 +295,7 @@ export class MotionBlurPass extends BasePass {
     (un.uTexel.value as THREE.Vector2).set(1 / tw, 1 / th);
     ctx.blit(this.neighbour, nb);
 
-    const samples = g.motionBlurStrength > 0.8 ? 16 : 10;
+    const samples = g.motionBlurStrength > 0.8 ? this.sampleCount : Math.max(8, this.sampleCount >> 1);
     this.setDefine(this.reconstruct, 'MB_SAMPLES', samples);
     const ur = this.reconstruct.uniforms;
     ur.tInput.value = input;
@@ -266,6 +308,9 @@ export class MotionBlurPass extends BasePass {
     ur.uScale.value = scale;
     ur.uMaxLength.value = maxLength;
     ur.uFrame.value = ctx.frame % 64;
+    ur.uJitter.value = this.jitterAmount;
+    ur.uBgBoost.value = this.backgroundBoost;
+    ur.uDepthScale.value = this.depthScale;
     ctx.blit(this.reconstruct, output);
     return true;
   }

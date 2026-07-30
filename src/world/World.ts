@@ -240,6 +240,20 @@ export class WorldSystem implements System {
     bus.on('game:ready', () => this.applyEnvironment(ctx));
     this.renderApi = ctx.engine.tryGet<System & RenderAPI>('render') ?? null;
 
+    // Every camera in the level's shot list faces north, south or across the
+    // square. At the hero hour the sun sits WNW at 11 degrees of elevation —
+    // outside all of their frustums — which is how a golden-hour map came back
+    // from review as "there is no sun anywhere in the sky, at any hour". The
+    // sun was there; nothing ever pointed at it. This one does: high enough
+    // that the town's own rooflines drop below the disc, angled straight down
+    // the solar azimuth.
+    if (!WORLD_SHOTS.some((s) => s.name === 'sun-west')) {
+      WORLD_SHOTS.push({
+        name: 'sun-west',
+        description: 'Eye level in the square looking WNW straight into the low sun as it clears the west shop row',
+        position: [30, 11.5, 6], yaw: 73.2, pitch: 0, fov: 72, viewModel: false,
+      });
+    }
     registerWorldShots(this);
     // Pin the level's own hour on to every level shot. `setShot` only touches
     // the time of day when a shot names one, so in a run that also contains the
@@ -294,8 +308,13 @@ export class WorldSystem implements System {
     // of falling off the bottom of the frame — which is what put the plaza at
     // 3% grey. The tint stays firmly blue: sky fill is the cool half of the
     // golden-hour colour split.
+    //
+    // 3.2 rather than 2.0 because `SKY_INTENSITY` came down again (9.5 → 5.2)
+    // to stop the dome bleaching to white on screen. That is a change to what
+    // the *camera* sees; the amount of fill a shaded wall receives should not
+    // move with it, so the probe scale takes the difference back out.
     const api = render as unknown as { setAmbient?: (tint: THREE.ColorRepresentation, i: number) => void };
-    api.setAmbient?.(0x7fa9ef, 2.0);
+    api.setAmbient?.(0x7fa9ef, 3.2);
     this.cloth.setWind(0.75);
   }
 

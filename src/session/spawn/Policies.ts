@@ -111,6 +111,15 @@ export interface SpawnPolicy {
   fixedTeamZones: boolean;
   /** Only points tagged for the spawning team are eligible (S&D). */
   requireOwnedPoints: boolean;
+  /**
+   * With `requireOwnedPoints`, whether *neutral* ground also counts.
+   *
+   * This is the difference between "prefer your half" and "spawn on your pad".
+   * S&D needs the strict form: the moment neutral midfield is eligible, both
+   * teams' round-start group spawns are pulled toward the same objective and
+   * the round opens with the two squads on top of each other.
+   */
+  strictOwnership: boolean;
   /** Territory drives zone ownership (TDM, Domination, Hardpoint). */
   zoneFlipping: boolean;
   /** Steer spawns toward the objective the team should be fighting for. */
@@ -146,15 +155,21 @@ export function policyFor(id: SpawnPolicyId): SpawnPolicy {
     case 'sd':
       w.reuseCooldown = 0.5;
       w.territory = 0;
-      w.objective = 10;
+      // Positional objective pull is *off* in S&D. The objective still exists
+      // (it decides which way a spawned body faces, and it is what the squad
+      // walks toward) but a fixed-spawn mode must never let the bomb site drag
+      // two opposing round-start groups into the same midfield.
+      w.objective = 0;
       w.objectiveRange = 90;
       w.friendly = 22;
       w.friendlyIdeal = 10;
       w.friendlySigma = 12;
       w.minEnemyDistance = 25;
+      w.cover = 10;
       return {
         id, name: 'Search & Destroy', weights: w,
-        fixedTeamZones: true, requireOwnedPoints: true, zoneFlipping: false,
+        fixedTeamZones: true, requireOwnedPoints: true, strictOwnership: true,
+        zoneFlipping: false,
         objectiveDriven: true, groupSpawn: true, aggressiveFlip: false,
       };
     case 'domination':
@@ -163,7 +178,8 @@ export function policyFor(id: SpawnPolicyId): SpawnPolicy {
       w.territory = 28;
       return {
         id, name: 'Domination', weights: w,
-        fixedTeamZones: false, requireOwnedPoints: false, zoneFlipping: true,
+        fixedTeamZones: false, requireOwnedPoints: false, strictOwnership: false,
+        zoneFlipping: true,
         objectiveDriven: true, groupSpawn: false, aggressiveFlip: true,
       };
     case 'hardpoint':
@@ -173,7 +189,8 @@ export function policyFor(id: SpawnPolicyId): SpawnPolicy {
       w.minEnemyDistance = 22;
       return {
         id, name: 'Hardpoint', weights: w,
-        fixedTeamZones: false, requireOwnedPoints: false, zoneFlipping: true,
+        fixedTeamZones: false, requireOwnedPoints: false, strictOwnership: false,
+        zoneFlipping: true,
         objectiveDriven: true, groupSpawn: false, aggressiveFlip: true,
       };
     case 'pve':
@@ -185,7 +202,8 @@ export function policyFor(id: SpawnPolicyId): SpawnPolicy {
       w.losVetoRange = 30;
       return {
         id, name: 'PvE', weights: w,
-        fixedTeamZones: false, requireOwnedPoints: false, zoneFlipping: false,
+        fixedTeamZones: false, requireOwnedPoints: false, strictOwnership: false,
+        zoneFlipping: false,
         objectiveDriven: false, groupSpawn: false, aggressiveFlip: false,
       };
     case 'tdm':
@@ -193,7 +211,8 @@ export function policyFor(id: SpawnPolicyId): SpawnPolicy {
       w.objective = 0;
       return {
         id: 'tdm', name: 'Team Deathmatch', weights: w,
-        fixedTeamZones: false, requireOwnedPoints: false, zoneFlipping: true,
+        fixedTeamZones: false, requireOwnedPoints: false, strictOwnership: false,
+        zoneFlipping: true,
         objectiveDriven: false, groupSpawn: false, aggressiveFlip: true,
       };
   }

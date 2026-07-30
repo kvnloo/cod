@@ -48,9 +48,15 @@ const HAND = {
   /** Half-length of the palm along the gripped axis. */
   palmHalf: 0.0455,
   /** Radius of the wrist. */
-  wristR: 0.0330,
-  /** Radius of the forearm at the far end. */
-  armR: 0.0430,
+  wristR: 0.0355,
+  /**
+   * Radius of the forearm at the far end.
+   *
+   * A forearm in a rolled combat-shirt sleeve is ~10 cm across. At 0.043 the
+   * arm read as a stick and the eye never registered it as a limb, which is
+   * half of why the rifle looked unsupported.
+   */
+  armR: 0.0520,
 };
 
 export interface HandSpec {
@@ -255,8 +261,12 @@ export function buildHand(b: RigBuilder, s: HandSpec): void {
     const axial = s.fingerAxial + s.fingerStep * HAND.fingerPitch * k * i;
     const kr = HAND.fingerR * k * (i === 3 ? 0.86 : i === 0 ? 1.02 : 1.0);
     const theta = s.fingerFrom + (s.palmTheta - s.fingerFrom) * 0.34;
-    onGrip(_p, s, ref2, theta, s.radius + HAND.palmT * k * 0.64, axial);
-    b.add(xf(ball(kr * 0.88, 10), { pos: v3(_p) }), glove);
+    // Sunk into the back of the hand, not perched on it. At 0.64 the domes
+    // stood a centimetre proud of the palm shell and — with the shell's own
+    // silhouette hidden behind the handguard — the eye read four detached
+    // spheres floating beside the rifle instead of a fist.
+    onGrip(_p, s, ref2, theta, s.radius + HAND.palmT * k * 0.46, axial);
+    b.add(xf(ball(kr * 0.80, 10), { pos: v3(_p) }), glove);
   }
   // Reinforced knuckle strap across them.
   {
@@ -337,13 +347,18 @@ export function buildHand(b: RigBuilder, s: HandSpec): void {
     // toward the elbow. Ends well past the near plane, so it always leaves the
     // frame rather than terminating in mid-air.
     const sleeve: LoftRing[] = [];
-    const n = 5;
+    const n = 11;
     for (let i = 0; i <= n; i++) {
       const t = i / n;
       _p.copy(wrist).addScaledVector(arm, (0.030 + t * s.armLength) * k);
       _p.y -= t * t * 0.014 * k;
-      const rr = HAND.wristR * k * (1.02 + t * (HAND.armR / HAND.wristR - 1.0));
-      sleeve.push({ at: v3(_p), w: rr, h: rr * 0.92, sq: 2.6 });
+      // Ripstop does not lie smooth over a forearm: it bunches at the wrist,
+      // slackens over the belly of the muscle and pulls in again toward the
+      // elbow. Without that the sleeve is a cardboard tube with a cloth
+      // texture on it, which is exactly how it read.
+      const fold = 1 + Math.sin(t * 9.4 + 0.7) * 0.035 + Math.sin(t * 4.1) * 0.028;
+      const rr = HAND.wristR * k * (1.02 + t * (HAND.armR / HAND.wristR - 1.0)) * fold;
+      sleeve.push({ at: v3(_p), w: rr, h: rr * (0.92 - t * 0.06), sq: 2.6 });
     }
     b.add(loft(sleeve, 20, false, true, v3(s.axis)), 'sleeve');
   }
@@ -386,25 +401,36 @@ export function hands(ctx: BuildCtx): void {
       radius: sup.radius,
       // The eye is above and to the left of the handguard, so the back of the
       // hand is put on that flank: it is the only face the shooter can see.
-      palmTheta: 0.42,
-      palmArc: 0.74,
+      palmTheta: 0.50,
+      // Wrapped further round: the shell now reaches from below the tube up to
+      // the rail on the near flank, so the hand has a continuous silhouette
+      // against the world instead of four knuckle domes peering out from under
+      // the handguard with nothing joining them up.
+      palmArc: 0.98,
       // Fingers break out just below the horizontal — the first joint of each
       // stays on the visible flank, and only then do they curl underneath.
       fingerFrom: -0.34,
       fingerTo: -2.78,
-      // Thumb laid forward alongside the top rail, the way a support hand
-      // actually holds a rifle with a full-length rail.
-      thumbFrom: 0.98,
-      thumbTo: 0.58,
-      thumbAxial: 0.008,
-      thumbAxialTip: 0.066,
+      // Thumb-forward grip: the thumb comes up over the near shoulder of the
+      // handguard and points down-range alongside the rail. It is the one part
+      // of the support hand that sits *above* the tube's horizon from the
+      // shooter's eye, so it is what actually reads at a glance — and it is
+      // the pose every modern shooter animates.
+      thumbFrom: 1.34,
+      thumbTo: 1.18,
+      thumbAxial: 0.004,
+      thumbAxialTip: 0.082,
       fingerAxial: 0.030,
       fingerStep: -1,
       wristAxial: -0.034,
-      // Almost straight down: the support forearm should leave the bottom of
-      // the frame, not lie across the middle of it.
-      armDir: new THREE.Vector3(-0.30, -0.91, 0.28),
-      armLength: 0.26,
+      // Down *and back toward the shoulder*. Straight down was anatomically
+      // defensible and visually useless: the arm left the bottom of the frame
+      // within a couple of centimetres of the wrist and the eye never saw a
+      // limb at all. Raked back, the forearm becomes the long diagonal mass
+      // running out of the lower-left of every Call of Duty frame — which is
+      // the shape that tells you the rifle is being *held*.
+      armDir: new THREE.Vector3(-0.34, -0.70, 0.63),
+      armLength: 0.40,
     });
   }
 
@@ -434,8 +460,11 @@ export function hands(ctx: BuildCtx): void {
       fingerStep: 1,
       wristAxial: -0.052,
       trigger: ctx.triggerFace?.clone(),
-      armDir: new THREE.Vector3(0.26, -0.88, 0.40),
-      armLength: 0.24,
+      // Same reasoning as the support arm: the firing forearm runs down and
+      // back to a shoulder that is behind the camera, so it wants a real
+      // rearward rake rather than dropping vertically out of shot.
+      armDir: new THREE.Vector3(0.30, -0.70, 0.65),
+      armLength: 0.34,
     });
   }
 }

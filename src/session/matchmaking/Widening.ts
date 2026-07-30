@@ -49,6 +49,33 @@
  * friends must never sit staring at "SEARCHING" when the game can simply start.
  * Private playlists arm at 6 s because there nobody is waiting for strangers.
  *
+ * **Bots arming is not the same as bots filling.** This distinction is the
+ * difference between a healthy playlist and one where everybody is fighting
+ * robots. `botFillAfter` says bots are *permitted*; `humansRequired()` says how
+ * many humans the lobby must still contain, and it starts at
+ * `botFillFloor × capacity` — half a twelve-slot lobby — and decays linearly to
+ * `minHumansToStart` at the hard timeout:
+ *
+ * ```
+ *   t (s)     25    45    65    85   105   120
+ *   humans     6     5     4     3     2     1     (12-slot lobby, min 1)
+ * ```
+ *
+ * 0.5 is the measured knee of the frontier (`tools/session-mm-sweep.mjs`, 500
+ * synthetic players): raising it to 0.75 buys 13 points of formation-time bot
+ * share for 6 s of median queue and 20 s of p95; raising it to 1.0 buys another
+ * 8 points for 10 s more. Half the lobby human at launch means every match
+ * starts around a real core, and the bots completing it are handed to humans
+ * within seconds — time-averaged bot *occupancy* at this setting is under 3%.
+ *
+ * Without this the queue launches the instant the timer arms, and a playlist
+ * with a perfectly healthy population still ships 80% bot lobbies because it
+ * never waits for the players who were thirty seconds away. *With* it, and with
+ * the supply cap the queue applies on top (see `Queue.tryForm`), a lobby only
+ * takes bots when the queue genuinely cannot deliver humans — which is exactly
+ * the four-friends case, where the floor collapses to 4 immediately because
+ * there is nobody else in the world to wait for.
+ *
  * **Hard timeout at 120 s.** Past it the queue launches with whatever it has,
  * subject only to `minHumansToStart`. Nothing is worse than an infinite search.
  */
@@ -65,6 +92,7 @@ export const DEFAULT_WIDENING: WideningParams = {
   pingWindowMax: 220,
   crossRegionAfter: 40,
   botFillAfter: 25,
+  botFillFloor: 0.5,
   hardTimeout: 120,
 };
 
@@ -79,6 +107,7 @@ export const RANKED_WIDENING: Partial<WideningParams> = {
   pingWindowMax: 140,
   crossRegionAfter: 90,
   botFillAfter: Infinity,
+  botFillFloor: 1,
   hardTimeout: 300,
 };
 
@@ -88,6 +117,7 @@ export const PRIVATE_WIDENING: Partial<WideningParams> = {
   skillDoubleEvery: 10,
   skillWindowMax: 2000,
   botFillAfter: 6,
+  botFillFloor: 0,
   crossRegionAfter: 0,
   hardTimeout: 20,
 };
@@ -128,19 +158,62 @@ export function windowsForTicket(ticket: QueueTicket, now: number, p: WideningPa
 }
 
 /**
- * Two tickets are compatible when *either* is willing to accept the other.
- * Taking the max rather than the min is deliberate: a player who has waited
- * 90 s should be able to rescue a player who just arrived, otherwise the
- * long-waiting ticket can never be cleared by fresh arrivals — which is the
- * classic way queues develop a permanently stuck tail.
+ * How many of the lobby's `capacity` slots must be filled by humans before the
+ * queue is willing to launch, given the seed has waited `waited` seconds.
+ *
+ * Above `botFillAfter` this decays linearly from `botFillFloor × capacity` down
+ * to `minHumans`, reaching it at the hard timeout. Below it the answer is
+ * `capacity` — bots are not permitted at all yet, so nothing short of a full
+ * lobby launches.
+ *
+ * This is a *demand-side* floor only. The queue caps it by what the population
+ * can actually supply (`Queue.tryForm`), because waiting for humans who do not
+ * exist is the other way to make a queue feel broken.
+ */
+export function humansRequired(
+  waited: number, capacity: number, minHumans: number, p: WideningParams,
+): number {
+  const cap = Math.max(1, Math.floor(capacity));
+  const floorMin = Math.max(1, Math.min(Math.floor(minHumans), cap));
+  if (!Number.isFinite(p.botFillAfter)) return cap;
+  if (waited < p.botFillAfter) return cap;
+  const span = Math.max(1e-6, p.hardTimeout - p.botFillAfter);
+  const u = Math.max(0, Math.min(1, (waited - p.botFillAfter) / span));
+  const start = Math.max(floorMin, Math.min(cap, Math.ceil(cap * p.botFillFloor)));
+  return Math.max(floorMin, Math.round(start + (floorMin - start) * u));
+}
+
+/**
+ * Combines two tickets' windows into the pair's operating window.
+ *
+ * The two axes deliberately combine in *opposite* directions, because they
+ * express opposite things:
+ *
+ * **Skill takes the max — fairness is negotiable.** A player who has waited
+ * 90 s should be able to rescue a player who just arrived. If both sides had to
+ * agree, the long-waiting ticket could never be cleared by fresh arrivals,
+ * which is the classic way a queue develops a permanently stuck tail.
+ *
+ * **Ping and region take the min — comfort is not.** Someone who queued four
+ * seconds ago should not be dragged into a 220 ms cross-region lobby because a
+ * stranger has been waiting a minute and a half. Their patience is not the
+ * newcomer's problem. Taking the max here was worth ~50 ms of mean lobby ping
+ * in the population sim, all of it paid by the players who were *not* waiting.
+ *
+ * The stuck tail this could create on the latency axis is bounded by
+ * `desperate`: past the hard timeout a ticket stops negotiating and the pair's
+ * windows open all the way. That is the correct place for the escape hatch —
+ * it is explicit, it is capped, and it applies to one ticket rather than
+ * quietly degrading every match in the playlist.
  */
 export function mutualWindows(a: SearchWindows, b: SearchWindows): SearchWindows {
+  const desperate = a.desperate || b.desperate;
   return {
     skill: Math.max(a.skill, b.skill),
-    ping: Math.max(a.ping, b.ping),
-    crossRegion: a.crossRegion || b.crossRegion,
+    ping: desperate ? Math.max(a.ping, b.ping) : Math.min(a.ping, b.ping),
+    crossRegion: desperate ? true : a.crossRegion && b.crossRegion,
     botFill: a.botFill || b.botFill,
-    desperate: a.desperate || b.desperate,
+    desperate,
     waited: Math.max(a.waited, b.waited),
   };
 }
@@ -150,7 +223,9 @@ export function describeCurve(
   p: WideningParams = DEFAULT_WIDENING,
   times: readonly number[] = [0, 5, 10, 20, 30, 45, 60, 90, 120],
   rd = 0,
-): Array<{ t: number; skill: number; ping: number; crossRegion: boolean; botFill: boolean }> {
+  capacity = 12,
+  minHumans = 1,
+): Array<{ t: number; skill: number; ping: number; crossRegion: boolean; botFill: boolean; humans: number }> {
   return times.map((t) => {
     const w = windowsAt(t, rd, p);
     return {
@@ -159,6 +234,7 @@ export function describeCurve(
       ping: Math.round(w.ping),
       crossRegion: w.crossRegion,
       botFill: w.botFill,
+      humans: humansRequired(t, capacity, minHumans, p),
     };
   });
 }

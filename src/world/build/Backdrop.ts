@@ -28,6 +28,9 @@ import * as THREE from 'three';
 import { Rand } from '../../core/Rand';
 import type { Chunk } from '../geom/Chunk';
 import type { Mesher } from '../geom/Mesher';
+import { noise3 } from './Grounding';
+
+type BackdropKey = 'backdropMid' | 'backdropFar' | 'ridgeNear' | 'ridgeMid' | 'ridge';
 
 export function buildBackdrop(chunk: Chunk): void {
   const rand = new Rand(1717);
@@ -35,16 +38,33 @@ export function buildBackdrop(chunk: Chunk): void {
   /* --- receding bands of city blocks ---------------------------------- */
   const bands: {
     r0: number; r1: number; count: number; minH: number; maxH: number;
-    key: 'backdropMid' | 'backdropFar'; minW: number; maxW: number;
+    keys: BackdropKey[]; minW: number; maxW: number; glaze: boolean;
   }[] = [
     // A provincial town, not a CBD: three to eight storeys, receding into haze.
-    { r0: 98, r1: 158, count: 96, minH: 6.5, maxH: 21, key: 'backdropMid', minW: 11, maxW: 30 },
-    { r0: 168, r1: 268, count: 104, minH: 8, maxH: 27, key: 'backdropFar', minW: 15, maxW: 44 },
-    { r0: 285, r1: 388, count: 84, minH: 11, maxH: 34, key: 'backdropFar', minW: 22, maxW: 66 },
+    //
+    // `keys` is the fix for the loudest backdrop tell: every block used to be
+    // drawn in one flat material, so a hundred blocks were a hundred cut-outs
+    // of exactly the same value and the whole band read as a bar chart. Real
+    // districts are built of half a dozen renders and brick tones, and value
+    // difference between neighbours is what makes a mass read as buildings.
+    // The first band starts at 118 m, not 98. A 20 m block 50 m past the map
+    // edge is close enough to read as a wall rather than as a silhouette, and
+    // a backdrop material has no window, no eaves and no downpipe to survive
+    // that. Pushed out, aerial perspective does its job and the band reads as
+    // the next district.
+    { r0: 118, r1: 180, count: 100, minH: 6, maxH: 16, minW: 9, maxW: 23, glaze: true,
+      keys: ['backdropMid', 'backdropMid', 'backdropFar', 'ridgeMid', 'ridge'] },
+    { r0: 190, r1: 298, count: 112, minH: 7, maxH: 24, minW: 13, maxW: 37, glaze: true,
+      keys: ['backdropFar', 'backdropMid', 'ridgeMid', 'ridge', 'backdropFar'] },
+    { r0: 306, r1: 404, count: 88, minH: 9, maxH: 32, minW: 18, maxW: 56, glaze: true,
+      keys: ['backdropFar', 'ridge', 'backdropFar', 'ridgeMid'] },
   ];
 
+  // Window / shadow-gap ribbons. `ridgeNear` is the darkest key in the catalogue
+  // and it is only ever seen at 400 m, so it doubles as the backdrop's void.
+  const voidM = chunk.m('ridgeNear');
+
   for (const band of bands) {
-    const m = chunk.m(band.key);
     for (let i = 0; i < band.count; i++) {
       // Free angle, not i/count. Regular angular spacing at three fixed radii
       // is what produced the rows-of-identical-bars read.
@@ -59,8 +79,11 @@ export function buildBackdrop(chunk: Chunk): void {
       const d = rand.range(band.minW, band.maxW) * rand.range(0.55, 1.0);
       // Blocks face the street grid of their own district, not the camera.
       const yaw = -a + rand.range(-0.9, 0.9);
+      const m = chunk.m(band.keys[rand.int(0, band.keys.length - 1)]);
       m.pushTRS(x, 0, z, yaw);
-      cityBlock(m, w, d, h, rand);
+      voidM.pushTRS(x, 0, z, yaw);
+      cityBlock(m, voidM, w, d, h, rand, band.glaze);
+      voidM.pop();
       m.pop();
     }
   }
@@ -77,9 +100,12 @@ export function buildBackdrop(chunk: Chunk): void {
    * notches — and the whole thing is still only a few thousand triangles on a
    * layer that never casts a shadow. */
   const ranges: (RangeDef & { key: 'ridgeNear' | 'ridgeMid' | 'ridge' })[] = [
-    { key: 'ridgeNear', rFoot: 400, rCrest: 500, base: 26, gain: 96, sharp: 2.6, phase: 0.0, segments: 320, rows: 8 },
-    { key: 'ridgeMid', rFoot: 528, rCrest: 660, base: 48, gain: 142, sharp: 2.0, phase: 1.9, segments: 280, rows: 7 },
-    { key: 'ridge', rFoot: 680, rCrest: 850, base: 70, gain: 182, sharp: 1.6, phase: 4.3, segments: 240, rows: 6 },
+    // Broken foothills in front of the main range. One ridgeline on the horizon
+    // is a cutout; two ridgelines that cross each other read as distance.
+    { key: 'ridgeNear', rFoot: 372, rCrest: 452, base: 4, gain: 44, sharp: 1.35, phase: 6.1, segments: 300, rows: 9 },
+    { key: 'ridgeNear', rFoot: 430, rCrest: 540, base: 22, gain: 104, sharp: 1.9, phase: 0.0, segments: 320, rows: 13 },
+    { key: 'ridgeMid', rFoot: 560, rCrest: 700, base: 44, gain: 150, sharp: 1.7, phase: 1.9, segments: 288, rows: 12 },
+    { key: 'ridge', rFoot: 720, rCrest: 900, base: 66, gain: 194, sharp: 1.5, phase: 4.3, segments: 256, rows: 10 },
   ];
   for (const range of ranges) buildRidge(chunk.m(range.key), range);
 
@@ -112,11 +138,11 @@ export function buildBackdrop(chunk: Chunk): void {
 
   /* --- low industrial sheds hugging the near band ---------------------- */
   const shed = chunk.m('backdropMid');
-  for (let i = 0; i < 26; i++) {
+  for (let i = 0; i < 34; i++) {
     const a = rand.range(0, Math.PI * 2);
-    const r = rand.range(88, 132);
-    const w = rand.range(14, 34), d = rand.range(9, 20);
-    const h = rand.range(4.5, 8.5);
+    const r = rand.range(72, 128);
+    const w = rand.range(12, 30), d = rand.range(9, 20);
+    const h = rand.range(4.0, 8.0);
     shed.pushTRS(Math.cos(a) * r, 0, Math.sin(a) * r, -a + rand.range(-1.2, 1.2));
     shed.box(0, h * 0.5, 0, w * 0.5, h * 0.5, d * 0.5, 8);
     gable(shed, w * 0.5, d * 0.5, h, rand.range(1.2, 2.6));
@@ -131,9 +157,50 @@ export function buildBackdrop(chunk: Chunk): void {
  * rooftop clutter. Everything is proportional to the block so a 6 m shed and a
  * 34 m slab both read correctly.
  */
-function cityBlock(m: Mesher, w: number, d: number, h: number, rand: Rand): void {
+function cityBlock(m: Mesher, voidM: Mesher, w: number, d: number, h: number, rand: Rand, glaze: boolean): void {
   const hw = w * 0.5, hd = d * 0.5;
   m.box(0, h * 0.5, 0, hw, h * 0.5, hd, 8.0);
+
+  // Massing. A single extruded rectangle is the bar-chart primitive; a real
+  // block is a main range plus a lower back wing, a corner infill of a
+  // different height, or a setback top. Two extra masses per block is all it
+  // takes for the silhouette to stop being a rectangle.
+  if (rand.bool(0.62)) {
+    const ww = hw * rand.range(0.35, 0.85);
+    const wd = hd * rand.range(0.45, 1.15);
+    const wh = h * rand.range(0.38, 0.82);
+    const sx = (rand.bool() ? 1 : -1) * (hw + ww * rand.range(0.55, 0.95));
+    const sz = rand.range(-hd * 0.4, hd * 0.4);
+    m.box(sx, wh * 0.5, sz, ww, wh * 0.5, wd, 8.0);
+    if (rand.bool(0.5)) m.box(sx, wh + 0.3, sz, ww * 1.04, 0.3, wd * 1.04, 8.0);
+  }
+  if (rand.bool(0.4)) {
+    // A taller end bay. Kept narrow and only a storey or two over the main
+    // range: a full-width mass at 1.4× the height is a second bar on the chart.
+    const ww = hw * rand.range(0.28, 0.55);
+    const wd = hd * rand.range(0.3, 0.7);
+    const wh = h + rand.range(2.2, 6.5);
+    m.box(rand.range(-hw * 0.4, hw * 0.4), wh * 0.5,
+      (rand.bool() ? 1 : -1) * (hd - wd * rand.range(0.1, 0.6)), ww, wh * 0.5, wd, 8.0);
+  }
+
+  // Glazing bands. At 120–270 m a facade is not read as individual windows, it
+  // is read as horizontal value banding — a dark ribbon per storey against the
+  // render. A blank slab of one value is the thing that says "untextured box".
+  if (glaze && h > 5) {
+    const storey = rand.range(3.0, 3.9);
+    const n = Math.min(9, Math.floor((h - 1.2) / storey));
+    const sill = rand.range(0.9, 1.35);
+    for (let s = 0; s < n; s++) {
+      const y = 1.0 + s * storey + sill;
+      const bh = storey * rand.range(0.28, 0.42);
+      if (y + bh > h - 0.4) break;
+      // Slightly proud of the wall so it never z-fights; dark, so it reads as
+      // the shadow inside a reveal rather than as a projecting band.
+      voidM.box(0, y + bh * 0.5, 0, hw + 0.05, bh * 0.5, hd - hd * 0.14, 4.0);
+      voidM.box(0, y + bh * 0.5, 0, hw - hw * 0.14, bh * 0.5, hd + 0.05, 4.0);
+    }
+  }
 
   const roll = rand.next();
   if (roll < 0.32) {
@@ -270,51 +337,80 @@ interface RangeDef {
  */
 function buildRidge(m: Mesher, def: RangeDef): void {
   const { segments, rows } = def;
-  const crest = (a: number): number =>
-    def.base + Math.pow(ridged(a + def.phase), def.sharp) * def.gain;
+  const seed = def.phase;
+
+  const crest = (a: number): number => {
+    // A massif envelope: whole sectors of the range are low saddles and whole
+    // sectors are high massifs. Without it every peak reaches the same altitude
+    // and the horizon is a row of identical paper triangles.
+    const massif = 0.20 + 0.80 * Math.pow(ringNoise(a, 0.62, seed + 17.3), 1.25);
+    const rid = Math.max(0, (ringRidge(a, seed) - 0.40) / 0.60);
+    return def.base + Math.pow(rid, def.sharp) * def.gain * massif;
+  };
 
   const radiusAt = (a: number, t: number): number => {
-    const lobe = 1 + (ridged(a * 1.7 + def.phase * 2.1) - 0.4) * 0.08;
+    // The plan is not a circle: the foot wanders in and out by ~12%, and it
+    // wanders differently at the crest, so ridgelines are not radial spokes.
+    const lobeFoot = 1 + (ringNoise(a, 1.1, seed + 2.7) - 0.5) * 0.24;
+    const lobeCrest = 1 + (ringNoise(a, 2.3, seed + 9.1) - 0.5) * 0.18;
+    const lobe = lobeFoot + (lobeCrest - lobeFoot) * t;
     return (def.rFoot + (def.rCrest - def.rFoot) * t) * lobe;
   };
+
   const heightAt = (a: number, t: number): number => {
     const c = crest(a);
     // S-curve flank: the toe eases out into the plain and the crest rounds.
     const prof = t * t * (3 - 2 * t);
-    // Spur/gully field, strongest at mid-slope, gone at the skyline.
-    const spur = (ridged(a * 5.9 + 1.7) - 0.45) * def.gain * 0.22 * Math.sin(Math.PI * t)
-      + (ridged(a * 11.3 + 4.9) - 0.45) * def.gain * 0.09 * Math.sin(Math.PI * t);
-    return -14 + (c + 14) * prof + spur;
+    const belly = Math.sin(Math.PI * t);
+    // Spurs and gullies. The first two vary with angle only — those are the
+    // long ridges that run down off a summit. The last two vary with angle AND
+    // slope, and they are the whole point: the old surface was ruled between
+    // foot and crest, so every flank was a dead-straight line in space and the
+    // range read as folded paper with one crease per peak.
+    const spur = (ringRidge(a * 1.0 + 3.1, seed + 5.5) - 0.5) * def.gain * 0.26 * belly
+      + (ringNoise(a, 14.0, seed + 21.7) - 0.5) * def.gain * 0.11 * belly;
+    const wob = (noise3(Math.cos(a) * 7.5 + seed, t * 3.1, Math.sin(a) * 7.5 - seed) - 0.5)
+      * def.gain * 0.17 * belly
+      + (noise3(Math.cos(a) * 21.0 - seed, t * 7.3 + 4.4, Math.sin(a) * 21.0 + seed) - 0.5)
+      * def.gain * 0.055 * belly;
+    return -14 + (c + 14) * prof + spur + wob;
   };
 
-  const pt = (a: number, t: number, out: THREE.Vector3): THREE.Vector3 => {
-    const r = radiusAt(a, t);
-    return out.set(Math.cos(a) * r, heightAt(a, t), Math.sin(a) * r);
-  };
+  // Build the position grid first, then take normals from its own neighbours:
+  // one field evaluation per vertex instead of three, and normals that follow
+  // the displaced surface exactly rather than an idealised parameterisation.
+  const px: number[][] = [], py: number[][] = [], pz: number[][] = [];
+  for (let j = 0; j <= rows; j++) {
+    const t = j / rows;
+    const rx: number[] = [], ry: number[] = [], rz: number[] = [];
+    for (let i = 0; i <= segments; i++) {
+      const a = (i / segments) * Math.PI * 2;
+      const r = radiusAt(a, t);
+      rx.push(Math.cos(a) * r);
+      ry.push(heightAt(a, t));
+      rz.push(Math.sin(a) * r);
+    }
+    // Seam: the last column must be exactly the first.
+    rx[segments] = rx[0]; ry[segments] = ry[0]; rz[segments] = rz[0];
+    px.push(rx); py.push(ry); pz.push(rz);
+  }
 
-  const p = new THREE.Vector3();
-  const pa = new THREE.Vector3();
-  const pb = new THREE.Vector3();
   const du = new THREE.Vector3();
   const dv = new THREE.Vector3();
   const n = new THREE.Vector3();
   const rowsIdx: number[][] = [];
-  const da = ((Math.PI * 2) / segments) * 0.5;
-  const dt = (1 / rows) * 0.5;
-
   for (let j = 0; j <= rows; j++) {
-    const t = j / rows;
     const row: number[] = [];
+    const jm = Math.max(0, j - 1), jp = Math.min(rows, j + 1);
     for (let i = 0; i <= segments; i++) {
-      const a = (i / segments) * Math.PI * 2;
-      pt(a, t, p);
-      pt(a + da, t, pa);
-      pt(a, Math.min(1, t + dt), pb);
-      du.subVectors(pa, p);
-      dv.subVectors(pb, p);
+      const im = (i - 1 + segments) % segments, ip = (i + 1) % segments;
+      du.set(px[j][ip] - px[j][im], py[j][ip] - py[j][im], pz[j][ip] - pz[j][im]);
+      dv.set(px[jp][i] - px[jm][i], py[jp][i] - py[jm][i], pz[jp][i] - pz[jm][i]);
       n.crossVectors(du, dv).normalize();
+      if (!Number.isFinite(n.x) || n.lengthSq() < 0.5) n.set(0, 1, 0);
       if (n.y < 0) n.negate();
-      row.push(m.vertex(p.x, p.y, p.z, n.x, n.y, n.z, (i / segments) * 40, t * 8));
+      row.push(m.vertex(px[j][i], py[j][i], pz[j][i], n.x, n.y, n.z,
+        (i / segments) * 40, (j / rows) * 8));
     }
     rowsIdx.push(row);
   }
@@ -326,15 +422,26 @@ function buildRidge(m: Mesher, def: RangeDef): void {
 }
 
 /**
- * Ridged multifractal in [0,1]. Five octaves, folded through `1 - |n|` so the
- * maxima are creases rather than domes — the difference between a mountain
- * profile and a sine wave.
+ * Value noise sampled on a circle of radius `freq`, so it wraps seamlessly at
+ * a = 2π and has none of the visible periodicity of a sum of sines.
  */
-function ridged(a: number): number {
-  const n = Math.sin(a * 3.1 + 0.4) * 0.42
-    + Math.sin(a * 7.3 + 2.1) * 0.24
-    + Math.sin(a * 13.7 + 4.4) * 0.16
-    + Math.sin(a * 27.1 + 1.7) * 0.11
-    + Math.sin(a * 49.3 + 5.9) * 0.07;
-  return Math.max(0, 1 - Math.abs(n));
+function ringNoise(a: number, freq: number, seed: number): number {
+  return noise3(Math.cos(a) * freq + seed * 3.7, seed * 1.93, Math.sin(a) * freq - seed * 2.3);
+}
+
+/**
+ * Ridged multifractal around a ring, in roughly [0,1]. Folded through
+ * `1 - |n|` so the maxima are creases rather than domes — the difference
+ * between a mountain profile and a sine wave.
+ */
+function ringRidge(a: number, seed: number): number {
+  let amp = 1, sum = 0, norm = 0, f = 1.7;
+  for (let o = 0; o < 5; o++) {
+    const v = ringNoise(a, f, seed + o * 4.13) * 2 - 1;
+    sum += (1 - Math.abs(v)) * amp;
+    norm += amp;
+    amp *= 0.53;
+    f *= 2.11;
+  }
+  return sum / norm;
 }

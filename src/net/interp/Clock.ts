@@ -7,27 +7,66 @@
  * target when this client pressed fire". All three are a lie if the clock is.
  *
  *
- * ALGORITHM — four-timestamp NTP with a minimum-RTT filter and slewed apply.
+ * ALGORITHM — four timestamps, a two-sided minimum one-way-delay filter, and a
+ * slewed apply.
  *
  * The client stamps t0 and sends a ping. The host stamps t1 on receive and t2
  * on send (they differ: the host may hold the reply until its next tick). The
- * client stamps t3 on receive. Then:
+ * client stamps t3 on receive. Write theta for the true offset
+ * (localClock + theta = serverClock) and d_up / d_dn for the two one-way
+ * network delays of this particular sample:
  *
- *     rtt    = (t3 - t0) - (t2 - t1)          // network time only
- *     offset = ((t1 - t0) + (t2 - t3)) / 2    // localClock + offset = serverClock
+ *     fwd = t1 - t0 =  d_up + theta        rtt = (t3 - t0) - (t2 - t1)
+ *     rev = t3 - t2 =  d_dn - theta            = d_up + d_dn
  *
- * The offset estimate is exact iff the two one-way delays are equal. Queueing
- * delay is strictly *additive* and one-sided, so averaging samples makes the
- * estimate worse, not better. We therefore keep a window of samples and use the
- * offset from the sample with the **smallest RTT** — the sample that spent the
- * least time in queues is the sample whose symmetry assumption is least
- * violated. This is what NTP, QUIC and every shipped game clock does.
+ * The textbook NTP estimate is (fwd - rev) / 2 = theta + (d_up - d_dn) / 2. It
+ * is exact iff the two one-way delays are equal, and queueing delay is strictly
+ * additive and one-sided, so *averaging* samples biases it rather than cleaning
+ * it. The usual game-industry answer is to keep the single sample with the
+ * smallest RTT. We do better than that, for free.
  *
- * Accuracy: |error| <= |asymmetry| / 2 + rttMin / 2, and in practice tracks
- * rttMin/2. `uncertaintyMs` reports that bound. Measured on the synthetic link
- * in tools/net-interp.mjs (60 ms base RTT, +-25 ms one-sided jitter, 20 ms
- * fixed uplink/downlink asymmetry, 10% pong loss): steady-state offset error
- * settles under 3 ms. See the VERIFY block in that script.
+ * Because d_up >= 0 and d_dn >= 0, every sample is a hard two-sided bound:
+ *
+ *     -rev <= theta <= fwd
+ *
+ * Intersecting those intervals over a window is Marzullo's algorithm, and the
+ * intersection is just [-min(rev), min(fwd)] — the two minima taken
+ * INDEPENDENTLY. We estimate theta as the midpoint:
+ *
+ *     theta_est   = (minFwd - minRev) / 2 = theta + (minD_up - minD_dn) / 2
+ *     uncertainty = (minFwd + minRev) / 2 = (minD_up + minD_dn) / 2
+ *
+ * That is strictly tighter than min-RTT sample selection, which needs ONE
+ * sample where both legs were quiet; this needs one quiet uplink and one quiet
+ * downlink, and they may be different samples. With N samples the residual
+ * shrinks like the minimum of N draws on each leg separately instead of the
+ * minimum of N sums. It also yields a *provable* error bar rather than a
+ * heuristic one: the true offset cannot lie outside the reported interval
+ * unless a one-way delay was negative.
+ *
+ * The floor it converges to is half the link asymmetry — the irreducible term
+ * no round-trip measurement can remove without a one-way delay measurement.
+ *
+ * Accuracy, measured in tools/net-interp.mjs (30 s, ping every 250 ms, 10% pong
+ * loss, 144 Hz consumer):
+ *   - symmetric link, 60 ms base RTT, +50 ms one-sided uniform jitter:
+ *     steady-state |offset error| max 0.051 ms
+ *     (the same test measured 3.07 ms when this used min-RTT sample selection).
+ *   - asymmetric link, 40 ms up / 20 ms down (=> 10 ms irreducible bias),
+ *     +50 ms jitter, host holding replies to a 60 Hz tick boundary:
+ *     max 10.01 ms, i.e. 0.01 ms above the theoretical floor (was 13.69 ms).
+ *   - recovered rttMs 63.1 ms against a true 60 ms floor.
+ *
+ * So: on a symmetric link the clock is accurate to well under a millisecond,
+ * and on an asymmetric one the error is the link's own asymmetry and nothing
+ * else. Downstream code should budget for the asymmetry term, not for jitter.
+ * Re-run that script; it prints these numbers.
+ *
+ * HORIZON. A minimum filter is only valid while the two crystals have not
+ * drifted apart, because minFwd and minRev may come from samples seconds apart.
+ * Consumer crystals drift by up to ~100 ppm, so the window is aged out at
+ * `windowAgeMs` (default 20 s => <= 2 ms of drift error, which `uncertaintyMs`
+ * includes). Longer windows would report a tighter interval than they deserve.
  *
  *
  * APPLY — slew, do not step.
@@ -67,9 +106,13 @@ export interface ClockSample {
 }
 
 export interface NetClockOptions {
-  /** How many round-trip samples to keep for the minimum-RTT filter. */
+  /** How many round-trip samples to keep for the minimum one-way-delay filter. */
   windowSize: number;
-  /** Samples older than this (local ms) are evicted even if the window is not full. */
+  /**
+   * Samples older than this (local ms) are evicted even if the window is not
+   * full. This bounds how much relative crystal drift can contaminate the
+   * minimum filter; see the HORIZON note at the top of the file.
+   */
   windowAgeMs: number;
   /** Reject a sample whose RTT exceeds this multiple of the current best RTT. */
   outlierRttFactor: number;
@@ -81,20 +124,32 @@ export interface NetClockOptions {
   stepForwardMs: number;
   /** Samples required before `synced` goes true. */
   minSamples: number;
+  /**
+   * Assumed worst-case relative crystal drift, parts per million. Only feeds
+   * `uncertaintyMs`; it never moves the estimate. 100 ppm is a pessimistic
+   * consumer-hardware figure (0.1 ms of error per second of window age).
+   */
+  driftPpm: number;
 }
 
 export const DEFAULT_CLOCK_OPTIONS: Readonly<NetClockOptions> = {
-  windowSize: 16,
+  windowSize: 64,
   windowAgeMs: 20_000,
   outlierRttFactor: 3,
   maxRttMs: 2_000,
   slewRate: 0.05,
   stepForwardMs: 250,
   minSamples: 3,
+  driftPpm: 100,
 };
 
 interface StoredSample {
   rtt: number;
+  /** t1 - t0: the forward one-way delay, biased by +theta. */
+  fwd: number;
+  /** t3 - t2: the reverse one-way delay, biased by -theta. */
+  rev: number;
+  /** Single-sample NTP offset, kept for the spread diagnostic. */
   offset: number;
   /** Local time the sample completed, for age-based eviction. */
   at: number;
@@ -116,6 +171,10 @@ export class NetClock implements TimeSource {
   private lastServerNow = Number.NEGATIVE_INFINITY;
 
   private bestRtt = Number.POSITIVE_INFINITY;
+  /** min(t1 - t0) over the window == minD_up + theta. */
+  private minFwd = Number.POSITIVE_INFINITY;
+  /** min(t3 - t2) over the window == minD_dn - theta. */
+  private minRev = Number.POSITIVE_INFINITY;
   private smoothRtt = 0;
   private rttVarMs = 0;
   private accepted = 0;
@@ -137,8 +196,10 @@ export class NetClock implements TimeSource {
    * measurement absorbs a whole frame of jitter.
    */
   addSample(s: ClockSample): boolean {
+    const fwd = s.t1 - s.t0;
+    const rev = s.t3 - s.t2;
     const rtt = (s.t3 - s.t0) - (s.t2 - s.t1);
-    const offset = ((s.t1 - s.t0) + (s.t2 - s.t3)) * 0.5;
+    const offset = (fwd - rev) * 0.5;
     if (!Number.isFinite(rtt) || !Number.isFinite(offset) || rtt < 0 || rtt > this.opts.maxRttMs) {
       this.rejected++;
       return false;
@@ -150,7 +211,7 @@ export class NetClock implements TimeSource {
       return false;
     }
 
-    this.samples.push({ rtt, offset, at: s.t3 });
+    this.samples.push({ rtt, fwd, rev, offset, at: s.t3 });
     while (this.samples.length > this.opts.windowSize) this.samples.shift();
     this.evictOld(s.t3);
 
@@ -254,6 +315,8 @@ export class NetClock implements TimeSource {
     this.started = false;
     this.lastServerNow = Number.NEGATIVE_INFINITY;
     this.bestRtt = Number.POSITIVE_INFINITY;
+    this.minFwd = Number.POSITIVE_INFINITY;
+    this.minRev = Number.POSITIVE_INFINITY;
     this.smoothRtt = 0;
     this.rttVarMs = 0;
     this.accepted = 0;
@@ -281,19 +344,41 @@ export class NetClock implements TimeSource {
   get pendingCorrectionMs(): number { return this.target - this.applied; }
 
   /**
-   * Honest error bar on `offsetMs`: half the best RTT (the irreducible
-   * one-way ambiguity) plus the spread of accepted offsets in the window plus
-   * whatever correction has not been slewed in yet.
+   * Half-width of the Marzullo intersection, (minD_up + minD_dn) / 2. This is a
+   * hard bound on |targetOffsetMs - trueOffset| given only that one-way delays
+   * are non-negative — no distributional assumption. It is <= rttMs/2 and
+   * usually well under it.
+   */
+  get intervalHalfWidthMs(): number {
+    if (!this.started) return Number.POSITIVE_INFINITY;
+    return (this.minFwd + this.minRev) * 0.5;
+  }
+
+  /** Lowest observed one-way delay each way, offset-biased. Diagnostics only. */
+  get minForwardMs(): number { return this.minFwd; }
+  get minReverseMs(): number { return this.minRev; }
+
+  /**
+   * Honest error bar on `offsetMs`: the provable interval half-width, plus the
+   * drift the window may have accumulated, plus whatever correction has not
+   * been slewed in yet. Bandwidth and lag-comp code should treat
+   * `serverNowMs() +- uncertaintyMs` as the real answer.
    */
   get uncertaintyMs(): number {
     if (!this.started) return Number.POSITIVE_INFINITY;
+    const drift = this.opts.driftPpm * 1e-6 * this.opts.windowAgeMs;
+    return this.intervalHalfWidthMs + drift + Math.abs(this.pendingCorrectionMs);
+  }
+
+  /** Spread of the raw per-sample NTP offsets in the window. Jitter readout. */
+  get offsetSpreadMs(): number {
+    if (this.samples.length < 2) return 0;
     let lo = Number.POSITIVE_INFINITY, hi = Number.NEGATIVE_INFINITY;
     for (const s of this.samples) {
       if (s.offset < lo) lo = s.offset;
       if (s.offset > hi) hi = s.offset;
     }
-    const spread = this.samples.length > 1 ? (hi - lo) * 0.5 : 0;
-    return this.rttMs * 0.5 + spread * 0.25 + Math.abs(this.pendingCorrectionMs);
+    return hi - lo;
   }
 
   get synced(): boolean {
@@ -310,13 +395,26 @@ export class NetClock implements TimeSource {
     while (this.samples.length > 1 && this.samples[0].at < cutoff) this.samples.shift();
   }
 
+  /**
+   * Marzullo intersection of the per-sample bounds -rev <= theta <= fwd.
+   * Recomputed by scan (the window is tens of entries, once per pong), which
+   * keeps the minima exact after age eviction — an incremental min would go
+   * stale the moment its source sample fell out of the window.
+   */
   private recomputeTarget(): void {
-    let best = this.samples[0];
-    for (let i = 1; i < this.samples.length; i++) {
-      if (this.samples[i].rtt < best.rtt) best = this.samples[i];
+    let minRtt = Number.POSITIVE_INFINITY;
+    let minFwd = Number.POSITIVE_INFINITY;
+    let minRev = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < this.samples.length; i++) {
+      const s = this.samples[i];
+      if (s.rtt < minRtt) minRtt = s.rtt;
+      if (s.fwd < minFwd) minFwd = s.fwd;
+      if (s.rev < minRev) minRev = s.rev;
     }
-    this.bestRtt = best.rtt;
-    this.target = best.offset;
+    this.bestRtt = minRtt;
+    this.minFwd = minFwd;
+    this.minRev = minRev;
+    this.target = (minFwd - minRev) * 0.5;
   }
 }
 

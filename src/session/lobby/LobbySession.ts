@@ -17,7 +17,7 @@
 
 import type {
   LobbyId, LobbyResult, LobbySettings, LobbySnapshot, LobbyState, PlayerId, PlayerProfile,
-  RoomCode, SessionEmitter,
+  RoomCode, SessionEmitter, SessionTeam,
 } from '../types';
 import { nullEmitter } from '../types';
 import type { LobbyCatalog } from './Catalog';
@@ -53,6 +53,8 @@ export class LobbySession {
   private lastSnapshot: LobbySnapshot | null = null;
   private snapshotTimer = 0;
   private snapshotInterval: number;
+  private pingTimer = 0;
+  private snapshotDue = false;
   private offs: Array<() => void> = [];
   private disposed = false;
 
@@ -126,6 +128,35 @@ export class LobbySession {
   ready(ready: boolean): CommandResult { return this.submit({ t: 'ready', ready }); }
   vote(candidateId: string): CommandResult { return this.submit({ t: 'vote', candidateId }); }
   leave(): CommandResult { return this.submit({ t: 'leave' }); }
+
+  /* --- party. One button each on the roster row; see the UI notes in index.ts. */
+
+  /** Start a party of one. Invites turn it into a squad. */
+  createParty(): CommandResult { return this.submit({ t: 'party:create' }); }
+  /** Ask someone in this lobby to join our party. Creates one if we have none. */
+  invite(target: PlayerId): CommandResult { return this.submit({ t: 'party:invite', target }); }
+  /** Accept an invite. `partyId` comes from the `lobby:party:invite` event. */
+  acceptInvite(partyId: string): CommandResult {
+    return this.submit({ t: 'party:accept', partyId });
+  }
+  leaveParty(): CommandResult { return this.submit({ t: 'party:leave' }); }
+  promoteInParty(target: PlayerId): CommandResult {
+    return this.submit({ t: 'party:promote', target });
+  }
+  /** The local player's party as the read model sees it, or null when solo. */
+  get party(): { id: string; leaderId: PlayerId; members: PlayerId[] } | null {
+    const me = this.state?.members.find((m) => m.id === this.localId);
+    if (!me?.partyId) return null;
+    return this.state?.parties.find((p) => p.id === me.partyId) ?? null;
+  }
+
+  /* --- team and match --- */
+
+  switchTeam(team: SessionTeam): CommandResult { return this.submit({ t: 'switchTeam', team }); }
+  /** Leader-only: arm the countdown now, without waiting for stragglers. */
+  start(): CommandResult { return this.submit({ t: 'start' }); }
+  /** Leader-only: disarm an armed countdown. */
+  cancel(): CommandResult { return this.submit({ t: 'cancel' }); }
   kick(target: PlayerId, reason?: string): CommandResult {
     return this.submit({ t: 'kick', target, reason });
   }
@@ -148,10 +179,32 @@ export class LobbySession {
     if (this.disposed) return;
     if (!this.hostImpl) return;
     this.hostImpl.tick(dt);
+    this.pingTimer += dt;
+    if (this.pingTimer >= 1) {
+      this.pingTimer = 0;
+      this.refreshPings();
+    }
     this.snapshotTimer += dt;
     if (this.snapshotTimer >= this.snapshotInterval) {
       this.snapshotTimer = 0;
       this.broadcastSnapshot();
+    }
+  }
+
+  /**
+   * Link quality is something the transport *measures*, not something a client
+   * gets to claim — so the host stamps it in on every peer's behalf, once a
+   * second. This matters beyond the ping column in the UI: migration succession
+   * is ranked on these numbers (`Migration.ts`), and a client that could inflate
+   * its own would be electing itself host.
+   */
+  private refreshPings(): void {
+    const host = this.hostImpl;
+    if (!host) return;
+    for (const m of host.state.members) {
+      if (m.profile.bot) continue;
+      const ping = this.transport.pingOf(m.id);
+      if (ping >= 0 && ping !== m.ping) host.submit({ t: 'heartbeat', ping }, m.id);
     }
   }
 
@@ -164,9 +217,19 @@ export class LobbySession {
   private hostEmitter(): SessionEmitter {
     return ((key, payload) => {
       this.emit(key, payload);
+      // A phase change is exactly the moment a stale snapshot hurts: elect a new
+      // host off a snapshot taken one beat ago and the room replays the beat.
+      // So the slow timer is short-circuited and a full snapshot rides out with
+      // the state that announces the new phase.
+      if (key === 'lobby:phase') this.snapshotDue = true;
       if (key === 'lobby:state') {
         this.remote = payload as LobbyState;
         this.transport.broadcast({ t: 'state', state: payload as LobbyState });
+        if (this.snapshotDue) {
+          this.snapshotDue = false;
+          this.snapshotTimer = 0;
+          this.broadcastSnapshot();
+        }
       }
     }) as SessionEmitter;
   }
@@ -250,8 +313,8 @@ export class LobbySession {
         emit: this.hostEmitter(),
         catalog: this.catalog,
         departed,
+        parties: this.parties,
       });
-      this.parties.restore(snapshot.parties);
       this.remote = this.hostImpl.state;
       this.snapshotTimer = 0;
       this.broadcastSnapshot();

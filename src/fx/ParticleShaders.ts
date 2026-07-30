@@ -330,7 +330,11 @@ void main() {
 	float fadeOut;
 	if ( model == 1 ) fadeOut = pow( 1.0 - t, 1.5 );
 	else if ( model == 2 ) fadeOut = 1.0 - smoothstep( 0.74, 1.0, t );
-	else fadeOut = 1.0 - smoothstep( 0.50, 1.0, t );
+	// Media held half its life at reduced opacity, so a smoke screen five seconds
+	// into a thirteen-second burn was running at roughly 60% of the density it
+	// had been authored for. Real smoke thins by dispersing, which the size curve
+	// already does; the alpha only needs to let go at the very end.
+	else fadeOut = 1.0 - smoothstep( 0.72, 1.0, t );
 	float alpha = s0.a * fadeIn * fadeOut;
 
 	if ( ( flags & FX_FLICKER ) != 0 ) {
@@ -489,7 +493,22 @@ void main() {
 		B = mix( B, texture( tAtlasB, uvB ), blend );
 	}
 
-	float alpha = A.a * vColor.a;
+	// The spawn opacity is an alpha *gain*, not a ceiling. The atlas puff averages about
+	// 0.2 coverage across its disc once the body falloff, the density noise and
+	// the lobe mask have all multiplied together, so even fifty overlapping
+	// sprites only reach ~60% opacity — which is why a smoke screen you could
+	// read a shop window through survived doubling the emission rate. Letting an
+	// emitter ask for more than 1 and clamping here is the one lever that turns
+	// a bank into something that genuinely blocks line of sight. The clamp is
+	// load-bearing: the blend factor is 1 - srcAlpha, so an alpha over 1 would
+	// go negative and subtract the scene.
+	// Media accumulates as optical depth, not as coverage: a hard min() plateaus
+	// every sprite into a flat disc and prints its circular outline on the cloud.
+	// Beer-Lambert saturates smoothly instead, so the puff keeps a gradient all
+	// the way to its core and the individual billboards stay invisible.
+	float alpha = vModel == 0
+		? 1.0 - exp( - A.a * vColor.a * 1.35 )
+		: min( A.a * vColor.a, 1.0 );
 	if ( alpha < 0.0025 ) discard;
 
 	float viewZ = vMisc.y;
@@ -546,6 +565,11 @@ void main() {
 		float wrap = boSat( ( ndl + 0.52 ) / 1.52 );
 		float thickness = B.b;
 		float shadow = vMisc.w;
+		// Media is metres across, so a single PCF tap lands it wholly inside or
+		// wholly outside a shadow and the cascade edge prints a hard-edged dark
+		// rectangle across the cloud. A real cloud in shadow is still lit by the
+		// sky and by the rest of itself, so floor the occlusion well above black.
+		float mediaShadow = mix( 0.34, 1.0, shadow );
 
 		// Sky/bounce fill. A puff sees the sky from above and the ground from
 		// below, so the SH lookup already gives it a cool top and a warm floor
@@ -558,10 +582,15 @@ void main() {
 
 		// Beer-Lambert through the puff along the light path. The exponent runs
 		// from "thin edge, fully lit" to "dense core on the far side, dark".
-		float depth = thickness * ( 0.55 + 2.85 * ( 1.0 - wrap ) );
-		float selfShadow = exp( - depth * 1.9 );
+		// Tuned so the *ratio* between the two sides is about 5:1 while the lit
+		// side keeps three quarters of the key. At the old 1.9 extinction even
+		// the side facing the sun kept barely a third of it, so the entire
+		// volume sat below the sky fill and every puff came out a uniform cold
+		// blue-grey with no bright side at all — fog, not smoke.
+		float depth = thickness * ( 0.30 + 1.55 * ( 1.0 - wrap ) );
+		float selfShadow = exp( - depth * 1.05 );
 
-		vec3 sun = boSunColor * ( wrap * selfShadow * shadow );
+		vec3 sun = boSunColor * ( wrap * selfShadow * mediaShadow );
 
 		// Henyey-Greenstein forward lobe. Backlit smoke glowing around its rim
 		// is the single most recognisable thing about real smoke on film, and a
@@ -577,15 +606,26 @@ void main() {
 		hg = min( hg, 5.0 );
 		// Transmission falls off with optical depth — a thin wisp glows, the
 		// dense core stays dark, and that contrast is what gives smoke volume.
+		// In-scatter is proportional to how much media is *there* as well as to
+		// how much light gets through it. Weighting by transmission alone peaks
+		// at zero thickness, which lights the extreme edge of every billboard and
+		// prints a bright ring around each sprite once the cloud is dense enough
+		// for those edges to be visible at all.
 		float transmit = exp( - thickness * 2.35 );
-		sun += boSunColor * hg * transmit * shadow * 0.38;
+		sun += boSunColor * hg * thickness * transmit * mediaShadow * 0.62;
 
 		// boSunColor is illuminance; a scattering lobe converts it to radiance.
 		// The extra hold-down is deliberate: pale dust really is ~3x brighter
 		// than dark asphalt, but at the exposure the frame graph settles on,
 		// that clips every bit of internal structure to flat white.
-		sun *= BO_INV_PI * 0.62;
-		amb *= 0.72;
+		// A lit smoke bank is about as bright as lit concrete — that is the whole
+		// reason a smoke screen reads as a solid object rather than a veil. The
+		// solid-chunk branch below uses BO_INV_PI * ~0.9 for exactly that look,
+		// so holding media down to 0.62 of it (and then again by the extinction
+		// above) put the brightest part of a smoke screen *below* the wall behind
+		// it, which is why it read as transparent haze.
+		sun *= BO_INV_PI * 0.76;
+		amb *= 0.58;
 
 		if ( vModel == 2 ) {
 			// Solid chunk: a proper lambert term plus a tight sheen on the edge.
@@ -606,7 +646,7 @@ void main() {
 			// *through* the cloud, which is what gives it interior.
 			float vol = boFbm( vWorldPos * 0.38 + vec3( 11.0, 3.0, 7.0 ), 3 );
 			float vol2 = boFbm( vWorldPos * 1.35 + vec3( 2.0, 9.0, 4.0 ), 2 );
-			sun *= 0.42 + 1.35 * vol;
+			sun *= 0.40 + 1.05 * vol;
 			amb *= 0.78 + 0.34 * vol2;
 		}
 

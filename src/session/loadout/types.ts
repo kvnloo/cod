@@ -305,6 +305,18 @@ export interface EffectiveWeaponStats {
   holsterTime: number;
   reloadTactical: number;
   reloadEmpty: number;
+  /**
+   * Shell-by-shell reloaders (shotguns, some marksman rifles) have
+   * `reloadTactical === 0`; their timing lives here instead. Every field is
+   * already scaled by `reloadScale`, so a quickdraw magazine or Sleight of Hand
+   * speeds a shotgun up exactly as it speeds a rifle up.
+   */
+  shellReload: boolean;
+  reloadPerShell: number;
+  reloadShellIn: number;
+  reloadShellOut: number;
+  /** The multiplier that produced every reload number above. */
+  reloadScale: number;
   /** Multipliers on the player's base speed. */
   moveScale: number;
   adsMoveScale: number;

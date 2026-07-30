@@ -162,10 +162,13 @@ export class ScorePopups implements Widget {
       if (alpha <= 0.005) continue;
 
       // Score is the loudest thing on a busy frame precisely because it is the
-      // least urgent — it costs nothing to miss one. Ordinary awards run in the
-      // neutral ramp; only a killstreak-tier reward is worth the accent, and
-      // that is one popup every few minutes rather than three per firefight.
-      const tint: RGB = q.reward ? p.accent : lift(p.ink, 0.2);
+      // least urgent — it costs nothing to miss one. *Every* award runs in the
+      // neutral ramp, including killstreak-tier ones: a "+300" in the accent
+      // stacked directly above a "+150" in white made the hue look arbitrary,
+      // and the accent has to mean "objective" and nothing else. A reward is
+      // told apart by value and weight instead — brighter, larger, and haloed
+      // in the accent rather than filled with it.
+      const tint: RGB = lift(p.ink, q.reward ? 0.42 : 0.2);
       c.save();
       c.globalAlpha = alpha;
       c.translate(x, y);
@@ -176,18 +179,20 @@ export class ScorePopups implements Widget {
       // a stack of "+25 HIT / +150 HEADSHOT" lines up on the digits the way a
       // shipped feed does instead of centring each row independently.
       const amountStr = `+${q.amount}`;
-      const aOpts = { size: 20 * s, weight: 700, family: 'cond' as const, tracking: 0.4 * s };
+      const aOpts = {
+        size: (q.reward ? 25 : 20) * s, weight: 700, family: 'cond' as const, tracking: 0.4 * s,
+      };
       const lOpts = { size: 11 * s, weight: 600, family: 'cond' as const, tracking: 2.6 * s };
       const hinge = 6 * s;
 
       text(c, amountStr, -hinge, 0, {
         ...aOpts, align: 'right', color: rgba(tint, q.reward ? 1 : 0.92),
         shadow: Math.max(1, 1.3 * s), outline: 2.6 * s,
-        glow: q.reward ? 14 * s : 0, glowColor: rgba(tint, 0.5),
+        glow: q.reward ? 16 * s : 0, glowColor: rgba(p.accent, 0.55),
       });
       if (q.label) {
         text(c, q.label, hinge, -1.5 * s, {
-          ...lOpts, color: rgba(p.inkDim, 0.86),
+          ...lOpts, color: rgba(q.reward ? lift(p.ink, 0.2) : p.inkDim, q.reward ? 0.95 : 0.86),
           shadow: Math.max(1, 1 * s), outline: 2.2 * s,
         });
       }

@@ -198,12 +198,31 @@ export interface SessionPorts {
 
 /* ----------------------------------------------------------------- config -- */
 
+/**
+ * The meta-layer objects a build chose to install, kept so anything holding the
+ * `SessionSystem` can find them. Deliberately opaque: each subsystem owns its
+ * own contract, and re-declaring those here would make this file the place they
+ * all have to agree, which is exactly what ports exist to avoid.
+ */
+export interface SessionSubsystems {
+  lobby: object | null;
+  matchmaking: object | null;
+  loadout: object | null;
+  spawns: object | null;
+  replay: object | null;
+}
+
 export interface SessionConfig {
   /** Seconds the lobby idles before searching. -1 waits for the player. */
   lobbyDwell: number;
   /** Seconds to wait for human players before filling with bots. */
   searchPatience: number;
-  /** Hard search failure after this. */
+  /**
+   * Hard search failure after this. It is a *hang detector*, not a patience
+   * knob: the matchmaker owns the decision to give up and bot-fill (its own
+   * `hardTimeout` is 120 s on the core playlists), so this must sit above that
+   * or the session cancels searches the matchmaker would have resolved.
+   */
   searchTimeout: number;
   /** Hard load failure after this. */
   loadTimeout: number;
@@ -512,6 +531,14 @@ export class SessionSystem implements System {
   readonly flow = new Flow('boot');
   readonly config: SessionConfig;
   readonly ports: SessionPorts;
+  /**
+   * Raw handles for the subsystems this session was installed with. Discovery
+   * only — `src/game/Services.ts` reads this to find the meta layer without
+   * importing it. The session drives subsystems through `ports`, never here.
+   */
+  readonly subsystems: SessionSubsystems = {
+    lobby: null, matchmaking: null, loadout: null, spawns: null, replay: null,
+  };
 
   private readonly bus: EventBus;
   private readonly rng: Rand;
@@ -543,6 +570,8 @@ export class SessionSystem implements System {
   private lastCountdownSent = -1;
   private resumeFrom: FlowState = 'lobby';
   private snap: SessionSnapshot;
+  /** Stand-in view used only until a real lobby has state. */
+  private fallbackLobby: LocalLobby | null = null;
 
   constructor(opts: SessionOptions = {}) {
     this.config = defaultSessionConfig(opts.config);
@@ -598,12 +627,22 @@ export class SessionSystem implements System {
   private resolveFromEngine(ctx: EngineContext): void {
     const e = ctx.engine;
     this.ports.match ??= asMatchPort(e.tryGet('director'));
-    this.ports.lobby ??= asLobbyPort(e.tryGet('lobby'));
-    this.ports.matchmaking ??= asMatchmakingPort(e.tryGet('matchmaking'));
+    this.ports.lobby ??= lobbyPortFrom(e.tryGet('lobby'), () => this.baselineLobbyView());
+    this.ports.matchmaking ??= matchmakingPortFrom(e.tryGet('matchmaking'), { map: this.map });
     this.ports.mapLoad ??= asMapLoadPort(e.tryGet('maploader') ?? e.tryGet('world'));
-    this.ports.loadout ??= asLoadoutPort(e.tryGet('loadout'));
+    this.ports.loadout ??= loadoutPortFrom(e.tryGet('loadout'));
     this.ports.net ??= asNetPort(e.tryGet('net'));
     this.ports.progression ??= asProgressionPort(e.tryGet('director'));
+  }
+
+  /**
+   * What the front end shows while a real lobby is still coming up: our own
+   * party, our own selection. Never authoritative — the moment the lobby
+   * module has a `LobbyState`, that wins.
+   */
+  private baselineLobbyView(): SessionLobbyView {
+    this.fallbackLobby ??= new LocalLobby(this.mode, this.map, this.seed, this.me);
+    return this.fallbackLobby.view();
   }
 
   /** Installs fallbacks, subscribes to the bus and leaves `boot`. */
@@ -1213,6 +1252,347 @@ function asMatchmakingPort(sys: unknown): MatchmakingPort | null {
   const m = sys as Partial<MatchmakingPort> | undefined;
   if (!m || !isFn(m.search) || !isFn(m.cancel) || !isFn(m.status) || !isFn(m.result)) return null;
   return sys as MatchmakingPort;
+}
+
+/* --------------------------------------------------- real-subsystem bridges -- */
+
+/**
+ * The seven session subsystems were written in parallel and do not all speak
+ * the port vocabulary above. Rather than ask another module to change shape —
+ * or import it and drag the whole subsystem into the bundle — the disagreements
+ * are reconciled here, structurally: each bridge takes `unknown`, proves the
+ * shape at runtime, and returns a port or `null`.
+ *
+ * Reconciled (see `docs/SESSION.md` §8):
+ *
+ * - `lobby/LobbySystem` owns a `LobbySession` that publishes a fat `LobbyState`;
+ *   `LobbyPort` wants a flat `view()`.               → `lobbyPortFrom`
+ * - `matchmaking/MatchmakingService` is ticket-shaped and clocked in *absolute*
+ *   seconds; `MatchmakingPort` is search/status/result shaped and clocked in
+ *   deltas.                                          → `matchmakingPortFrom`
+ * - `loadout/LoadoutBook` is the client's saved classes; the session only needs
+ *   the active class name.                           → `loadoutPortFrom`
+ *
+ * None of these bridges mutate the subsystem they wrap beyond the commands that
+ * subsystem already exposes to its own UI, so authority stays where it was.
+ */
+
+interface MemberStateLike {
+  id: string;
+  profile: { name: string; rank: number; bot: boolean };
+  team: SessionTeam;
+  ready: boolean;
+  loadProgress: number;
+  host: boolean;
+  leader: boolean;
+  ping: number;
+}
+
+interface LobbyStateLike {
+  phase: LobbyPhase;
+  hostId: string;
+  members: MemberStateLike[];
+  selection: LobbySelection;
+  countdown: { secondsLeft: number };
+  connectedCount: number;
+  capacity: number;
+  message: string;
+}
+
+interface LobbySessionLike {
+  readonly localId: string;
+  readonly state: LobbyStateLike | null;
+  submit(cmd: unknown): unknown;
+  ready(ready: boolean): unknown;
+  tick(dt: number): void;
+}
+
+/** A `LobbySession`, or anything that owns one (`LobbySystem.session`). */
+function asLobbySession(src: unknown): LobbySessionLike | null {
+  const direct = src as Partial<LobbySessionLike> | undefined;
+  if (direct && isFn(direct.submit) && isFn(direct.tick) && isFn(direct.ready)) {
+    return src as LobbySessionLike;
+  }
+  const owner = src as { session?: unknown } | undefined;
+  const inner = owner?.session as Partial<LobbySessionLike> | undefined;
+  if (inner && inner !== direct && isFn(inner.submit) && isFn(inner.tick) && isFn(inner.ready)) {
+    return owner!.session as LobbySessionLike;
+  }
+  return null;
+}
+
+function memberFrom(m: MemberStateLike, hostId: string, localId: string): SessionMember {
+  return {
+    id: m.id,
+    name: m.profile?.name ?? m.id,
+    team: m.team,
+    bot: m.profile?.bot === true,
+    host: m.host || m.id === hostId,
+    leader: m.leader === true,
+    ready: m.ready === true,
+    loadProgress: typeof m.loadProgress === 'number' ? m.loadProgress : 0,
+    ping: typeof m.ping === 'number' ? m.ping : 0,
+    rank: m.profile?.rank ?? 1,
+    local: m.id === localId,
+  };
+}
+
+/**
+ * Bridges the lobby module onto `LobbyPort`. `fallback` is used for the frames
+ * before the lobby exists (a `LobbySystem` creates its room in `init`, and a
+ * client has none until the host answers) — without it the front end would
+ * flash an empty room.
+ */
+export function lobbyPortFrom(src: unknown, fallback?: () => SessionLobbyView): LobbyPort | null {
+  const alreadyAPort = asLobbyPort(src);
+  if (alreadyAPort) return alreadyAPort;
+  const session = asLobbySession(src);
+  if (!session) return null;
+
+  return {
+    view(): SessionLobbyView {
+      const s = session.state;
+      if (!s) return fallback ? fallback() : EMPTY_LOBBY_VIEW;
+      const localId = session.localId;
+      return {
+        phase: s.phase,
+        hostId: s.hostId,
+        members: s.members.map((m) => memberFrom(m, s.hostId, localId)),
+        selection: s.selection,
+        countdown: s.countdown?.secondsLeft ?? -1,
+        connected: s.connectedCount ?? s.members.length,
+        capacity: s.capacity ?? s.members.length,
+        message: s.message ?? '',
+      };
+    },
+    // `pin` is the leader-only shortcut for `settings`; a non-leader's command
+    // is rejected by the host, which is the correct authority answer.
+    setMode(mode: GameModeId): void { session.submit({ t: 'pin', mapId: null, modeId: mode }); },
+    requestLaunch(): void { session.ready(true); session.submit({ t: 'start' }); },
+    requestCancel(): void { session.submit({ t: 'cancel' }); },
+    tick(dt: number): void { session.tick(dt); },
+  };
+}
+
+const EMPTY_LOBBY_VIEW: SessionLobbyView = {
+  phase: 'forming',
+  hostId: 'local',
+  members: [],
+  selection: {
+    mapId: 'blackout', mapName: 'Blackout', modeId: 'operation', modeName: 'Operation', seed: 1337,
+  },
+  countdown: -1,
+  connected: 0,
+  capacity: 0,
+  message: '',
+};
+
+interface MmSnapshotLike {
+  state: 'idle' | 'searching' | 'found' | 'joining' | 'in-match';
+  waited: number;
+  candidates: number;
+  roster: MmRosterLike | null;
+}
+
+interface MmSlotLike {
+  kind: 'human' | 'bot';
+  playerId?: string;
+  botId?: string;
+  name: string;
+  team: number;
+}
+
+interface MmRosterLike {
+  mode: string;
+  seed: number;
+  slots: MmSlotLike[];
+}
+
+interface MatchmakingServiceLike {
+  requestJoin(playlist: string, party?: unknown[], now?: number): unknown;
+  leaveQueue(): void;
+  update(now: number): unknown;
+  snapshot(): MmSnapshotLike;
+}
+
+/** Playlist chosen for a mode when the caller does not pick one. */
+const PLAYLIST_FOR_MODE: Readonly<Record<GameModeId, string>> = {
+  tdm: 'core-tdm-6v6',
+  operation: 'operation-coop-4',
+  firefight: 'firefight-coop-4',
+};
+
+export interface MatchmakingBridgeOptions {
+  /** Map id stamped onto the launch order; the roster does not carry one. */
+  map?: string;
+  /** Override the mode → playlist choice (ranked, private match, …). */
+  playlistFor?: (mode: GameModeId) => string;
+}
+
+/**
+ * Bridges `matchmaking/MatchmakingService` onto `MatchmakingPort`. The service
+ * owns no clock by design, so the bridge keeps one and advances it from the
+ * session's `tick(dt)` — which means matchmaking inherits the session's
+ * determinism instead of wall time.
+ */
+export function matchmakingPortFrom(
+  src: unknown,
+  opts: MatchmakingBridgeOptions = {},
+): MatchmakingPort | null {
+  const alreadyAPort = asMatchmakingPort(src);
+  if (alreadyAPort) return alreadyAPort;
+  const svc = src as Partial<MatchmakingServiceLike> | undefined;
+  if (!svc || !isFn(svc.requestJoin) || !isFn(svc.update) || !isFn(svc.snapshot)) return null;
+  const service = src as MatchmakingServiceLike;
+
+  const pick = opts.playlistFor ?? ((m: GameModeId) => PLAYLIST_FOR_MODE[m] ?? 'core-tdm-6v6');
+  let clock = 0;
+  let searching = false;
+  let target = 0;
+
+  return {
+    search(req: SearchRequest): void {
+      const party = req.party
+        .filter((m) => !m.bot)
+        .map((m) => ({ playerId: m.id, name: m.name, rank: m.rank }));
+      if (!party.length) party.push({ playerId: 'local', name: 'OPERATOR', rank: 1 });
+      searching = true;
+      service.requestJoin(pick(req.mode), party, clock);
+    },
+    cancel(): void {
+      searching = false;
+      if (isFn(service.leaveQueue)) service.leaveQueue();
+    },
+    status(): SearchStatus {
+      const s = service.snapshot();
+      const roster = s.roster;
+      if (roster) target = roster.slots.length;
+      const humans = roster ? roster.slots.filter((x) => x.kind === 'human').length : 0;
+      const state: SearchStatus['state'] = !searching
+        ? 'idle'
+        : s.state === 'searching' || s.state === 'idle' ? 'searching' : 'found';
+      return {
+        state,
+        elapsed: s.waited ?? clock,
+        players: roster ? humans : (s.candidates ?? 0) + 1,
+        target,
+        region: 'local',
+        // The service reports "still looking", never "gave up" — the session's
+        // own `searchTimeout` is what turns a hopeless search into a failure.
+        error: null,
+      };
+    },
+    result(): MatchLaunch | null {
+      const roster = service.snapshot().roster;
+      if (!roster) return null;
+      return {
+        modeId: normaliseMode(roster.mode),
+        mapId: opts.map ?? 'blackout',
+        seed: roster.seed,
+        roster: roster.slots.map((s) => ({
+          id: (s.kind === 'human' ? s.playerId : s.botId) ?? s.name,
+          name: s.name,
+          bot: s.kind === 'bot',
+          team: s.team === 1 ? ('bravo' as SessionTeam) : ('alpha' as SessionTeam),
+        })),
+        matchIndex: 0,
+      };
+    },
+    tick(dt: number): void {
+      clock += dt;
+      service.update(clock);
+    },
+  };
+}
+
+/* ------------------------------------------------------------ installation -- */
+
+/** The slice of `Engine` installation needs. Anything else can stand in. */
+export interface SystemRegistry {
+  add<T extends System>(system: T): T;
+  tryGet<T extends System>(name: string): T | undefined;
+}
+
+export interface InstallSessionOptions extends SessionOptions {
+  /** A `LobbySystem`, or a bare `LobbySession`. A `System` is registered too. */
+  lobby?: unknown;
+  /** A `MatchmakingService`. */
+  matchmaking?: unknown;
+  /** A `LoadoutBook`. */
+  loadout?: unknown;
+  /** A `SpawnDirector`. Registered for discovery; the match layer drives it. */
+  spawns?: unknown;
+  /** A replay recorder/theater. Registered for discovery. */
+  replay?: unknown;
+}
+
+function looksLikeSystem(v: unknown): v is System {
+  const s = v as Partial<System> | undefined;
+  return !!s && typeof s.name === 'string' && typeof s.order === 'number';
+}
+
+/**
+ * The one call that turns the meta layer on:
+ *
+ * ```ts
+ * installSession(engine, { lobby: new LobbySystem(), matchmaking: mm });
+ * ```
+ *
+ * Everything is optional. `installSession(engine)` alone gives you the local
+ * session — menu, lobby, bot fill, after-action report — with no network and no
+ * subsystems, which is exactly what single player is. Subsystems handed in here
+ * are bridged onto ports (see above) and, when they are `System`s in their own
+ * right, registered so the engine ticks them.
+ *
+ * Idempotent: a session already in the registry is returned untouched.
+ */
+export function installSession(
+  registry: SystemRegistry,
+  opts: InstallSessionOptions = {},
+): SessionSystem {
+  const existing = registry.tryGet('session');
+  if (existing) return existing as unknown as SessionSystem;
+
+  const { lobby, matchmaking, loadout, spawns, replay, ...sessionOpts } = opts;
+  const session = new SessionSystem(sessionOpts);
+  const subs = session.subsystems as unknown as Record<string, object | null>;
+  subs.lobby = (lobby as object) ?? null;
+  subs.matchmaking = (matchmaking as object) ?? null;
+  subs.loadout = (loadout as object) ?? null;
+  subs.spawns = (spawns as object) ?? null;
+  subs.replay = (replay as object) ?? null;
+
+  if (lobby && looksLikeSystem(lobby) && !registry.tryGet(lobby.name)) registry.add(lobby);
+
+  const ports: Partial<SessionPorts> = {};
+  const lobbyPort = lobbyPortFrom(lobby);
+  if (lobbyPort) ports.lobby = lobbyPort;
+  const mmPort = matchmakingPortFrom(matchmaking, { map: opts.map });
+  if (mmPort) ports.matchmaking = mmPort;
+  const loadoutPort = loadoutPortFrom(loadout);
+  if (loadoutPort) ports.loadout = loadoutPort;
+  if (Object.keys(ports).length) session.attach(ports);
+
+  registry.add(session);
+  return session;
+}
+
+/** Bridges `loadout/LoadoutBook` (or anything with `current()`) onto `LoadoutPort`. */
+export function loadoutPortFrom(src: unknown): LoadoutPort | null {
+  const already = asLoadoutPort(src);
+  if (already) return already;
+  const book = src as { current?: unknown } | undefined;
+  if (!book || !isFn(book.current)) return null;
+  const read = (): { name?: string; primary?: unknown; secondary?: unknown } | null => {
+    try { return (book.current as () => never)(); } catch { return null; }
+  };
+  return {
+    activeName: () => read()?.name ?? 'DEFAULT',
+    valid: () => {
+      const l = read();
+      return !!l && !!l.primary && !!l.secondary;
+    },
+  };
 }
 
 function asMapLoadPort(sys: unknown): MapLoadPort | null {

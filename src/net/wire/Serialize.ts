@@ -233,18 +233,68 @@ export function unormCodec(bits = 8): Codec<number> {
   return scalarCodec(0, 1, bits);
 }
 
-/** Angle in radians, wrapped to [−π, π). */
-export function angleCodec(bits: number = ANGLE_BITS_COARSE): Codec<number> {
+export interface AngleCodecOptions {
+  /**
+   * Width of the signed cheap tier, in quantisation steps. Defaults to
+   * `bits - 5`, which is ±1/64 turn (±5.6°) of change per snapshot whatever the
+   * precision — a 20 Hz client turning up to 112°/s stays in the cheap tier.
+   */
+  deltaBits?: number;
+}
+
+/**
+ * Angle in radians, wrapped to [−π, π).
+ *
+ * View angles are the field that changes on every player on every tick, so they
+ * get the same treatment as positions: against a baseline, send the *wrapped
+ * integer difference* in a narrow signed tier and escape to the absolute value
+ * only for flicks. Costs `bits - 4` for ordinary aiming and `bits + 1` for a
+ * flick, versus a flat `bits` before. The wrap is done in integer steps, so a
+ * turn across ±π costs the same as any other and cannot accumulate drift.
+ */
+export function angleCodec(
+  bits: number = ANGLE_BITS_COARSE,
+  options: AngleCodecOptions = {},
+): Codec<number> {
+  const steps = Math.pow(2, bits);
+  const half = steps / 2;
+  const deltaBits = Math.max(2, Math.min(options.deltaBits ?? bits - 5, bits - 1));
+  const dMin = -Math.pow(2, deltaBits - 1);
+  const dMax = Math.pow(2, deltaBits - 1) - 1;
+  /** Shortest signed step count from one quantised angle to another. */
+  const wrapSteps = (d: number): number => {
+    const x = ((d % steps) + steps) % steps;
+    return x >= half ? x - steps : x;
+  };
   return {
     kind: 'angle',
-    signature: `angle(${bits})`,
-    maxBits: bits,
+    signature: `angle(${bits},${deltaBits})`,
+    maxBits: bits + 1,
     errorBound: angleError(bits),
     snap: (v) => snapAngle(v, bits),
     equals: strictEquals,
     copy: identityCopy,
-    write: (w, v) => w.writeBits(quantizeAngle(v, bits), bits),
-    read: (r) => dequantizeAngle(r.readBits(bits), bits),
+    write: (w, v, base) => {
+      const q = quantizeAngle(v, bits);
+      if (base === undefined) {
+        w.writeBits(q, bits);
+        return;
+      }
+      const d = wrapSteps(q - quantizeAngle(base, bits));
+      if (d >= dMin && d <= dMax) {
+        w.writeBool(false);
+        w.writeInt(d, deltaBits);
+      } else {
+        w.writeBool(true);
+        w.writeBits(q, bits);
+      }
+    },
+    read: (r, base) => {
+      if (base === undefined) return dequantizeAngle(r.readBits(bits), bits);
+      if (r.readBool()) return dequantizeAngle(r.readBits(bits), bits);
+      const q = quantizeAngle(base, bits) + r.readInt(deltaBits);
+      return dequantizeAngle(((q % steps) + steps) % steps, bits);
+    },
   };
 }
 

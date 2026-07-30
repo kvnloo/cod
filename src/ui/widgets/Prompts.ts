@@ -177,30 +177,19 @@ export class Prompts implements Widget {
     }
 
     /* ------------------------------------------------------- reload ---- */
-    // Only the dry-magazine cue lives in the centre column, and it sits *above*
-    // the aperture rather than on it. The low-ammo warning has moved onto the
-    // ammunition readout itself, where the number it is talking about lives —
-    // it used to be painted across the middle of the sight picture during the
-    // exact seconds a player is most likely to be aiming.
-    const w = m.weapon;
-    if (w.ammo <= 0 && !w.reloading && m.alive) {
-      const pulse = 0.65 + 0.35 * Math.sin(this.t * 8.5) * motion();
-      const ry = aboveSightY(d, m, 40);
-      c.save();
-      c.globalAlpha = d.alpha;
-      if (!d.cheap) wash(c, cx, ry - 4 * s, 180 * s, 30 * s, 0.4);
-      text(c, 'RELOAD', cx, ry, {
-        size: 22 * s, weight: 700, family: 'cond', tracking: 7 * s, align: 'center',
-        color: rgba(lift(p.hostile, 0.72), 0.75 + 0.25 * pulse),
-        shadow: Math.max(1.4, 2 * s),
-        glow: 18 * s, glowColor: rgba(p.hostile, 0.85 * pulse),
-      });
-      text(c, '[ R ]', cx, ry + 16 * s, {
-        size: 11 * s, weight: 600, family: 'mono', tracking: 2 * s, align: 'center',
-        color: rgba(p.inkDim, 0.9),
-      });
-      c.restore();
-    }
+    // There is deliberately nothing here.
+    //
+    // A dry magazine used to print "RELOAD / [ R ]" in the centre column. Even
+    // pushed clear of the aperture by `aboveSightY` it still landed a third of
+    // the way up the frame, dead centre, on the one axis a player is looking
+    // down — and it said exactly what the ammunition readout was already
+    // saying two hundred pixels away in the corner, in red, flashing, next to
+    // a "0". Two prompts for one fact, one of them in the sight line.
+    //
+    // The corner tag is the whole cue now (see `AmmoPanel`). Nothing in this
+    // widget draws in the centre column except the interaction prompt, which
+    // is anchored below the aperture and only appears when the player is
+    // standing next to something they can use.
 
     /* ------------------------------------------------------- downed ---- */
     if (!m.alive) {

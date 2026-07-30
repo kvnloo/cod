@@ -17,7 +17,9 @@
  *      with player identity, score and simulation continuity intact
  */
 
-import './ts-loader.mjs';
+// net-ts-loader resolves extensionless relative imports onto .ts WITHOUT forcing
+// `format: 'module'` — forcing the format defeats node's native type stripping.
+import './net-ts-loader.mjs';
 
 const VERBOSE = process.argv.includes('--verbose');
 
@@ -25,6 +27,7 @@ const {
   PeerSession, SnapshotReader, ArenaSim, AuthorityCore, LoopbackNetwork,
   electHost, exportCheckpoint, verifyCheckpoint, importCheckpoint,
   DEFAULT_MIGRATION_POLICY, BTN, ENTITY_FLAG, ENT, fnv1a,
+  ENTITY_FIELDS, FIELD_SCALE,
 } = await import('../src/net/host/index.ts');
 const { Rand } = await import('../src/core/Rand.ts');
 
@@ -195,7 +198,7 @@ function makePeer(peerId, stableId, name, botSeed) {
   const transport = net.createPort(peerId);
   const reader = new SnapshotReader();
   const rand = new Rand(botSeed);
-  const seen = { welcomes: 0, migratedWelcomes: 0, events: 0, kills: 0, disconnects: [] };
+  const seen = { welcomes: 0, migratedWelcomes: 0, events: 0, kills: 0, hits: 0, disconnects: [] };
 
   const peer = { peerId, stableId, name, transport, reader, seen, alive: true, session: null };
 
@@ -214,7 +217,7 @@ function makePeer(peerId, stableId, name, botSeed) {
         reader.reset();
       },
       onSnapshot: (s) => { reader.apply(s); },
-      onEvent: (ev) => { seen.events++; if (ev.kind === 'kill') seen.kills++; },
+      onEvent: (ev) => { seen.events++; if (ev.kind === 'kill') seen.kills++; if (ev.kind === 'hit') seen.hits++; },
       onDisconnect: (r) => seen.disconnects.push(r),
     },
     input: (tick) => botCommand(peer, tick, rand),
@@ -396,7 +399,19 @@ if (finalHost) {
     `alice=${alice.seen.events} events, bob=${bob.seen.events} events`);
 
   const totalKills = [...core.state.players.values()].reduce((n, s) => n + s.kills, 0);
-  check('the match produced kills', totalKills > 0, `${totalKills} kills`);
+  const totalDeaths = [...core.state.players.values()].reduce((n, s) => n + s.deaths, 0);
+  const totalHits = peers.reduce((n, p) => n + p.seen.hits, 0);
+  // Damage, not kills. This used to assert `totalKills > 0`, which passed only
+  // because every player admitted on the same tick spawned on the *identical*
+  // point (AuthorityCore.createPlayerEntity re-seeded the RNG from the tick
+  // alone, so the salt was the same for everyone) — the whole lobby started
+  // stacked and shot each other point blank. That bug is fixed and proved in
+  // tools/net-sim.mjs section 1e; with real ring spawns these bots land
+  // 15-20 hits and 0-2 kills over 30 lossy seconds with two migrations, so a
+  // kill count is a coin flip and a damage count is the same claim measured
+  // where the scenario can actually reach it.
+  check('the match resolved authoritative damage over the wire', totalHits > 0,
+    `${totalHits} hit events observed by clients, ${totalKills} kills, ${totalDeaths} deaths`);
 }
 
 /* --------------------------- replication fidelity ------------------ */
@@ -423,31 +438,56 @@ section('4b. delta compression reconstructs authoritative state exactly');
   hs.hostMatch(4242);
   cs.joinMatch('h');
 
+  // Record what the host actually held at every tick, quantised exactly the way
+  // the writer transmits it. Comparing the client against the host's *current*
+  // state would be comparing two different ticks and could only ever be
+  // approximate; comparing against the host's state at the client's own tick is
+  // the real contract delta compression has to satisfy.
+  const hostHistory = new Map();
+  const quantiseEntities = (st) => {
+    if (!st || hostHistory.has(st.tick)) return;
+    const m = new Map();
+    for (const [id, e] of st.entities) {
+      m.set(id, ENTITY_FIELDS.map((f) => Math.round(e[f] * (FIELD_SCALE[f] ?? 1))));
+    }
+    hostHistory.set(st.tick, m);
+  };
+
   let ms = 0;
   for (let i = 0; i < 120 * 10; i++) {
     net2.advanceTo(ms);
     hs.update(DT, ms);
+    quantiseEntities(hs.host?.core?.state);
     cs.update(DT, ms);
     ms += DT_MS;
   }
   // Let the last packets land.
-  for (let i = 0; i < 60; i++) { net2.advanceTo(ms); hs.update(DT, ms); cs.update(DT, ms); ms += DT_MS; }
+  for (let i = 0; i < 60; i++) {
+    net2.advanceTo(ms);
+    hs.update(DT, ms);
+    quantiseEntities(hs.host?.core?.state);
+    cs.update(DT, ms);
+    ms += DT_MS;
+  }
 
   const hostState = hs.host.core.state;
   const clientTick = c.reader.tick;
   const behind = hostState.tick - clientTick;
+  const ref = hostHistory.get(clientTick);
 
-  let maxErr = 0, compared = 0;
-  const hostAtClientTick = new Map();
-  for (const [id, e] of hostState.entities) hostAtClientTick.set(id, e);
+  let fieldsCompared = 0;
+  const mismatches = [];
+  let compared = 0;
   for (const [id, ce] of c.reader.entities) {
-    const he = hostAtClientTick.get(id);
-    if (!he) continue;
     compared++;
-    maxErr = Math.max(maxErr,
-      Math.abs(he.health - ce.health),
-      Math.abs(he.team - ce.team),
-      Math.abs(he.owner - ce.owner));
+    const rv = ref?.get(id);
+    if (!rv) { mismatches.push(`entity ${id} did not exist on the host at tick ${clientTick}`); continue; }
+    for (let fi = 0; fi < ENTITY_FIELDS.length; fi++) {
+      const f = ENTITY_FIELDS[fi];
+      const got = Math.round(ce[f] * (FIELD_SCALE[f] ?? 1));
+      fieldsCompared++;
+      if (got !== rv[fi]) mismatches.push(`e${id}.${f}: client ${got} != host ${rv[fi]}`);
+    }
   }
 
   check('client reconstructed every replicated entity', compared === hostState.entities.size && compared > 0,
@@ -457,7 +497,11 @@ section('4b. delta compression reconstructs authoritative state exactly');
     `applied=${c.reader.applied} droppedNoBaseline=${c.reader.droppedNoBaseline}`);
   check('client is at most a few ticks behind the host', behind >= 0 && behind < 20,
     `host tick=${hostState.tick} client tick=${clientTick} behind=${behind}`);
-  check('discrete fields match exactly', maxErr === 0, `maxAbsErr=${maxErr}`);
+  check('every replicated field reconstructs bit-exactly at the client tick',
+    !!ref && mismatches.length === 0 && fieldsCompared > 0,
+    mismatches.length
+      ? `${mismatches.length}/${fieldsCompared} fields wrong: ${mismatches.slice(0, 3).join('; ')}`
+      : `${fieldsCompared} fields exact at tick ${clientTick}`);
 
   const bytes = c.transport.bytesReceived;
   const seconds = ms / 1000;

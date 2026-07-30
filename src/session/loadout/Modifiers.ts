@@ -53,8 +53,10 @@ export interface StatFold {
   factor: number;
   /** Total of the additive modifiers. */
   addend: number;
-  /** True when a rail changed the result. */
+  /** True when a rail changed the result. Rounding alone does *not* set this. */
   capped: boolean;
+  /** True when an integer stat was rounded off a fractional value. */
+  rounded: boolean;
   contributions: Contribution[];
 }
 
@@ -153,15 +155,27 @@ export class ModifierStack {
     }
 
     /* --- 4. rails ------------------------------------------------------- */
+    // Clamping and rounding are different events and are reported separately.
+    // A magazine that folds to 22.5 rounds to 23 — that is arithmetic, not the
+    // safety net engaging, and conflating the two made the balance tools read
+    // every odd magazine multiplier as a rail hit.
+    const { lo, hi } = railBounds(base, rule);
     const raw = value;
-    value = clampToRule(value, base, rule);
+    let out = value < lo ? lo : value > hi ? hi : value;
+    let capped = Math.abs(out - raw) > Math.max(EPS, Math.abs(raw) * 1e-9);
+    let rounded = false;
     if (rule.integer) {
-      value = Math.round(value);
-      value = clampToRule(value, base, rule);
+      const whole = Math.round(out);
+      rounded = Math.abs(whole - out) > EPS;
+      // Rounding can step over a fractional rail; walk back inside it, and that
+      // *is* a cap.
+      if (whole > hi) { out = Math.floor(hi); capped = true; }
+      else if (whole < lo) { out = Math.ceil(lo); capped = true; }
+      else out = whole;
     }
-    const capped = Math.abs(value - raw) > Math.max(EPS, Math.abs(raw) * 1e-9);
+    value = out;
 
-    return { stat, base, value, factor, addend, capped, contributions };
+    return { stat, base, value, factor, addend, capped, rounded, contributions };
   }
 
   /** Convenience: fold and return only the number. */
@@ -170,18 +184,30 @@ export class ModifierStack {
   }
 }
 
+/**
+ * The concrete rails for one base value: the relative pair intersected with the
+ * absolute pair. A weapon whose base already sits on an absolute rail keeps a
+ * usable window rather than collapsing to a point.
+ */
+export function railBounds(base: number, rule: StatRule): { lo: number; hi: number } {
+  let lo = base > 0 ? base * rule.minMul : -Infinity;
+  let hi = base > 0 ? base * rule.maxMul : Infinity;
+  // An absolute rail never moves a weapon past its own base value. The
+  // bolt-action and the launcher ship `spread.ads === 0` — a designer saying
+  // "this gun does not miss when aimed" — and a 0.005° floor must not invent
+  // spread for them, nor report a clamp on every build they can make. A weapon
+  // that ships outside a rail is grandfathered at its base; attachments still
+  // cannot push it further out.
+  if (rule.min !== undefined) lo = Math.max(lo, Math.min(rule.min, base));
+  if (rule.max !== undefined) hi = Math.min(hi, Math.max(rule.max, base));
+  if (hi < lo) hi = lo;
+  return { lo, hi };
+}
+
 /** Applies the relative rails, then the absolute ones. */
 export function clampToRule(value: number, base: number, rule: StatRule): number {
-  let v = value;
-  if (base > 0) {
-    const lo = base * rule.minMul;
-    const hi = base * rule.maxMul;
-    if (v < lo) v = lo;
-    if (v > hi) v = hi;
-  }
-  if (rule.min !== undefined && v < rule.min) v = rule.min;
-  if (rule.max !== undefined && v > rule.max) v = rule.max;
-  return v;
+  const { lo, hi } = railBounds(base, rule);
+  return value < lo ? lo : value > hi ? hi : value;
 }
 
 /**
@@ -189,10 +215,5 @@ export function clampToRule(value: number, base: number, rule: StatRule): number
  * verification tool and by any UI that wants to draw a bar with real endpoints.
  */
 export function railsFor(stat: StatKey, base: number): { lo: number; hi: number } {
-  const rule = STAT_RULES[stat];
-  let lo = base > 0 ? base * rule.minMul : -Infinity;
-  let hi = base > 0 ? base * rule.maxMul : Infinity;
-  if (rule.min !== undefined) lo = Math.max(lo, rule.min);
-  if (rule.max !== undefined) hi = Math.min(hi, rule.max);
-  return { lo, hi };
+  return railBounds(base, STAT_RULES[stat]);
 }

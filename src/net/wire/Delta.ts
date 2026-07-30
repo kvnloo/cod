@@ -88,6 +88,21 @@ export interface DeltaEncoderOptions {
   /** How many past snapshots to retain as candidate baselines. Default 64. */
   historyTicks?: number;
   registry?: SchemaRegistry;
+  /**
+   * How long to keep betting on an unacknowledged baseline before giving up and
+   * sending a fresh one, in ticks. Default 8.
+   *
+   * A joining client cannot ack anything for a full round trip. Sending a full
+   * world every tick until that ack lands costs a baseline per tick of RTT —
+   * with twelve clients joining at match start that is a multi-megabit spike on
+   * a peer host's uplink, exactly when it can least afford one. Instead, after
+   * the first baseline goes out we assume it arrived and delta against it. If
+   * the bet is wrong, the client cannot decode those deltas, so it never acks,
+   * and after this many ticks we send another baseline. The wrong bet costs a
+   * few small undecodable packets; the right bet — the overwhelmingly common
+   * case — saves a full world per tick of RTT.
+   */
+  baselineRetryTicks?: number;
 }
 
 export interface EncodeOptions {
@@ -122,12 +137,30 @@ export class DeltaEncoder {
   private readonly history = new Map<number, StoredSnapshot>();
   private readonly historyTicks: number;
   private readonly registry: SchemaRegistry;
+  private readonly baselineRetryTicks: number;
   private acked = -1;
   private lastTick = -1;
+  private pendingBaseline = -1;
 
   constructor(options: DeltaEncoderOptions = {}) {
     this.historyTicks = Math.max(2, options.historyTicks ?? 64);
     this.registry = options.registry ?? schemaRegistry;
+    // 0 disables the bet entirely: every tick re-sends a full world until the
+    // client acks. Costly, but it is the only mode where a joining client can
+    // never be handed a delta it cannot decode.
+    this.baselineRetryTicks = Math.max(
+      0,
+      Math.min(options.baselineRetryTicks ?? 8, this.historyTicks),
+    );
+  }
+
+  /**
+   * The last baseline we sent that the client has not confirmed, or -1. Deltas
+   * are currently being bet against it; a transport that can deliver the
+   * baseline reliably should ack it instead of leaving this pending.
+   */
+  get pendingBaselineTick(): number {
+    return this.pendingBaseline;
   }
 
   /** Newest tick this client has confirmed. -1 until the first ack. */
@@ -167,6 +200,7 @@ export class DeltaEncoder {
     this.history.clear();
     this.acked = -1;
     this.lastTick = -1;
+    this.pendingBaseline = -1;
   }
 
   /**
@@ -287,6 +321,7 @@ export class DeltaEncoder {
 
     this.history.set(tick, next);
     this.lastTick = tick;
+    if (isBaseline) this.pendingBaseline = tick;
     this.trimHistory(tick);
 
     result.bits = w.bitLength - startBits;
@@ -295,16 +330,32 @@ export class DeltaEncoder {
   }
 
   private usableBaselineTick(tick: number): number {
-    if (this.acked < 0) return -1;
-    if (tick - this.acked > this.historyTicks) return -1;
-    return this.history.has(this.acked) ? this.acked : -1;
+    // A confirmed baseline is always the right answer: the client provably has
+    // it, so a delta against it is guaranteed decodable.
+    if (
+      this.acked >= 0 &&
+      tick - this.acked <= this.historyTicks &&
+      this.history.has(this.acked)
+    ) {
+      return this.acked;
+    }
+    // Nothing confirmed. Bet on the last baseline we sent, for as long as its
+    // ack could still plausibly be in flight. See baselineRetryTicks.
+    if (
+      this.pendingBaseline > this.acked &&
+      tick - this.pendingBaseline <= this.baselineRetryTicks &&
+      this.history.has(this.pendingBaseline)
+    ) {
+      return this.pendingBaseline;
+    }
+    return -1;
   }
 
   private trimHistory(tick: number): void {
     if (this.history.size <= this.historyTicks) return;
     const cutoff = tick - this.historyTicks;
     for (const t of this.history.keys()) {
-      if (t < cutoff && t !== this.acked) this.history.delete(t);
+      if (t < cutoff && t !== this.acked && t !== this.pendingBaseline) this.history.delete(t);
     }
   }
 }

@@ -406,24 +406,32 @@ float boCascadeSample( const in int c, const in vec3 wp, const in float NdotL, c
 
 	float tanSun = boCsmInfo.y;
 
-	// The widest penumbra this cascade may produce, in metres. Tied to the
-	// cascade's own texel so cascade 0 stays contact-sharp and the far cascade
-	// stays cheap, with an absolute ceiling so a distant roof edge cannot smear
-	// into a featureless gradient.
-	float maxFilterM = clamp( texelW * 8.0, 0.10, 0.80 );
+	// The widest penumbra this cascade may produce, in metres.
+	//
+	// This used to be clamp( texelW * 8, 0.10, 0.80 ) — a floor of ten centimetres
+	// and a ceiling of eighty. The sun's penumbra only reaches ten centimetres
+	// once the occluder is ten metres away from what it is shading, so that floor
+	// was applied to *every* shadow in the level: a kerb, a bench leg, a lamppost
+	// and a crate all got blurred by a disc wider than the shadow itself and came
+	// back as a 40% grey wash with no edge. Rendering the same frame with a
+	// single-texel filter brought back the lamppost stripe, the kerb line and
+	// every crate shadow immediately, which is what proved this was the culprit
+	// rather than missing casters or a bad frustum fit.
+	//
+	// The ceiling now tracks the cascade's own texel (so a far cascade still gets
+	// a cheap, blur-limited filter) but the *floor* is sub-texel, so contact
+	// shadows stay as sharp as the map allows.
+	float maxFilterM = clamp( texelW * 5.0, 0.03, 0.30 );
 
 	// ---- blocker search (PCSS step 1)
 	//
-	// This radius is the single most important number in the filter. An 8-tap
-	// search only finds an occluder whose shadow is a decent fraction of the
-	// search disc wide, so a metre-scale radius is statistically blind to poles,
-	// railings, benches and crates: every one of them reports "no blocker" and
-	// the surface comes back fully lit. Deriving it from the cascade's depth
-	// range (which includes the 60 m light pull-back) made it 1.5-2.5 m, which
-	// is why nothing under two metres across cast a shadow anywhere in the level.
-	// It is now the projected light size over a plausible blocker distance,
-	// clamped to a few texels either side.
-	float searchM = max( texelW * 1.25, min( tanSun * 6.0, min( maxFilterM, 0.35 ) ) );
+	// An 8-tap search only finds an occluder whose shadow covers a decent
+	// fraction of the search disc, so a metre-scale radius is statistically
+	// blind to poles, railings, benches and crates — every one of them reports
+	// "no blocker" and the surface comes back fully lit. A couple of texels is
+	// both the smallest useful radius and the largest one that still resolves
+	// prop-sized casters, so the radius simply tracks the cascade's texel.
+	float searchM = clamp( texelW * 2.0, 0.02, 0.22 );
 	float searchUV = searchM * uvPerMetre;
 	float blockerSum = 0.0;
 	float blockerCount = 0.0;
@@ -437,8 +445,11 @@ float boCascadeSample( const in int c, const in vec3 wp, const in float NdotL, c
 	float blocker = blockerSum / blockerCount;
 
 	// ---- variable penumbra (PCSS step 2)
+	// Penumbra width = occluder-to-receiver distance x the sun's angular size.
+	// Nothing else. No floor beyond half a texel, because a floor here is exactly
+	// what erased every small shadow in the level.
 	float penumbraM = max( ( uvd.z - blocker ) * zRange, 0.0 ) * tanSun;
-	float filterM = max( texelW * 0.8, min( max( penumbraM, texelW * 0.8 ), maxFilterM ) );
+	float filterM = clamp( penumbraM, texelW * 0.55, maxFilterM );
 	float filterUV = filterM * uvPerMetre;
 
 	// ---- filtered comparison (PCSS step 3)

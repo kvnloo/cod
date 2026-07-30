@@ -55,6 +55,9 @@ async function bundle() {
     `export { Rand } from '${abs('src/core/Rand.ts')}';`,
     `export { WEAPONS } from '${abs('src/weapons/Catalog.ts')}';`,
     `export { ATTACHMENTS } from '${abs('src/weapons/Attachments.ts')}';`,
+    // The game's own deterministic state-machine test — proves `Match` and
+    // `Scoring` still drive the rewritten `Progression` end to end.
+    `export { runSelfTest } from '${abs('src/game/SelfTest.ts')}';`,
   ].join('\n'), 'utf8');
 
   const build = await rolldown({ input: entry, logLevel: 'silent' });
@@ -85,11 +88,12 @@ function playMatch(M, prog, rng, opts) {
   let deathsLeft = opts.deaths;
   let lastEnemy = -1;
   let t = 0;
+  /** Kills still queued to land inside the multi-kill window. */
+  let chain = 0;
 
   while (killsLeft > 0 || deathsLeft > 0) {
     // Interleave kills and deaths so streaks and revenge behave realistically.
     const killNow = killsLeft > 0 && (deathsLeft === 0 || rng.next() < opts.killBias);
-    t += rng.range(2, 9);
 
     if (killNow) {
       killsLeft--;
@@ -140,12 +144,35 @@ function playMatch(M, prog, rng, opts) {
       port.emit('player:killed', { by: 'hostile', distance: 12, headshot: false });
       scoring.playerDeath();
     }
-    scoring.fixedUpdate(3.0); // long enough to close the multikill window
+    // Gap to the next event. Some kills land inside the 2.4 s multi-kill window
+    // — that is where double kills, the Crimson camo and the mastery ladder
+    // come from, so the sim has to produce them.
+    let gap;
+    if (killNow && chain > 0) { chain--; gap = rng.range(0.35, 1.0); }
+    else if (killNow && killsLeft > 0 && rng.bool(0.22)) { chain = 1 + rng.int(0, 1); gap = rng.range(0.35, 1.0); }
+    else { chain = 0; gap = rng.range(2, 9); }
+    t += gap;
+    scoring.fixedUpdate(gap);
   }
 
   for (let o = 0; o < opts.objectives; o++) {
+    // Capture ticks first: the player stands on the point and it fills. Half of
+    // them are captured by a team-mate (contested === false) and must pay the
+    // player nothing.
+    // Two points in three are taken by the player, the third by a team-mate.
+    const mine = o % 3 !== 2;
+    for (let s = 1; s <= 5; s++) {
+      port.emit('objective:update', {
+        id: `obj${o}`, kind: 'capture', state: 'active', label: 'SECURE',
+        hint: 'Hold the point', progress: s / 5, timer: -1,
+        position: [origin.x, 0, origin.z], radius: 6, contested: mine,
+      });
+    }
     port.emit('objective:complete', { id: `obj${o}`, label: 'SECURE', score: 250 });
     prog.award(M.XP.objectiveComplete, 'Objectives');
+  }
+  for (let w = 0; w < opts.waves; w++) {
+    port.emit('wave:cleared', { index: w, bonus: 250, nextIn: 8 });
   }
   for (let k = 0; k < opts.killstreaks; k++) {
     port.emit('killstreak:activated', { id: 'uav', name: 'UAV', position: origin });
@@ -423,7 +450,15 @@ async function run(M) {
       fresh.grantExtra('sr_longbow');
       return fresh.canEquip('sr_longbow');
     })());
-    check('unknown content is not gated by progression', fresh.isUnlocked('equip_frag_2026'));
+    // `isUnlocked` is consumed by src/session/loadout's validator, where a
+    // `true` means "explicitly granted — bypass the rank gate". Content
+    // progression has never heard of must therefore answer *false*, so the
+    // caller's own gate stays authoritative rather than being short-circuited.
+    check('unknown content is not claimed as granted', !fresh.isUnlocked('equip_frag_2026'));
+    check('unknown content becomes granted when it is actually granted', (() => {
+      fresh.grantExtra('equip_frag_2026');
+      return fresh.isUnlocked('equip_frag_2026');
+    })());
     check('legacy menu ids still resolve', fresh.isUnlocked('ar_vector') && !fresh.isUnlocked('sr_apex'));
     const q = prog.unlockQuery();
     say(`  rank ${q.rank} · ${M.unlockedWeapons(q).length}/${M.WEAPON_TRACKS.length} weapons owned · ` +
@@ -461,6 +496,8 @@ async function run(M) {
       w.camos.join(','));
     check('platinum requires gold on the whole class',
       !w.camos.includes('platinum') || w.camos.includes('gold'));
+    check('the mastery ladder is actually reachable in 50 matches',
+      w.camos.includes('gold'), `${PRIMARY}: ${w.camos.join(',')}`);
     check('re-evaluating is idempotent (no double award)',
       (() => {
         const before = JSON.stringify(prog.profile.challenges);
@@ -568,6 +605,19 @@ async function run(M) {
       r.weapons.reduce((a, w) => a + w.kills, 0) <= r.kills);
     check('favourite weapon is the most-used one',
       r.favouriteWeapon === r.weapons[0].id);
+
+    // The one call the meta screens make.
+    const v = prog.view();
+    say('');
+    say(`  lobby card: ${v.rankName} (${v.rank})  ${bar(v.pct, 20)}  ` +
+      `${fmt(v.intoRank)}/${fmt(v.forNext)}   next: ${v.nextUnlock?.name ?? '—'} ` +
+      `in ${fmt(v.xpToNextUnlock)} XP`);
+    check('the view exposes a rank bar the UI can render directly',
+      v.pct >= 0 && v.pct <= 1 && v.intoRank <= v.forNext);
+    check('the view names the next unlock and its XP cost',
+      !!v.nextUnlock && v.xpToNextUnlock > 0);
+    check('the view carries active challenges and recent matches',
+      v.challenges.length > 0 && v.history.length > 0 && v.challenges.every((c) => !c.done));
   }
 
   /* ------------------------------------------ 9. save / reload round trip -- */
@@ -677,6 +727,54 @@ async function run(M) {
     });
     const r = p.afterAction();
     check('double XP doubles match XP', r.xp.total >= r.xp.base * 2, `${r.xp.total} vs base ${r.xp.base}`);
+  }
+
+  /* ---------------------------------- 12b. objective and wave XP wiring -- */
+  say('\n── OBJECTIVE & WAVE XP ────────────────────────────────────────────────');
+  {
+    const p = makeProgression(M, M.memoryStorage());
+    p.load();
+    const OBJECTIVES = 4, WAVES = 3;
+    const { report } = playMatch(M, p, new M.Rand(4242), {
+      mode: 'firefight', modeName: 'Firefight', seed: 4242, weapon: 'ar_vkr7',
+      kills: 12, deaths: 4, killBias: 0.7, headshotRate: 0.2, adsRate: 0.8,
+      longRange: false, objectives: OBJECTIVES, waves: WAVES, killstreaks: 0, win: true,
+    });
+    const row = (label) => report.xp.rows.find((r) => r.label === label);
+    // Exactly how many points the player personally stood on.
+    const mine = new Set(p.__port.events
+      .filter((e) => e.key === 'objective:update' && e.payload.contested)
+      .map((e) => e.payload.id)).size;
+    const expectCapture = mine * 10 * M.XP.objectiveTick;
+
+    say(`  ${WAVES} waves cleared, ${OBJECTIVES} objectives (${mine} captured by the player)`);
+    for (const r of report.xp.rows) {
+      say(`    ${r.label.padEnd(22)} ${String(r.count).padStart(4)} ×    ${('+' + fmt(r.xp)).padStart(9)}`);
+    }
+
+    check('clearing a Firefight wave pays XP',
+      (row('Waves Cleared')?.xp ?? 0) === WAVES * M.XP.waveCleared,
+      `${row('Waves Cleared')?.xp ?? 0} for ${WAVES} waves`);
+    check('capture ticks pay only for points the player stood on',
+      (row('Captures')?.xp ?? 0) === expectCapture,
+      `${row('Captures')?.xp ?? 0} vs ${expectCapture}`);
+    check('a teammate capping alone pays the player nothing', mine < OBJECTIVES,
+      `${OBJECTIVES - mine} capped by team-mates`);
+    check('objective XP is its own after-action category',
+      report.xp.byCategory.some((c) => c.category === 'objective'));
+    check('wave XP reaches the profile', p.xp === report.xp.total);
+  }
+
+  /* --------------------------------------------- 13. game-layer integration */
+  say('\n── GAME INTEGRATION ───────────────────────────────────────────────────');
+  {
+    const r = M.runSelfTest();
+    const failed = r.cases.filter((c) => !c.pass);
+    say(`  game self-test: ${r.cases.length - failed.length}/${r.cases.length} cases in ${r.ms.toFixed(1)} ms`);
+    say(`  phases: ${[...new Set(r.transitions)].join(' → ')}`);
+    for (const c of failed) say(`    FAIL ${c.name} — ${c.detail}`);
+    check('Match + Scoring still drive Progression end to end', r.pass,
+      `${r.cases.length - failed.length}/${r.cases.length} self-test cases`);
   }
 
   /* ------------------------------------------------------------- results -- */

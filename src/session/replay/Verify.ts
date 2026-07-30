@@ -143,6 +143,11 @@ export function recordProbeMatch(opts: VerifyOptions): LiveRun {
   const frames: InputFrame[] = [];
   const t0 = now();
   for (let t = 0; t < ticks; t++) {
+    // Keyframe first: a keyframe stamped tick N is the state at the *start* of
+    // tick N, before any of tick N's input has been applied. Capturing after
+    // the step would put the blob and the input stream one tick out of phase,
+    // which is the classic way a replay drifts.
+    recorder.beforeStep(sim);
     const n = script.frames(t, frames);
     // Snap to the wire representation before anything consumes it.
     for (let i = 0; i < n; i++) {
@@ -326,9 +331,14 @@ export function runVerification(opts: VerifyOptions = defaultVerifyOptions()): V
       if (report.killcam.finalAimErrorDeg > 35) {
         failures.push(`killcam final frame is ${report.killcam.finalAimErrorDeg.toFixed(1)}° off the victim`);
       }
-      // A jump larger than a few metres in one 60 Hz frame is a camera cut, and
-      // there should not be one after the initial placement.
-      if (maxStep > 3) failures.push(`killcam camera jumped ${maxStep.toFixed(2)} m in one frame`);
+      // After the initial placement (which is a deliberate hard cut) the camera
+      // must stay continuous. The subject sprints at ~7 m/s and the pull-back
+      // adds ~6, so anything past 0.6 m in a 60 Hz frame — 36 m/s — is not the
+      // camera following a man, it is the camera teleporting.
+      if (maxStep > 0.6) {
+        failures.push(`killcam camera jumped ${maxStep.toFixed(2)} m in one frame `
+          + `(${(maxStep * 60).toFixed(0)} m/s) — that is a cut, not a follow`);
+      }
     }
   }
 

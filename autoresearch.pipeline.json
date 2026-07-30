@@ -8,7 +8,7 @@
   "resourceIsolation": {
     "mode": "remote-safe",
     "pauseCommands": ["claude", "codex", "grok", "hermes", "zen-bin", "bun"],
-    "desktopPauseCommands": ["Hyprland", "Xwayland", "sunshine", "waybar", "kitty", "zsh", "bash", "Web Content", "Isolated Web Co", "Socket Process"],
+    "desktopPauseCommands": ["Hyprland", "Xwayland", "sunshine", "waybar", "qs", "noctalia-shell", "kitty", "zsh", "bash", "Web Content", "Isolated Web Co", "Socket Process"],
     "exclusiveSignalPauseCommands": ["python3", "python", "node"],
     "maxCpuUtilization": 20,
     "maxGpuUtilization": 20,

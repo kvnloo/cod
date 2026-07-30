@@ -201,6 +201,15 @@ export class Session {
     return this.page.evaluate(() => (globalThis).__BLACKOUT__.listShots());
   }
 
+  /** Full definition of a registered shot, with `setup` stringified if present. */
+  shotInfo(name) {
+    return this.page.evaluate((n) => {
+      const info = (globalThis).__BLACKOUT__.shotInfo(n);
+      if (!info) return null;
+      return { ...info, setupSource: typeof info.setup === 'function' ? String(info.setup) : null };
+    }, name);
+  }
+
   /** Positions the world/camera for a named shot and settles temporal effects. */
   async setShot(name, opts = {}) {
     await this.page.evaluate(

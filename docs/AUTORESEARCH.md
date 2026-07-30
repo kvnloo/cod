@@ -22,6 +22,11 @@ Each loop gets its own Git branch and worktree. A proposal agent makes one uncom
 - Proposal agents run in a Bubblewrap sandbox backed by a disposable clone and private PID namespace. The real repository and shared Git metadata are read-only; detached descendants die with the namespace, and only independently enumerated, non-ignored, allowlisted regular files are copied back.
 - The proposal importer rejects symlinks, commits/staging, protected files, repository-policy files, ignored source injection, and newly introduced capture/debug/URL/environment-conditioned code.
 - Evaluators reject inherited `BLACKOUT_URL` values and refuse to reuse an unowned server already listening on their assigned port.
+- Baseline and loop commands enter a fail-closed, remote-safe resource-isolation window before measuring. Competing same-user AI agents, browsers, development servers, and scripting runtimes are suspended while the active pipeline ancestry, desktop compositor, and Sunshine stream remain alive.
+- The machine must then remain below the configured CPU and GPU thresholds for three consecutive samples. If it cannot become quiet within the configured timeout, no benchmark runs and no KEEP/REVERT decision is made.
+- Suspended processes are resumed on success, error, SIGINT, SIGTERM, or SIGHUP. A private recovery journal resumes matching PIDs after an interrupted prior invocation without risking PID reuse.
+- Every isolation window records thresholds, timestamps, quiet samples, and sanitized paused PID/command evidence under `.git/autoresearch-state/resource-evidence/`.
+- A separate watchdog samples process CPU and NVIDIA per-process GPU activity throughout every measurement. Activity from outside the evaluator cgroup or frozen workload cgroups invalidates the measurement before the evaluator can return an accepted score.
 - Runs, captures, generated configs, and the Python environment are ignored by Git.
 
 ## Commands
@@ -30,12 +35,28 @@ Each loop gets its own Git branch and worktree. A proposal agent makes one uncom
 npm run autoresearch -- bootstrap       # install the pinned Python harness
 npm run autoresearch -- status          # inspect branches, worktrees, baselines
 npm run autoresearch -- setup all       # create isolated loop worktrees
+npm run autoresearch -- isolation-check performance
 npm run autoresearch -- baseline all    # measure frozen baselines
 npm run autoresearch -- run performance
 npm run autoresearch -- run cinematic
 ```
 
 Run `setup` only from a clean committed `feat/autoresearch-pipeline` branch so each child worktree contains this pipeline. `run all` executes loops serially by default because concurrent GPU benchmarks contaminate one another.
+
+## Resource isolation
+
+`baseline` and `run` use the `resourceIsolation` policy in `autoresearch.pipeline.json`. The default `remote-safe` policy suspends configured competing user processes for the complete baseline or loop window, waits for CPU and GPU quiescence, and fails closed rather than accepting contaminated measurements. It never kills those processes and does not suspend the desktop, display server, audio stack, terminal, or Sunshine, so an active remote session survives.
+
+This is strong interactive-workstation isolation, not literal exclusive ownership of the GPU: the compositor and remote encoder still exist. A truly exclusive GPU run requires a separate headless/TTY operating mode that stops the graphical session; that mode is intentionally not automatic because it disconnects the desktop and can strand an unattended session.
+
+If the remote-safe check cannot reach the GPU threshold, explicitly enable the pause-all desktop toggle for the benchmark window:
+
+```bash
+AR_BENCHMARK_EXCLUSIVE=1 npm run autoresearch -- baseline performance
+AR_BENCHMARK_EXCLUSIVE=1 npm run autoresearch -- run performance
+```
+
+This additionally freezes Hyprland, Sunshine, shell UI, and related graphical cgroups. The remote display will disconnect or freeze only during each baseline or evaluator measurement—not while the proposal agent thinks—then reconnect after the cgroups are thawed. The pipeline never enables this mode implicitly.
 
 ## Agent and visual-judge overrides
 

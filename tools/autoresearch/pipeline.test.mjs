@@ -11,6 +11,20 @@ import {
 const manifest = {
   version: 1,
   worktreeRoot: 'worktree/autoresearch',
+  resourceIsolation: {
+    mode: 'remote-safe',
+    pauseCommands: ['claude', 'codex'],
+    desktopPauseCommands: ['Hyprland', 'sunshine'],
+    maxCpuUtilization: 20,
+    maxGpuUtilization: 20,
+    quietSamples: 3,
+    sampleIntervalMs: 1000,
+    maxWaitSeconds: 60,
+    monitor: true,
+    monitorIntervalMs: 500,
+    maxExternalCpuPercent: 20,
+    maxExternalGpuPercent: 5,
+  },
   loops: {
     performance: {
       branch: 'autoresearch/performance',
@@ -57,6 +71,10 @@ test('validates the required independent performance and cinematic loops', () =>
   const duplicate = structuredClone(manifest);
   duplicate.loops.cinematic.branch = duplicate.loops.performance.branch;
   assert.throws(() => validatePipelineManifest(duplicate), /unique branch/);
+
+  const unsafeIsolation = structuredClone(manifest);
+  unsafeIsolation.resourceIsolation.maxGpuUtilization = 101;
+  assert.throws(() => validatePipelineManifest(unsafeIsolation), /within 0\.\.100/);
 });
 
 test('builds a harness config scoped to one clean experiment worktree', () => {

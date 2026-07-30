@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { scoreCinematicEvaluation, scorePerformanceEvaluation } from './pipeline-lib.mjs';
+import { enterResourceIsolation } from './resource-isolation.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(process.env.AR_REPO_PATH || path.resolve(HERE, '../..'));
@@ -125,6 +126,8 @@ async function evaluatePerformance() {
   assertExpectedShots(rows, 'performance');
   const targetRows = rows.filter((row) => row.preset === loop.preset);
   const guardRows = rows.filter((row) => row.preset === loop.guardPreset);
+  assertExpectedShots(targetRows, `${loop.preset} performance`);
+  assertExpectedShots(guardRows, `${loop.guardPreset} performance`);
   const target = scorePerformanceEvaluation(targetRows, loop.evaluator);
   const guard = relaxedPerformanceScore(guardRows);
   return { target, guard, integrity: { shots: shotIntegrity(rows) }, artifacts: { perf: 'shots/perf.json' } };
@@ -154,6 +157,8 @@ async function evaluateCinematic() {
   }
   const targetRows = rows.filter((row) => row.preset === loop.preset);
   const guardRows = rows.filter((row) => row.preset === loop.guardPreset);
+  assertExpectedShots(targetRows, `${loop.preset} performance`);
+  assertExpectedShots(guardRows, `${loop.guardPreset} performance`);
   const targetPerf = relaxedPerformanceScore(targetRows);
   const guard = relaxedPerformanceScore(guardRows);
   const target = scoreCinematicEvaluation({
@@ -175,6 +180,24 @@ async function evaluateCinematic() {
   };
 }
 
+async function measuredEvaluation() {
+  const evaluate = () => (loop.evaluator.kind === 'cinematic' ? evaluateCinematic() : evaluatePerformance());
+  const isolation = structuredClone(manifest.resourceIsolation);
+  if (process.env.AR_BENCHMARK_EXCLUSIVE === '1') {
+    isolation.mode = 'desktop-exclusive';
+    isolation.pauseCommands = [...new Set([...isolation.pauseCommands, ...isolation.desktopPauseCommands])];
+  }
+  const release = await enterResourceIsolation(isolation, {
+    statePath: path.join(gitCommonDir, 'autoresearch-state', 'resource-isolation.json'),
+    auditPath: path.join(gitCommonDir, 'autoresearch-state', 'resource-evidence', `${Date.now()}-${loopId}-trial-${trial}.json`),
+  });
+  try {
+    return await evaluate();
+  } finally {
+    await release();
+  }
+}
+
 async function main() {
   if (expectedBranch !== loop.branch) throw new Error(`evaluator is on ${expectedBranch}, expected ${loop.branch}`);
   if (gitValue('rev-parse', 'HEAD') !== expectedHead) throw new Error('HEAD changed before evaluation');
@@ -182,9 +205,7 @@ async function main() {
   const proposedTree = await repositoryFingerprint();
   run('npm', ['run', 'typecheck']);
   run('npm', ['run', 'build', '--', '--outDir', dist]);
-  const evaluation = loop.evaluator.kind === 'cinematic'
-    ? await evaluateCinematic()
-    : await evaluatePerformance();
+  const evaluation = await measuredEvaluation();
   // The upstream harness checks its allowlist before evaluation and later uses
   // git add -A. Re-check here so evaluator/judge side effects cannot bypass it.
   assertChangedPathsAllowed();

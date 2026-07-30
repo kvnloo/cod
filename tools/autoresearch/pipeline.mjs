@@ -155,6 +155,13 @@ async function runLoop(loop) {
       GIT_CONFIG_COUNT: '1',
       GIT_CONFIG_KEY_0: 'core.hooksPath',
       GIT_CONFIG_VALUE_0: '/dev/null',
+      // The harness creates accepted-trial commits while global Git config is
+      // intentionally disabled. Give those commits a deterministic local bot
+      // identity without mutating the repository or the user's configuration.
+      GIT_AUTHOR_NAME: process.env.AR_GIT_NAME || 'Hermes Autoresearch',
+      GIT_AUTHOR_EMAIL: process.env.AR_GIT_EMAIL || 'autoresearch@local',
+      GIT_COMMITTER_NAME: process.env.AR_GIT_NAME || 'Hermes Autoresearch',
+      GIT_COMMITTER_EMAIL: process.env.AR_GIT_EMAIL || 'autoresearch@local',
     },
   });
 }

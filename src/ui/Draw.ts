@@ -41,6 +41,14 @@ const FAMILY: Record<FontFamily, string> = {
 
 /* ---------------------------------------------------------------- text ---- */
 
+/**
+ * Global quality switch. `shadowBlur` is by far the most expensive thing the
+ * overlay does, so the low preset drops every glow and keeps the flat fills.
+ */
+let cheapMode = false;
+export function setCheapMode(v: boolean): void { cheapMode = v; }
+export function isCheap(): boolean { return cheapMode; }
+
 let letterSpacingSupported: boolean | null = null;
 
 function supportsLetterSpacing(c: CanvasRenderingContext2D): boolean {
@@ -154,14 +162,14 @@ export function text(
     paint('rgba(0,2,5,0.95)', o.shadow, o.shadow, 0);
     c.globalAlpha = prev;
   }
-  if (o.chroma) {
+  if (o.chroma && !cheapMode) {
     const prev = c.globalAlpha;
     c.globalAlpha = prev * 0.5;
     paint('rgba(255,60,90,1)', -o.chroma, 0, 0);
     paint('rgba(60,220,255,1)', o.chroma, 0, 0);
     c.globalAlpha = prev;
   }
-  if (o.glow) paint(o.glowColor ?? color, 0, 0, o.glow, o.glowColor ?? color);
+  if (o.glow && !cheapMode) paint(o.glowColor ?? color, 0, 0, o.glow, o.glowColor ?? color);
   paint(color, 0, 0, 0);
 
   if (native && track !== 0) c.letterSpacing = '0px';

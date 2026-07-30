@@ -254,8 +254,15 @@ export type MaterialKey =
 
 /** Style/dimension inputs to the procedural mesh builder. */
 export interface ModelProfile {
-  /** Overall receiver length, height and width in metres. */
+  /** Receiver width, height and length in metres. */
   receiver: Vec3;
+  /**
+   * Height of the top rail surface above the bore. This is the datum the whole
+   * upper half of the weapon is built from — receiver top, handguard rail
+   * riser, sight bases and optic mounts all key off it, which is what keeps a
+   * swapped optic sitting flush instead of floating.
+   */
+  railHeight: number;
   barrelLength: number;
   barrelRadius: number;
   handguardLength: number;

@@ -156,9 +156,9 @@ export function hudScale(viewportHeight: number): number {
 export const MARGIN = 34;
 
 export const LAYOUT = {
-  minimapSize: 194,
-  compassWidth: 620,
-  compassHeight: 34,
+  minimapSize: 196,
+  compassWidth: 700,
+  compassHeight: 68,
   killfeedWidth: 400,
   ammoWidth: 260,
   vitalsWidth: 300,

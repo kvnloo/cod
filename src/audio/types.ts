@@ -67,6 +67,7 @@ export interface AudioStats {
   running: boolean;
   contextState: string;
   sampleRate: number;
+  /** Voices currently producing sound (fading-out ones are not counted). */
   activeVoices: number;
   peakVoices: number;
   starvedVoices: number;

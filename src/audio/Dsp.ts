@@ -22,6 +22,17 @@ import { Rand } from '../core/Rand';
 
 export const TAU = Math.PI * 2;
 
+/**
+ * `Float32Array` backed by a plain `ArrayBuffer`.
+ *
+ * The Web Audio API refuses `SharedArrayBuffer`-backed views, and TypeScript
+ * models that: `copyToChannel`, `WaveShaperNode.curve` and friends all want the
+ * narrow form. Every buffer this module produces is allocated with
+ * `new Float32Array(n)`, so naming the narrow type keeps those boundaries
+ * honest without a single cast.
+ */
+export type F32 = Float32Array<ArrayBuffer>;
+
 /* ------------------------------------------------------------------ math -- */
 
 export function clamp(v: number, a: number, b: number): number {
@@ -340,7 +351,7 @@ export interface HitSpec {
  * shimmers) and the broadband body gives the weight. This is physical modelling
  * on a budget and it is why these read as *materials* rather than as noise.
  */
-export function renderHit(sampleRate: number, spec: HitSpec, rand: Rand): Float32Array {
+export function renderHit(sampleRate: number, spec: HitSpec, rand: Rand): F32 {
   const n = Math.max(16, Math.ceil(spec.seconds * sampleRate));
   const ex = new Float32Array(n);
   const exN = Math.max(2, Math.ceil(spec.excite * sampleRate));
@@ -355,11 +366,18 @@ export function renderHit(sampleRate: number, spec: HitSpec, rand: Rand): Float3
   const out = new Float32Array(n);
 
   // Resonant partials.
+  //
+  // The bandpass form used here has constant *peak* gain, so its output is
+  // whatever excitation energy falls inside its passband — and at Q in the
+  // hundreds that passband is a few hertz wide. Without compensation a struck
+  // steel plate is silent and the whole impact collapses into its contact
+  // click. Scaling by sqrt(Q) restores the physical balance: high-Q materials
+  // ring loudly and for a long time, low-Q ones thud and stop.
   const bq = new Biquad();
   for (const m of spec.modes) {
     if (m.freq >= sampleRate * 0.48) continue;
     bq.set('bandpass', sampleRate, m.freq, m.q).reset();
-    const g = m.gain;
+    const g = m.gain * Math.sqrt(m.q) * 0.25;
     for (let i = 0; i < n; i++) out[i] += bq.process(ex[i]) * g;
   }
 
@@ -394,7 +412,8 @@ export function renderHit(sampleRate: number, spec: HitSpec, rand: Rand): Float3
       const len = Math.min(n - at, Math.ceil(g.decay * sampleRate));
       const hz = g.hz * (0.55 + rand.next() * 1.5);
       gq.set('bandpass', sampleRate, hz, g.q).reset();
-      const amp = g.gain * (0.25 + rand.next() * 0.75) * (1 - at / (g.spread * sampleRate + 1));
+      const amp = g.gain * Math.sqrt(g.q) * 0.25
+        * (0.25 + rand.next() * 0.75) * (1 - at / (g.spread * sampleRate + 1));
       let prev = rand.signed();
       for (let i = 0; i < len; i++) {
         const drive = i < 3 ? prev : 0;
@@ -433,7 +452,7 @@ export function filterNode(
   return f;
 }
 
-export function shaperNode(ctx: BaseAudioContext, curve: Float32Array, oversample: OverSampleType = '2x'): WaveShaperNode {
+export function shaperNode(ctx: BaseAudioContext, curve: F32, oversample: OverSampleType = '2x'): WaveShaperNode {
   const w = ctx.createWaveShaper();
   w.curve = curve;
   w.oversample = oversample;
@@ -448,9 +467,9 @@ export function delayNode(ctx: BaseAudioContext, seconds: number, max = 2): Dela
 
 /* --------------------------------------------------- waveshaping curves -- */
 
-const curveCache = new Map<string, Float32Array>();
+const curveCache = new Map<string, F32>();
 
-function cachedCurve(key: string, build: (out: Float32Array, n: number) => void, n = 4096): Float32Array {
+function cachedCurve(key: string, build: (out: F32, n: number) => void, n = 4096): F32 {
   const hit = curveCache.get(key);
   if (hit) return hit;
   const out = new Float32Array(n);
@@ -460,7 +479,7 @@ function cachedCurve(key: string, build: (out: Float32Array, n: number) => void,
 }
 
 /** Symmetric tanh saturation — odd harmonics, the "loud" curve. */
-export function softClipCurve(drive: number): Float32Array {
+export function softClipCurve(drive: number): F32 {
   return cachedCurve(`soft:${drive.toFixed(3)}`, (out, n) => {
     const norm = 1 / Math.tanh(drive);
     for (let i = 0; i < n; i++) {
@@ -471,7 +490,7 @@ export function softClipCurve(drive: number): Float32Array {
 }
 
 /** Asymmetric drive — adds even harmonics, reads as "speaker being pushed". */
-export function asymCurve(drive: number): Float32Array {
+export function asymCurve(drive: number): F32 {
   return cachedCurve(`asym:${drive.toFixed(3)}`, (out, n) => {
     const up = 1 / Math.tanh(drive);
     const dn = 1 / Math.tanh(drive * 0.55);
@@ -483,7 +502,7 @@ export function asymCurve(drive: number): Float32Array {
 }
 
 /** Wavefolder — violent, metallic. Used sparingly on explosion cores. */
-export function foldCurve(amount: number): Float32Array {
+export function foldCurve(amount: number): F32 {
   return cachedCurve(`fold:${amount.toFixed(3)}`, (out, n) => {
     for (let i = 0; i < n; i++) {
       const x = ((i / (n - 1)) * 2 - 1) * amount;
@@ -497,7 +516,7 @@ export function foldCurve(amount: number): Float32Array {
 }
 
 /** Brickwall-ish safety clip that stays clean until it has to work. */
-export function limitCurve(): Float32Array {
+export function limitCurve(): F32 {
   return cachedCurve('limit', (out, n) => {
     for (let i = 0; i < n; i++) {
       const x = (i / (n - 1)) * 2 - 1;
@@ -600,7 +619,7 @@ export function cacheBuffer(ctx: BaseAudioContext, key: string, build: () => Aud
 }
 
 /** Wraps mono `Float32Array`s into an `AudioBuffer`. */
-export function toAudioBuffer(ctx: BaseAudioContext, channels: Float32Array[], sampleRate?: number): AudioBuffer {
+export function toAudioBuffer(ctx: BaseAudioContext, channels: F32[], sampleRate?: number): AudioBuffer {
   const n = channels[0].length;
   const buf = ctx.createBuffer(channels.length, n, sampleRate ?? ctx.sampleRate);
   for (let c = 0; c < channels.length; c++) buf.copyToChannel(channels[c], c);

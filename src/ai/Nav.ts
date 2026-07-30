@@ -445,6 +445,8 @@ export class NavService {
   private smoothScratch: THREE.Vector3[] = [];
   /** A* calls this frame; the system budget throttles them. */
   searches = 0;
+  /** Times the external navmesh threw. It is dropped after a few. */
+  private externalFailures = 0;
 
   attach(physics: PhysicsAPI | null): void { this.physics = physics; }
 
@@ -454,6 +456,7 @@ export class NavService {
    * up without a restart.
    */
   probeExternal(world: unknown): boolean {
+    if (this.externalFailures >= 2) return false;
     if (!world || typeof world !== 'object') return false;
     const holder = world as Record<string, unknown>;
     const candidates = [holder.nav, holder.navmesh, holder.navMesh, holder.navigation, world];
@@ -488,19 +491,30 @@ export class NavService {
     this.searches++;
     const ext = this.external;
     if (ext && typeof ext.findPath === 'function') {
-      const res = ext.findPath(from, to, this.extPath);
-      let n = 0;
-      if (typeof res === 'number') n = Math.min(res, this.extPath.length);
-      else if (Array.isArray(res)) {
-        n = res.length;
-        for (let i = 0; i < n; i++) pushPoint(this.extPath, i, res[i]);
+      // The world module's navmesh is another team's live code. If it throws —
+      // a signature we guessed wrong, a half-built mesh — the AI must keep
+      // pathing, not die. Two strikes and we fall back to our own grid for good.
+      try {
+        const res = ext.findPath(from, to, this.extPath);
+        let n = 0;
+        if (typeof res === 'number') n = Math.min(res, this.extPath.length);
+        else if (Array.isArray(res)) {
+          n = res.length;
+          for (let i = 0; i < n; i++) pushPoint(this.extPath, i, res[i]);
+        }
+        if (n > 0) {
+          for (let i = 0; i < n; i++) pushPoint(out, i, this.extPath[i]);
+          return n;
+        }
+        // External nav said "no route" — fall through to the grid rather than
+        // stranding the agent.
+      } catch (err) {
+        this.externalFailures++;
+        if (this.externalFailures <= 1) {
+          console.warn('[ai] world navmesh findPath threw; using the sampled grid', err);
+        }
+        if (this.externalFailures >= 2) this.external = null;
       }
-      if (n > 0) {
-        for (let i = 0; i < n; i++) pushPoint(out, i, this.extPath[i]);
-        return n;
-      }
-      // External nav said "no route" — fall through to the grid rather than
-      // stranding the agent.
     }
 
     const grid = this.grid;

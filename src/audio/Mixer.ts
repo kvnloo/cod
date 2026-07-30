@@ -61,22 +61,22 @@ const BUS_CONFIG: Array<{
     },
     {
       name: 'impact', duckWeight: 0.55, volumeKind: 'sfx', trimDb: -4.0,
-      comp: { threshold: -20, ratio: 3.0, attack: 0.002, release: 0.11, knee: 6, makeup: 1.55 },
+      comp: { threshold: -18, ratio: 2.3, attack: 0.002, release: 0.11, knee: 8, makeup: 1.35 },
     },
     {
-      name: 'explosion', duckWeight: 0.0, volumeKind: 'sfx', trimDb: 0.5,
+      name: 'explosion', duckWeight: 0.0, volumeKind: 'sfx', trimDb: -2.0,
       comp: { threshold: -10, ratio: 2.4, attack: 0.006, release: 0.28, knee: 8, makeup: 1.25 },
     },
     {
       name: 'foley', duckWeight: 0.8, volumeKind: 'sfx', trimDb: -7.5,
-      comp: { threshold: -24, ratio: 3.6, attack: 0.006, release: 0.16, knee: 8, makeup: 1.9 },
+      comp: { threshold: -20, ratio: 2.2, attack: 0.006, release: 0.16, knee: 10, makeup: 1.4 },
     },
     {
       name: 'voice', duckWeight: 0.35, volumeKind: 'sfx', trimDb: -3.0,
       comp: { threshold: -22, ratio: 4.5, attack: 0.004, release: 0.2, knee: 10, makeup: 2.0 },
     },
-    { name: 'ambience', duckWeight: 0.95, volumeKind: 'sfx', trimDb: -12.0 },
-    { name: 'music', duckWeight: 0.7, volumeKind: 'music', trimDb: -8.0 },
+    { name: 'ambience', duckWeight: 0.95, volumeKind: 'sfx', trimDb: -17.0 },
+    { name: 'music', duckWeight: 0.7, volumeKind: 'music', trimDb: -14.0 },
     { name: 'ui', duckWeight: 0.15, volumeKind: 'ui', trimDb: -8.0 },
     {
       name: 'reverb', duckWeight: 0.5, volumeKind: 'sfx', trimDb: -4.5,
@@ -136,8 +136,13 @@ export class Mixer {
     let headIn: AudioNode;
     let headOut: AudioNode;
     if (lowQuality) {
-      const g = gainNode(ctx, 1);
-      headIn = g; headOut = g;
+      // One glue compressor rather than three bands. Without *something* here
+      // the limiter has to do all the level control on its own and a close
+      // explosion flattens the whole mix against the ceiling for seconds.
+      const glue = compressor(ctx, {
+        threshold: -17, ratio: 2.6, attack: 0.005, release: 0.19, knee: 10, makeup: 1.2,
+      });
+      headIn = glue.input; headOut = glue.output;
     } else {
       const mb = multibandCompressor(ctx, [
         { hi: 170, comp: { threshold: -16, ratio: 2.6, attack: 0.012, release: 0.24, knee: 8, makeup: 1.2 } },
@@ -166,7 +171,12 @@ export class Mixer {
     this.deafFilter.connect(this.deafGain);
 
     this.preMaster = gainNode(ctx, 1);
-    this.preMaster.connect(this.deafFilter);
+    // Everything below ~30 Hz is inaudible on real playback hardware but very
+    // much audible to the limiter, so it is removed before the mix bus rather
+    // than being allowed to modulate the gain of everything else.
+    const subsonic = filterNode(ctx, 'highpass', 31, 0.62);
+    this.preMaster.connect(subsonic);
+    subsonic.connect(this.deafFilter);
 
     for (const cfg of BUS_CONFIG) {
       const input = gainNode(ctx, 1);
@@ -189,6 +199,20 @@ export class Mixer {
     }
 
     this.applySettings();
+  }
+
+  /**
+   * Wet-send scale for a category.
+   *
+   * Sends are taken inside the voice strip, upstream of the bus trim, so
+   * without this a quiet bus (foley at −7.5 dB) would get proportionally far
+   * more reverb than a loud one. Scaling the send by the bus trim keeps the
+   * wet/dry ratio constant no matter how a category is balanced.
+   */
+  sendScale(name: BusName): number {
+    const s = this.strips.get(name);
+    if (!s) return 1;
+    return dbToGain(s.trimDb) * s.userGain;
   }
 
   /** Where voices of a given category connect. */

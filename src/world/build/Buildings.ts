@@ -1,0 +1,946 @@
+/**
+ * The twelve buildings of Blackout.
+ *
+ * Each is authored for a gameplay job first and a silhouette second:
+ *
+ *  - **Town hall** (north): the hero building and skyline anchor. Arcade,
+ *    clock tower, raised terrace that gives the north end of the square its
+ *    elevated cover.
+ *  - **West terrace** (three party-wall blocks): the rooftop route. Enter at the
+ *    south end via the fire escape, run north above lane A, drop through the
+ *    blown roof into the top floor, out through the north stairwell.
+ *  - **Shops rows** flanking the square: shopfronts and balconies overlooking
+ *    the centre lane, with rear doors on to lane A and lane C — the two short
+ *    flanks.
+ *  - **Warehouse** (east): the interior lane. Roller door, mezzanine, clerestory,
+ *    roof access.
+ *  - **South apartments**: an arched passage through the ground floor, the only
+ *    covered crossing between the square and the southern street.
+ */
+
+import * as THREE from 'three';
+import { Rand } from '../../core/Rand';
+import type { Chunk, ChunkSet } from '../geom/Chunk';
+import { FOOTPRINTS, SQUARE } from '../Layout';
+import {
+  archOpening, cable, column, doorUnit, fireEscape, parapet, railing, roofFlat,
+  slab, stairs, wall, windowUnit, rectWalls, cornice, chimney, downpipe,
+  WallFrame, type Opening,
+} from '../geom/Kit';
+import { buildBlock, ladder, plankBridge, type BlockResult, type BlockSpec } from './Block';
+import type { MatKey } from '../MatCatalog';
+import { V3 } from '../geom/Mesher';
+
+export interface BuiltWorld {
+  blocks: Record<string, BlockResult>;
+  /** Points the nav build should treat as interesting patrol anchors. */
+  interiors: { x: number; z: number; y: number; radius: number; name: string }[];
+}
+
+export function buildAllBuildings(set: ChunkSet): BuiltWorld {
+  const blocks: Record<string, BlockResult> = {};
+  const interiors: BuiltWorld['interiors'] = [];
+
+  blocks.townHall = townHall(set.get('townHall'));
+  blocks.clinic = clinic(set.get('clinic'));
+  const terrace = westTerrace(set);
+  Object.assign(blocks, terrace);
+  blocks.cafe = cafe(set.get('cafe'));
+  blocks.apartmentSW = apartmentSW(set.get('apartmentSW'));
+  ruinSW(set.get('ruinSW'));
+  blocks.shopsW = shopRow(set.get('shopsW'), 'shopsW', FOOTPRINTS.shopsW, 'e', 3101, 'plasterRose');
+  blocks.shopsW2 = shopRow(set.get('shopsW2'), 'shopsW2', FOOTPRINTS.shopsW2, 'e', 3121, 'plasterCream');
+  blocks.shopsE = shopRow(set.get('shopsE'), 'shopsE', FOOTPRINTS.shopsE, 'w', 3141, 'plasterOchre');
+  blocks.shopsE2 = shopRow(set.get('shopsE2'), 'shopsE2', FOOTPRINTS.shopsE2, 'w', 3161, 'plasterSage', {
+    // gap in the roof parapet where the plank bridge lands
+    parapetGaps: [{ x0: 24, z0: 17.5, x1: 26, z1: 20.5 }],
+  });
+  blocks.warehouse = warehouse(set.get('warehouse'));
+  blocks.offices = offices(set.get('offices'));
+  garage(set.get('garage'));
+  blocks.apartmentS = apartmentS(set.get('apartmentS'));
+
+  // Roof crossing from the east shops on to the office block's second-floor
+  // balcony — the plank that turns the east flank into a loop.
+  plankBridge(set.get('bridges'), V3(24.6, 7.24, 19.4), V3(30.4, 6.86, 19.4), 1.2, 91);
+
+  interiors.push(
+    { x: 0, z: -47, y: 0, radius: 12, name: 'townHall' },
+    { x: -43, z: -30, y: 0, radius: 8, name: 'terrace' },
+    { x: 38, z: -20, y: 0, radius: 11, name: 'warehouse' },
+    { x: -1, z: 45, y: 0, radius: 9, name: 'apartmentS' },
+    { x: 40, z: 16, y: 0, radius: 9, name: 'offices' },
+    { x: -20, z: -22, y: 0, radius: 5, name: 'shopsW' },
+    { x: 20, z: -22, y: 0, radius: 5, name: 'shopsE' },
+  );
+
+  return { blocks, interiors };
+}
+
+/* ============================================================ town hall == */
+
+function townHall(chunk: Chunk): BlockResult {
+  const f = FOOTPRINTS.townHall;
+  // Arcade geometry: six piers, five bays, symmetric about the centre line.
+  const bays = 5;
+  const pierW = 1.8;
+  const width = f.x1 - f.x0;
+  const span = (width - pierW * (bays + 1)) / bays;
+  // The hall's floor is level with the raised terrace in front of it, so the
+  // arcade is walkable straight off the square's steps.
+  const baseY = SQUARE.terraceY;
+  const springY = baseY + 2.4;
+  const archTop = springY + span * 0.5;
+  const bayCentreU: number[] = [];
+  for (let i = 0; i < bays; i++) bayCentreU.push(pierW * (i + 1) + span * (i + 0.5));
+
+  const spec: BlockSpec = {
+    name: 'townHall',
+    x0: f.x0, z0: f.z0, x1: f.x1, z1: f.z1,
+    storeys: 2,
+    base: baseY,
+    groundHeight: 5.0,
+    storeyHeight: 4.4,
+    wallKey: 'plasterOchre',
+    groundKey: 'stone',
+    innerKey: 'plasterIntWarm',
+    trimKey: 'stoneTrim',
+    plinthKey: 'stone',
+    roofKind: 'pitched',
+    roofKey: 'roofTile',
+    ridgeAxis: 'x',
+    ridgeRise: 3.0,
+    thickness: 0.55,
+    windowSpacing: 3.6,
+    windowWidth: 1.35,
+    windowHeight: 2.4,
+    sill: 1.05,
+    glazingDamage: 0.45,
+    openSides: ['n', 'w', 's', 'e'],
+    entrances: [{ side: 'n', at: 0, width: 1.5, missing: true }],
+    interior: 'full',
+    interiorFloorKey: 'stone',
+    ceilingKey: 'plasterIntWarm',
+    stairwell: { x: -12.5, z: -50.5, dir: '+z', width: 1.5 },
+    holes: [{ side: 'e', at: -47, width: 2.6, level: 1, height: 2.6 }],
+    // The arcade bays are cut out of the south wall; the arch rings are added
+    // afterwards so the opening and the masonry agree.
+    extraOpenings: bayCentreU.map((u) => ({
+      side: 's' as const, at: f.x0 + u, width: span, y: baseY, height: archTop - baseY + 0.05, kind: 'arch' as const,
+    })),
+    downpipes: [{ x: f.x0 - 0.2, z: f.z1 + 0.2 }, { x: f.x1 + 0.2, z: f.z1 + 0.2 }],
+    chimneys: [{ x: -9, z: -52, height: 1.9 }, { x: 9, z: -52, height: 1.9 }],
+    seed: 2201,
+  };
+  const res = buildBlock(chunk, spec);
+
+  // --- south arcade: five arch rings on to the square, the hall's signature.
+  const south = rectWalls(f.x0, f.z0, f.x1, f.z1)[2];
+  for (const u of bayCentreU) {
+    archOpening(chunk, south, 'stone', u, span, springY, archTop + 0.05, 0.55, 9, 'stoneTrim');
+  }
+  // The terrace runs through the arcade so the hall floor and the terrace are
+  // one continuous surface.
+  chunk.m('stone').boxMinMax(f.x0 + 0.2, -0.4, f.z1 - 1.2, f.x1 - 0.2, baseY, f.z1 + 0.2, 2.4);
+
+  // Vaulted soffit through the arcade so it reads as depth, not a painted arch.
+  const soffit = chunk.m('stone');
+  for (const u of bayCentreU) {
+    const cx = f.x0 + u;
+    const seg = 7;
+    for (let i = 0; i < seg; i++) {
+      const a0 = Math.PI * (i / seg);
+      const a1 = Math.PI * ((i + 1) / seg);
+      const am = (a0 + a1) * 0.5;
+      const r = span * 0.5;
+      soffit.pushTRS(
+        cx - Math.cos(am) * (r + 0.08), springY + Math.sin(am) * (r + 0.08), f.z1 - 0.28,
+        0, 0, am - Math.PI / 2,
+      );
+      soffit.box(0, 0, 0, (Math.PI * r) / seg * 0.62, 0.08, 0.28, 1.6);
+      soffit.pop();
+    }
+  }
+
+  // --- raised terrace in front, with balustrade and two flights of steps.
+  const t = chunk.m('stone');
+  t.boxMinMax(f.x0 - 1.5, -0.4, SQUARE.terraceZ0, f.x1 + 1.5, SQUARE.terraceY, SQUARE.terraceZ1, 2.4);
+  const bal = chunk.m('stoneTrim');
+  // balustrade along the square edge, with two gaps for the steps
+  const gaps = [[-9.5, -5.5], [5.5, 9.5]];
+  const seg = 0.55;
+  for (let x = f.x0 - 1.5; x < f.x1 + 1.5; x += seg) {
+    if (gaps.some((g) => x > g[0] - 0.3 && x < g[1] + 0.3)) continue;
+    bal.pushTRS(x + seg * 0.5, SQUARE.terraceY + 0.42, SQUARE.terraceZ1 - 0.22);
+    bal.cylinder(0.09, 0.075, 0.72, 8, false, false, 0.4);
+    bal.pop();
+  }
+  for (const [gx0, gx1] of [[f.x0 - 1.5, -9.5], [-5.5, 5.5], [9.5, f.x1 + 1.5]]) {
+    bal.boxMinMax(gx0, SQUARE.terraceY + 0.78, SQUARE.terraceZ1 - 0.36, gx1, SQUARE.terraceY + 0.92, SQUARE.terraceZ1 - 0.06, 1.2);
+    bal.boxMinMax(gx0, SQUARE.terraceY, SQUARE.terraceZ1 - 0.36, gx1, SQUARE.terraceY + 0.12, SQUARE.terraceZ1 - 0.06, 1.2);
+  }
+  for (const cx of [-7.5, 7.5]) {
+    stairs(chunk, {
+      key: 'stone', dir: '-z', x: cx, z: SQUARE.terraceZ1 + 0.02,
+      yBottom: 0, yTop: SQUARE.terraceY, width: 3.6, riser: 0.156, going: 0.34,
+    });
+  }
+
+  // --- clock tower: the map's tallest landmark, visible from every lane.
+  const tx = 0, tz = f.z0 + 3.2;
+  const towerTop = 21.5;
+  const towerStone = chunk.m('stoneTrim');
+  const hw = 2.6;
+  for (const [ax, az, bx, bz] of [
+    [tx + hw, tz - hw, tx - hw, tz - hw],
+    [tx - hw, tz - hw, tx - hw, tz + hw],
+    [tx - hw, tz + hw, tx + hw, tz + hw],
+    [tx + hw, tz + hw, tx + hw, tz - hw],
+  ]) {
+    const frame = new WallFrame(ax, az, bx, bz);
+    const openings: Opening[] = [
+      { u: hw, width: 1.1, sill: 15.6, height: 2.3, kind: 'window', broken: 0.6 },
+      { u: hw, width: 1.6, sill: 18.6, height: 1.6, kind: 'hole', noTrim: true },
+    ];
+    wall(chunk, frame, {
+      key: 'plasterOchre', y0: 8.0, y1: towerTop, thickness: 0.5,
+      openings, trimKey: 'stoneTrim', innerKey: 'plasterIntWarm',
+    });
+    windowUnit(chunk, frame, openings[0], { wallThickness: 0.5, broken: 0.6, cols: 2, rows: 3, seed: 771 });
+    // clock face
+    const clock = chunk.m('stoneTrim');
+    clock.push(frame.matrix);
+    clock.pushTRS(hw, 17.4, 0.28);
+    clock.cylinder(0.95, 0.95, 0.12, 16, true, false, 0.6);
+    clock.pop();
+    clock.pop();
+  }
+  towerStone.boxMinMax(tx - hw - 0.3, towerTop, tz - hw - 0.3, tx + hw + 0.3, towerTop + 0.32, tz + hw + 0.3, 1.4);
+  // spire
+  const spire = chunk.m('sheet');
+  spire.pushTRS(tx, towerTop + 2.4, tz);
+  spire.cylinder(hw + 0.2, 0.06, 4.6, 4, false, true, 1.6);
+  spire.pop();
+  spire.pushTRS(tx, towerTop + 5.2, tz);
+  spire.cylinder(0.05, 0.05, 1.2, 4, false, false, 0.4);
+  spire.pop();
+
+  // --- interior: first-floor gallery railing around the stairwell void.
+  railing(chunk, 'rust', [
+    V3(-14.6, 5.0, -49.0), V3(-10.4, 5.0, -49.0), V3(-10.4, 5.0, -52.2),
+  ], 1.0, 'ornate');
+
+  return res;
+}
+
+/* =============================================================== clinic == */
+
+function clinic(chunk: Chunk): BlockResult {
+  const f = FOOTPRINTS.clinic;
+  return buildBlock(chunk, {
+    name: 'clinic',
+    x0: f.x0, z0: f.z0, x1: f.x1, z1: f.z1,
+    storeys: 3,
+    wallKey: 'plasterBlue',
+    groundKey: 'concrete',
+    innerKey: 'plasterInt',
+    trimKey: 'concrete',
+    plinthKey: 'concreteDark',
+    roofKind: 'flat',
+    roofKey: 'roofFelt',
+    windowSpacing: 2.8,
+    windowWidth: 1.3,
+    glazingDamage: 0.55,
+    boardedChance: 0.22,
+    openSides: ['w', 's', 'e', 'n'],
+    entrances: [{ side: 's', at: 34, width: 1.6, open: 1.9 }],
+    interior: 'full',
+    interiorFloorKey: 'concrete',
+    ceilingKey: 'plasterInt',
+    stairwell: { x: 27.5, z: -44.0, dir: '+x', width: 1.3 },
+    partitions: [
+      { x0: 34, z0: -55, x1: 34, z1: -40, level: 0, door: 6.5 },
+      { x0: 40, z0: -55, x1: 40, z1: -40, level: 1, door: 8.5 },
+    ],
+    holes: [
+      { side: 's', at: 42, width: 3.0, level: 2, height: 2.4 },
+      { side: 'e', at: -46, width: 2.4, level: 1, height: 2.2 },
+    ],
+    raggedSides: ['e'],
+    raggedAmount: 1.4,
+    downpipes: [{ x: f.x0 - 0.2, z: f.z1 + 0.2 }, { x: f.x1 + 0.2, z: f.z0 - 0.2 }],
+    seed: 2311,
+  });
+}
+
+/* ======================================================== west terrace == */
+
+/**
+ * Three party-wall blocks sharing one continuous roof — the rooftop route.
+ * Party walls are owned by the block to the north so nothing z-fights, and the
+ * parapets between them are gapped so the roof is genuinely walkable.
+ */
+function westTerrace(set: ChunkSet): Record<string, BlockResult> {
+  const n = FOOTPRINTS.terraceN;
+  const m = FOOTPRINTS.terraceM;
+  const s = FOOTPRINTS.terraceS;
+  const out: Record<string, BlockResult> = {};
+  const chunkN = set.get('terraceN');
+  const chunkM = set.get('terraceM');
+  const chunkS = set.get('terraceS');
+
+  const shared = {
+    storeys: 3,
+    groundHeight: 3.5,
+    storeyHeight: 3.15,
+    innerKey: 'plasterInt' as MatKey,
+    trimKey: 'stoneTrim' as MatKey,
+    plinthKey: 'stone' as MatKey,
+    roofKind: 'flat' as const,
+    roofKey: 'roofFelt' as MatKey,
+    windowSpacing: 2.95,
+    windowWidth: 1.2,
+    interior: 'full' as const,
+    interiorFloorKey: 'plank' as MatKey,
+    ceilingKey: 'plasterInt' as MatKey,
+    parapetHeight: 0.95,
+  };
+
+  out.terraceN = buildBlock(chunkN, {
+    ...shared,
+    name: 'terraceN',
+    x0: n.x0, z0: n.z0, x1: n.x1, z1: n.z1,
+    wallKey: 'plasterCream',
+    groundKey: 'brickPale',
+    omitSides: ['s'],
+    blindSides: ['s'],
+    glazingDamage: 0.35,
+    entrances: [{ side: 'e', at: -47, width: 1.3, open: 1.5 }],
+    balconies: [
+      { side: 'e', at: -50, width: 2.4, level: 1 },
+      { side: 'e', at: -43, width: 2.4, level: 2 },
+    ],
+    stairwell: { x: -48.6, z: -52.0, dir: '+z', width: 1.25 },
+    partitions: [{ x0: -44, z0: -55, x1: -44, z1: -37, level: 1, door: 9 }],
+    parapetGaps: [{ x0: n.x0 - 1, z0: n.z1 - 1, x1: n.x1 + 1, z1: n.z1 + 1 }],
+    downpipes: [{ x: n.x1 + 0.2, z: n.z0 - 0.2 }],
+    seed: 2401,
+  });
+
+  out.terraceM = buildBlock(chunkM, {
+    ...shared,
+    name: 'terraceM',
+    x0: m.x0, z0: m.z0, x1: m.x1, z1: m.z1,
+    wallKey: 'plasterRose',
+    groundKey: 'brick',
+    omitSides: ['n'],
+    blindSides: ['n', 's'],
+    glazingDamage: 0.6,
+    boardedChance: 0.18,
+    balconies: [{ side: 'e', at: -32, width: 2.6, level: 2 }],
+    holes: [{ side: 'e', at: -27, width: 3.2, level: 2, height: 2.6 }],
+    // The blown roof hole is the rooftop route's way back inside.
+    roofHole: { x0: -46, z0: -32, x1: -42, z1: -28 },
+    parapetGaps: [
+      { x0: m.x0 - 1, z0: m.z0 - 1, x1: m.x1 + 1, z1: m.z0 + 1 },
+      { x0: m.x0 - 1, z0: m.z1 - 1, x1: m.x1 + 1, z1: m.z1 + 1 },
+    ],
+    seed: 2411,
+  });
+
+  out.terraceS = buildBlock(chunkS, {
+    ...shared,
+    name: 'terraceS',
+    x0: s.x0, z0: s.z0, x1: s.x1, z1: s.z1,
+    wallKey: 'plasterCream',
+    groundKey: 'brickPale',
+    omitSides: ['n'],
+    blindSides: ['n'],
+    glazingDamage: 0.45,
+    entrances: [{ side: 'e', at: -12, width: 1.3, open: 1.1 }],
+    shopfronts: [{ side: 'e', at: -18, width: 4.2, broken: 0.55 }],
+    balconies: [{ side: 'e', at: -9, width: 2.4, level: 2 }],
+    stairwell: { x: -48.6, z: -12.0, dir: '-z', width: 1.25 },
+    parapetGaps: [
+      { x0: s.x0 - 1, z0: s.z0 - 1, x1: s.x1 + 1, z1: s.z0 + 1 },
+      // gap where the fire escape lands on the roof
+      { x0: s.x1 - 2.6, z0: s.z1 - 4.4, x1: s.x1 + 1, z1: s.z1 - 1.6 },
+    ],
+    chimneys: [{ x: -46, z: -8, height: 1.7 }],
+    downpipes: [{ x: s.x1 + 0.2, z: s.z1 + 0.2 }],
+    seed: 2421,
+  });
+
+  // Fire escape climbing the east face of the south block up to the roof.
+  const eastFrame = rectWalls(s.x0, s.z0, s.x1, s.z1)[3];
+  const eaveY = out.terraceS.eaveY;
+  fireEscape(chunkS, eastFrame, 3.0, [3.5, 6.65, 9.8], 1.7, 1.4);
+  ladder(chunkS, 'rust', s.x1 + 0.85, s.z1 - 3.0, 9.8, eaveY + 0.7, Math.PI / 2, 0.5);
+
+  // Rooftop dressing that also blocks the long roof sightline.
+  const rp = chunkM.m('brickSoot');
+  rp.boxMinMax(-46.5, eaveY, -44.0, -44.5, eaveY + 1.5, -43.4, 1.6);
+  rp.boxMinMax(-42.0, eaveY, -19.5, -40.4, eaveY + 1.35, -19.0, 1.6);
+
+  return out;
+}
+
+/* ================================================================= café == */
+
+function cafe(chunk: Chunk): BlockResult {
+  const f = FOOTPRINTS.cafe;
+  const res = buildBlock(chunk, {
+    name: 'cafe',
+    x0: f.x0, z0: f.z0, x1: f.x1, z1: f.z1,
+    storeys: 2,
+    groundHeight: 3.7,
+    storeyHeight: 3.1,
+    wallKey: 'plasterSage',
+    groundKey: 'plasterSage',
+    innerKey: 'plasterIntWarm',
+    trimKey: 'stoneTrim',
+    plinthKey: 'stone',
+    roofKind: 'pitched',
+    roofKey: 'roofTile',
+    ridgeAxis: 'z',
+    ridgeRise: 2.2,
+    windowSpacing: 2.7,
+    glazingDamage: 0.3,
+    openSides: ['n', 'w', 's', 'e'],
+    shopfronts: [{ side: 'e', at: 3, width: 5.4, broken: 0.4, signKey: 'signGlow' }],
+    entrances: [{ side: 'e', at: 9, width: 1.2, open: 1.4 }],
+    interior: 'full',
+    interiorFloorKey: 'plank',
+    ceilingKey: 'plasterIntWarm',
+    stairwell: { x: -48.4, z: 9.0, dir: '-z', width: 1.2 },
+    chimneys: [{ x: -46, z: 10, height: 1.8 }],
+    downpipes: [{ x: f.x1 + 0.2, z: f.z0 - 0.2 }],
+    seed: 2501,
+  });
+
+  // Café terrace: a low wall and planter strip that breaks the long lane-A line.
+  const lowWall = chunk.m('brickPale');
+  lowWall.boxMinMax(-36.6, 0, -1.5, -36.0, 0.85, 11.5, 1.4);
+  const cap = chunk.m('stoneTrim');
+  cap.boxMinMax(-36.75, 0.85, -1.5, -35.85, 0.98, 11.5, 1.2);
+  return res;
+}
+
+/* ======================================================== apartment SW == */
+
+function apartmentSW(chunk: Chunk): BlockResult {
+  const f = FOOTPRINTS.apartmentSW;
+  return buildBlock(chunk, {
+    name: 'apartmentSW',
+    x0: f.x0, z0: f.z0, x1: f.x1, z1: f.z1,
+    storeys: 2,
+    wallKey: 'brick',
+    groundKey: 'brickSoot',
+    innerKey: 'plasterInt',
+    trimKey: 'stoneTrim',
+    plinthKey: 'concreteDark',
+    roofKind: 'flat',
+    roofKey: 'roofFelt',
+    windowSpacing: 3.0,
+    glazingDamage: 0.85,
+    boardedChance: 0.3,
+    entrances: [{ side: 'n', at: -40, width: 1.3, missing: true }],
+    interior: 'full',
+    interiorFloorKey: 'plank',
+    ceilingKey: 'plasterInt',
+    stairwell: { x: -48.0, z: 20.5, dir: '+z', width: 1.2 },
+    holes: [
+      { side: 'n', at: -44, width: 3.4, level: 1, height: 2.6 },
+      { side: 'e', at: 24, width: 2.6, level: 0, height: 2.4 },
+    ],
+    raggedSides: ['n', 'e'],
+    raggedAmount: 1.6,
+    cornerCollapse: { x: -34.5, z: 30.5, radius: 4.4 },
+    parapetGaps: [{ x0: -38, z0: 27, x1: -33, z1: 31 }],
+    seed: 2601,
+  });
+}
+
+/* ============================================================== SW ruin == */
+
+/** A roofless shell: three ragged walls, a fallen slab and a lot of rubble. */
+function ruinSW(chunk: Chunk): void {
+  const f = FOOTPRINTS.ruinSW;
+  const rand = new Rand(2701);
+  const walls = rectWalls(f.x0, f.z0, f.x1, f.z1);
+  const heights = [4.6, 6.2, 2.4, 5.4];
+  for (let i = 0; i < 4; i++) {
+    if (i === 2) continue; // south wall is gone entirely
+    const openings: Opening[] = [];
+    const len = walls[i].length;
+    const count = Math.max(1, Math.floor(len / 4.2));
+    for (let k = 0; k < count; k++) {
+      const u = (len / count) * (k + 0.5);
+      openings.push({
+        u, width: rand.range(1.2, 2.4), sill: rand.range(0.9, 1.4),
+        height: rand.range(1.6, 2.4), kind: 'hole', noTrim: true,
+      });
+    }
+    wall(chunk, walls[i], {
+      key: 'brickSoot', y0: -0.4, y1: heights[i], thickness: 0.42,
+      openings, ragged: { amplitude: 1.8, seed: 2711 + i, rebar: true },
+      innerKey: 'brickSoot',
+    });
+  }
+  // fallen floor slab leaning into the shell
+  const slabM = chunk.m('concreteDark');
+  slabM.pushTRS(f.x0 + 6.5, 1.6, f.z0 + 7.0, 0.4, 0, 0.62);
+  slabM.box(0, 0, 0, 4.2, 0.15, 3.0, 2.4);
+  slabM.pop();
+  // rubble heap
+  for (let i = 0; i < 90; i++) {
+    const x = rand.range(f.x0 + 0.5, f.x1 - 0.5);
+    const z = rand.range(f.z0 + 0.5, f.z1 - 0.5);
+    const s = rand.range(0.16, 0.55);
+    const key = rand.bool(0.55) ? 'brickSoot' : 'concreteDark';
+    const mm = chunk.m(key);
+    mm.pushTRS(x, s * 0.5, z, rand.next() * Math.PI, rand.range(-0.4, 0.4), rand.range(-0.4, 0.4));
+    mm.box(0, 0, 0, s, s * rand.range(0.4, 0.8), s * rand.range(0.6, 1.4), 1.0);
+    mm.pop();
+  }
+}
+
+/* =========================================================== shop rows == */
+
+/**
+ * A two-storey terrace of shop units. `front` is the side that faces the
+ * square: it gets the shopfronts, the fascia and the balconies; the opposite
+ * side gets service doors on to the flanking lane.
+ */
+function shopRow(
+  chunk: Chunk, name: string, f: { x0: number; z0: number; x1: number; z1: number },
+  front: 'e' | 'w', seed: number, wallKey: BlockSpec['wallKey'],
+  overrides: Partial<BlockSpec> = {},
+): BlockResult {
+  const back = front === 'e' ? 'w' : 'e';
+  const frontX = front === 'e' ? f.x1 : f.x0;
+  const backX = front === 'e' ? f.x0 : f.x1;
+  const rand = new Rand(seed);
+  const depth = f.z1 - f.z0;
+  const units = Math.max(2, Math.round(depth / 8));
+  const shopfronts: NonNullable<BlockSpec['shopfronts']>[number][] = [];
+  const entrances: NonNullable<BlockSpec['entrances']>[number][] = [];
+  const balconies: NonNullable<BlockSpec['balconies']>[number][] = [];
+  for (let i = 0; i < units; i++) {
+    const z = f.z0 + (depth * (i + 0.5)) / units;
+    shopfronts.push({ side: front, at: z, width: 4.0, broken: rand.range(0.25, 0.75) });
+    entrances.push({ side: back, at: z + 2.2, width: 1.15, open: rand.range(0.4, 1.7), missing: rand.bool(0.25) });
+    if (rand.bool(0.6)) balconies.push({ side: front, at: z, width: 2.4, level: 1, depth: 1.0 });
+  }
+
+  const res = buildBlock(chunk, {
+    name,
+    x0: f.x0, z0: f.z0, x1: f.x1, z1: f.z1,
+    storeys: 2,
+    groundHeight: 3.9,
+    storeyHeight: 3.3,
+    wallKey,
+    groundKey: 'plasterGrey',
+    innerKey: 'plasterInt',
+    trimKey: 'stoneTrim',
+    plinthKey: 'stone',
+    roofKind: 'flat',
+    roofKey: 'roofFelt',
+    parapetHeight: 0.95,
+    windowSpacing: 2.7,
+    windowWidth: 1.15,
+    glazingDamage: 0.5,
+    boardedChance: 0.2,
+    shopfronts,
+    entrances,
+    balconies,
+    interior: 'full',
+    interiorFloorKey: 'concrete',
+    ceilingKey: 'plasterInt',
+    stairwell: { x: backX + (front === 'e' ? 2.0 : -2.0), z: f.z0 + 2.4, dir: '+z', width: 1.2 },
+    holes: rand.bool(0.6) ? [{ side: front, at: f.z0 + depth * 0.75, width: 2.8, level: 1, height: 2.4 }] : [],
+    raggedSides: rand.bool(0.5) ? [front] : [],
+    raggedAmount: 1.0,
+    downpipes: [{ x: frontX + (front === 'e' ? 0.2 : -0.2), z: f.z0 - 0.2 }],
+    seed,
+    ...overrides,
+  });
+
+  // Roof access hatch housing so the roof reads as reachable.
+  const hut = chunk.m('brickSoot');
+  const hx = backX + (front === 'e' ? 2.0 : -2.0);
+  hut.boxMinMax(hx - 1.1, res.eaveY, f.z0 + 1.2, hx + 1.1, res.eaveY + 2.1, f.z0 + 3.6, 1.6);
+  ladder(chunk, 'rust', hx, f.z0 + 3.75, res.eaveY, res.eaveY + 2.3, 0, 0.5);
+
+  return res;
+}
+
+/* ============================================================ warehouse == */
+
+/**
+ * One tall volume with a mezzanine — the east lane's interior fight. Roller
+ * door on to lane C, clerestory band that throws late sun across the floor, an
+ * external stair to the roof and a shot-out section of roof deck for light.
+ */
+function warehouse(chunk: Chunk): BlockResult {
+  const f = FOOTPRINTS.warehouse;
+  const eave = 9.2;
+  const res = buildBlock(chunk, {
+    name: 'warehouse',
+    x0: f.x0, z0: f.z0, x1: f.x1, z1: f.z1,
+    storeys: 1,
+    groundHeight: eave,
+    wallKey: 'concrete',
+    groundKey: 'concrete',
+    innerKey: 'concreteDark',
+    trimKey: 'concreteDark',
+    plinthKey: 'concreteDark',
+    roofKind: 'flat',
+    roofKey: 'roofFelt',
+    parapetHeight: 0.7,
+    thickness: 0.42,
+    windowSpacing: 4.6,
+    windowWidth: 2.2,
+    windowHeight: 1.5,
+    sill: 6.4,
+    glazingDamage: 0.7,
+    openSides: ['n', 'w', 's', 'e'],
+    entrances: [{ side: 'w', at: -12, width: 1.4, open: 1.8 }],
+    extraOpenings: [
+      { side: 'w', at: -22, width: 4.8, y: 0, height: 4.6 },   // roller door bay
+      { side: 's', at: 40, width: 3.2, y: 0, height: 3.2 },    // blown-out south wall
+      { side: 'e', at: -14, width: 2.4, y: 0, height: 2.6 },   // rear service door
+    ],
+    interior: 'ground',
+    interiorFloorKey: 'concrete',
+    ceilingKey: 'concreteDark',
+    roofHole: { x0: 38, z0: -22, x1: 43, z1: -17 },
+    seed: 2801,
+  });
+
+  // roller door: slats half-raised in the west bay
+  const door = chunk.m('sheet');
+  const west = rectWalls(f.x0, f.z0, f.x1, f.z1)[1];
+  door.push(west.matrix);
+  const doorU = -22 - f.z0;
+  for (let i = 0; i < 9; i++) {
+    door.box(doorU, 2.62 + i * 0.2, 0.19, 2.4, 0.092, 0.03, 1.2);
+  }
+  door.box(doorU, 4.48, 0.19, 2.5, 0.11, 0.055, 1.2);
+  // runners
+  for (const s2 of [-1, 1]) door.box(doorU + s2 * 2.5, 2.3, 0.19, 0.06, 2.3, 0.07, 0.6);
+  door.pop();
+
+  // mezzanine floor + stairs + railing
+  const mezY = 4.3;
+  slab(chunk, 'plank', f.x1 - 9.0, f.z0 + 0.5, f.x1 - 0.5, f.z0 + 11.5, mezY, 0.26, 'rust');
+  const posts = chunk.m('rust');
+  for (let i = 0; i < 3; i++) {
+    const px = f.x1 - 9.0 + 0.4;
+    const pz = f.z0 + 1.5 + i * 4.5;
+    posts.pushTRS(px, mezY * 0.5, pz);
+    posts.cylinder(0.09, 0.09, mezY, 8, false, false, 0.8);
+    posts.pop();
+  }
+  stairs(chunk, {
+    key: 'rust', dir: '-x', x: f.x1 - 9.2, z: f.z0 + 9.0,
+    yBottom: 0.02, yTop: mezY, width: 1.2, railKey: 'rust', railSides: ['left', 'right'],
+  });
+  railing(chunk, 'rust', [
+    V3(f.x1 - 9.0, mezY, f.z0 + 0.6), V3(f.x1 - 9.0, mezY, f.z0 + 7.6),
+  ], 1.05, 'pipe');
+  railing(chunk, 'rust', [
+    V3(f.x1 - 9.0, mezY, f.z0 + 10.4), V3(f.x1 - 9.0, mezY, f.z0 + 11.4),
+    V3(f.x1 - 0.6, mezY, f.z0 + 11.4),
+  ], 1.05, 'pipe');
+
+  // roof trusses spanning the hall, seen from inside and through the roof hole
+  const truss = chunk.m('rust');
+  for (let i = 0; i < 6; i++) {
+    const z = f.z0 + 2.0 + i * 4.2;
+    truss.boxMinMax(f.x0 + 0.4, eave - 0.75, z - 0.06, f.x1 - 0.4, eave - 0.62, z + 0.06, 2.0);
+    truss.boxMinMax(f.x0 + 0.4, eave - 0.35, z - 0.05, f.x1 - 0.4, eave - 0.25, z + 0.05, 2.0);
+    for (let k = 0; k < 8; k++) {
+      const x = f.x0 + 1.2 + k * ((f.x1 - f.x0 - 2.4) / 7);
+      truss.pushTRS(x, eave - 0.5, z, 0, 0, k % 2 ? 0.6 : -0.6);
+      truss.box(0, 0, 0, 0.03, 0.36, 0.03, 0.5);
+      truss.pop();
+    }
+  }
+
+  // external stair up the north face to the roof
+  stairs(chunk, {
+    key: 'rust', dir: '+x', x: f.x0 + 1.0, z: f.z0 - 1.4,
+    yBottom: 0.02, yTop: eave + 0.2, width: 1.15, railKey: 'rust', railSides: ['left'],
+  });
+  railing(chunk, 'rust', [
+    V3(f.x0 + 1.0, eave + 0.2, f.z0 - 2.0), V3(f.x0 + 9.6, eave + 0.2, f.z0 - 2.0),
+    V3(f.x0 + 9.6, eave + 0.2, f.z0 - 0.4),
+  ], 1.05, 'pipe');
+
+  return res;
+}
+
+/* ============================================================== offices == */
+
+function offices(chunk: Chunk): BlockResult {
+  const f = FOOTPRINTS.offices;
+  const res = buildBlock(chunk, {
+    name: 'offices',
+    x0: f.x0, z0: f.z0, x1: f.x1, z1: f.z1,
+    storeys: 3,
+    groundHeight: 3.6,
+    storeyHeight: 3.2,
+    wallKey: 'concrete',
+    groundKey: 'stone',
+    innerKey: 'plasterInt',
+    trimKey: 'concreteDark',
+    plinthKey: 'stone',
+    roofKind: 'flat',
+    roofKey: 'roofFelt',
+    windowSpacing: 2.5,
+    windowWidth: 1.6,
+    windowHeight: 1.85,
+    sill: 0.85,
+    glazingDamage: 0.4,
+    openSides: ['n', 'w', 's', 'e'],
+    entrances: [{ side: 'w', at: 12, width: 1.7, open: 1.6 }],
+    interior: 'full',
+    interiorFloorKey: 'concrete',
+    ceilingKey: 'plasterInt',
+    stairwell: { x: 32.4, z: 25.0, dir: '-z', width: 1.3 },
+    partitions: [
+      { x0: 40, z0: 4.4, x1: 40, z1: 27.6, level: 1, door: 12 },
+      { x0: 40, z0: 4.4, x1: 40, z1: 27.6, level: 2, door: 18 },
+    ],
+    balconies: [{ side: 'w', at: 20, width: 5.0, level: 2, depth: 1.4 }],
+    holes: [{ side: 'w', at: 8, width: 3.2, level: 2, height: 2.6 }],
+    parapetGaps: [{ x0: f.x0 - 1, z0: 7.0, x1: f.x0 + 1, z1: 9.0 }],
+    downpipes: [{ x: f.x0 - 0.2, z: f.z1 + 0.2 }],
+    seed: 2901,
+  });
+  void res;
+  return res;
+}
+
+/* =============================================================== garage == */
+
+function garage(chunk: Chunk): void {
+  const f = FOOTPRINTS.garage;
+  buildBlock(chunk, {
+    name: 'garage',
+    x0: f.x0, z0: f.z0, x1: f.x1, z1: f.z1,
+    storeys: 1,
+    groundHeight: 4.4,
+    wallKey: 'brickSoot',
+    groundKey: 'brickSoot',
+    innerKey: 'concreteDark',
+    trimKey: 'concreteDark',
+    plinthKey: 'concreteDark',
+    roofKind: 'flat',
+    roofKey: 'sheet',
+    parapetHeight: 0.4,
+    windowSpacing: 3.4,
+    windowWidth: 1.5,
+    windowHeight: 1.1,
+    sill: 2.6,
+    glazingDamage: 0.9,
+    holes: [
+      { side: 'w', at: 44, width: 4.4, level: 0, height: 3.4 },
+      { side: 'n', at: 34, width: 3.2, level: 0, height: 3.2 },
+    ],
+    interior: 'ground',
+    interiorFloorKey: 'concreteWet',
+    ceilingKey: 'concreteDark',
+    raggedSides: ['s', 'e'],
+    raggedAmount: 1.5,
+    cornerCollapse: { x: f.x1 - 1.5, z: f.z1 - 1.5, radius: 4.0 },
+    seed: 3001,
+  });
+}
+
+/* ======================================================== apartment S ==== */
+
+/** Three storeys over an arched carriage passage — the only covered crossing. */
+function apartmentS(chunk: Chunk): BlockResult {
+  const f = FOOTPRINTS.apartmentS;
+  const res = buildBlock(chunk, {
+    name: 'apartmentS',
+    x0: f.x0, z0: f.z0, x1: f.x1, z1: f.z1,
+    storeys: 3,
+    groundHeight: 4.7,
+    storeyHeight: 3.15,
+    wallKey: 'plasterOchre',
+    groundKey: 'stone',
+    innerKey: 'plasterIntWarm',
+    trimKey: 'stoneTrim',
+    plinthKey: 'stone',
+    roofKind: 'pitched',
+    roofKey: 'roofTile',
+    ridgeAxis: 'x',
+    ridgeRise: 2.9,
+    windowSpacing: 3.0,
+    windowWidth: 1.2,
+    glazingDamage: 0.45,
+    openSides: ['n', 'w', 's', 'e'],
+    entrances: [{ side: 'n', at: -9, width: 1.35, open: 1.2 }],
+    balconies: [
+      { side: 'n', at: -6, width: 2.6, level: 1 },
+      { side: 'n', at: 6, width: 2.6, level: 1 },
+      { side: 'n', at: 0, width: 3.4, level: 2, depth: 1.3 },
+    ],
+    holes: [{ side: 'n', at: 9, width: 2.8, level: 2, height: 2.4 }],
+    // Carriage arch straight through the ground floor.
+    extraOpenings: [
+      { side: 'n', at: -1.0, width: 4.0, y: 0, height: 4.45, kind: 'arch' },
+      { side: 's', at: -1.0, width: 4.0, y: 0, height: 4.45, kind: 'arch' },
+    ],
+    interior: 'full',
+    interiorFloorKey: 'plank',
+    ceilingKey: 'plasterIntWarm',
+    stairwell: { x: -11.0, z: 39.0, dir: '+z', width: 1.3 },
+    partitions: [
+      { x0: -14, z0: 45, x1: 12, z1: 45, level: 1, door: 5 },
+      { x0: -14, z0: 45, x1: 12, z1: 45, level: 2, door: 19 },
+    ],
+    chimneys: [{ x: -8, z: 44.5, height: 1.8 }, { x: 6, z: 44.5, height: 1.8 }],
+    downpipes: [{ x: f.x0 - 0.2, z: f.z0 - 0.2 }, { x: f.x1 + 0.2, z: f.z0 - 0.2 }],
+    seed: 3101,
+  });
+
+  // The passage: a 4 m arch through the north and south walls with a barrel
+  // vault between them.
+  const north = rectWalls(f.x0, f.z0, f.x1, f.z1)[0];
+  const south = rectWalls(f.x0, f.z0, f.x1, f.z1)[2];
+  const passX = -1.0;
+  archOpening(chunk, north, 'stone', f.x1 - passX, 4.0, 2.4, 4.45, 0.5, 9, 'stoneTrim');
+  archOpening(chunk, south, 'stone', passX - f.x0, 4.0, 2.4, 4.45, 0.5, 9, 'stoneTrim');
+
+  const vault = chunk.m('stone');
+  const seg = 9;
+  for (let i = 0; i < seg; i++) {
+    const a0 = Math.PI * (i / seg);
+    const a1 = Math.PI * ((i + 1) / seg);
+    const am = (a0 + a1) * 0.5;
+    const r = 2.0;
+    const cx = passX - Math.cos(am) * (r + 0.14);
+    const cy = 2.4 + Math.sin(am) * (r + 0.14);
+    const w = (Math.PI * r) / seg * 0.62;
+    vault.pushTRS(cx, cy, (f.z0 + f.z1) * 0.5, 0, 0, am - Math.PI / 2);
+    vault.box(0, 0, 0, w, 0.14, (f.z1 - f.z0) * 0.5 - 0.4, 2.0);
+    vault.pop();
+  }
+  // passage side walls
+  for (const s of [-1, 1]) {
+    vault.boxMinMax(
+      passX + s * 2.0 - (s > 0 ? 0 : 0.35), -0.4, f.z0 + 0.35,
+      passX + s * 2.0 + (s > 0 ? 0.35 : 0), 2.6, f.z1 - 0.35, 2.2,
+    );
+  }
+  slab(chunk, 'cobble', passX - 2.0, f.z0, passX + 2.0, f.z1, 0.02, 0.3);
+
+  return res;
+}
+
+/* ====================================================== boundary ruins ==== */
+
+/**
+ * The map edge. Ruined facades and rubble berms so the play space is walled by
+ * something that reads as a bombed street rather than an invisible box, plus
+ * the (invisible) clip volumes that actually contain the player.
+ */
+export function buildBoundary(set: ChunkSet, clipParent: THREE.Object3D): void {
+  const rand = new Rand(3301);
+  const R = 56;
+
+  const ruinRun = (name: string, ax: number, az: number, bx: number, bz: number, seed: number) => {
+    const chunk = set.get(name);
+    const frame = new WallFrame(ax, az, bx, bz);
+    const len = frame.length;
+    const units = Math.max(1, Math.round(len / 9));
+    const local = new Rand(seed);
+    for (let i = 0; i < units; i++) {
+      const u0 = (len * i) / units;
+      const u1 = (len * (i + 1)) / units;
+      const h = local.range(4.5, 9.5);
+      const sub = new WallFrame(
+        ax + (bx - ax) * (u0 / len), az + (bz - az) * (u0 / len),
+        ax + (bx - ax) * (u1 / len), az + (bz - az) * (u1 / len),
+      );
+      const openings: Opening[] = [];
+      const winCount = Math.max(1, Math.floor((u1 - u0) / 3.2));
+      for (let k = 0; k < winCount; k++) {
+        openings.push({
+          u: ((u1 - u0) / winCount) * (k + 0.5), width: 1.3,
+          sill: 1.0, height: 1.8, kind: 'hole', noTrim: true,
+        });
+        if (h > 6.5) {
+          openings.push({
+            u: ((u1 - u0) / winCount) * (k + 0.5), width: 1.3,
+            sill: 4.2, height: 1.8, kind: 'hole', noTrim: true,
+          });
+        }
+      }
+      wall(chunk, sub, {
+        key: local.bool(0.5) ? 'brickSoot' : 'plasterGrey',
+        y0: -0.5, y1: h, thickness: 0.5, openings,
+        ragged: { amplitude: 1.9, seed: seed + i * 13, rebar: true },
+        innerKey: 'brickSoot',
+      });
+    }
+  };
+
+  ruinRun('edgeN', R, -R, -R, -R, 3311);
+  ruinRun('edgeW', -R, -R, -R, R, 3321);
+  ruinRun('edgeS', -R, R, R, R, 3331);
+  ruinRun('edgeE', R, R, R, -R, 3341);
+
+  // Rubble berm banked against the inside of the ruins.
+  const berm = set.get('edgeBerm');
+  const heap = berm.m('concreteDark');
+  const brickHeap = berm.m('brickSoot');
+  for (let i = 0; i < 900; i++) {
+    const edge = i % 4;
+    const t = rand.next();
+    let x = 0, z = 0;
+    const inset = rand.range(0.4, 4.2);
+    if (edge === 0) { x = -R + t * 2 * R; z = -R + inset; }
+    else if (edge === 1) { x = R - inset; z = -R + t * 2 * R; }
+    else if (edge === 2) { x = -R + t * 2 * R; z = R - inset; }
+    else { x = -R + inset; z = -R + t * 2 * R; }
+    const s = rand.range(0.18, 0.75) * (1 - inset / 5);
+    if (s < 0.06) continue;
+    const m = rand.bool(0.5) ? heap : brickHeap;
+    m.pushTRS(x, s * 0.55, z, rand.next() * Math.PI, rand.range(-0.5, 0.5), rand.range(-0.5, 0.5));
+    m.box(0, 0, 0, s, s * rand.range(0.4, 0.9), s * rand.range(0.6, 1.4), 1.0);
+    m.pop();
+  }
+
+  // Invisible clip ring: guarantees containment regardless of rubble geometry.
+  const clipGeo = new THREE.BoxGeometry(1, 1, 1);
+  const clipMat = new THREE.MeshBasicMaterial({ visible: false });
+  const bounds = R - 0.6;
+  const spans: [number, number, number, number][] = [
+    [0, -bounds, 2 * bounds + 4, 1],
+    [0, bounds, 2 * bounds + 4, 1],
+    [-bounds, 0, 1, 2 * bounds + 4],
+    [bounds, 0, 1, 2 * bounds + 4],
+  ];
+  for (const [cx, cz, sx, sz] of spans) {
+    const m = new THREE.Mesh(clipGeo, clipMat);
+    m.position.set(cx, 9, cz);
+    m.scale.set(sx, 26, sz);
+    m.visible = false;
+    m.userData.collideWhenHidden = true;
+    m.userData.physicsShape = 'box';
+    m.userData.navIgnore = false;
+    m.name = 'clip';
+    m.matrixAutoUpdate = false;
+    m.updateMatrix();
+    clipParent.add(m);
+  }
+}
+
+/* -------------------------------------------------------------- exports -- */
+
+export { column, cable, doorUnit, parapet, roofFlat, cornice, chimney, downpipe };

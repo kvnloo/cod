@@ -54,9 +54,9 @@ export interface FactionStyle {
 
 /** Linear-ish sRGB tints; the atlas supplies the pattern, these supply the hue. */
 const SKIN_TONES: number[][] = [
-  [0.86, 0.68, 0.55], [0.78, 0.59, 0.46], [0.68, 0.49, 0.37],
-  [0.55, 0.38, 0.28], [0.42, 0.28, 0.21], [0.33, 0.21, 0.16],
-  [0.90, 0.74, 0.62], [0.72, 0.54, 0.42],
+  [0.82, 0.70, 0.62], [0.75, 0.62, 0.54], [0.66, 0.53, 0.45],
+  [0.54, 0.43, 0.36], [0.42, 0.33, 0.28], [0.33, 0.26, 0.22],
+  [0.86, 0.75, 0.68], [0.70, 0.58, 0.50],
 ];
 
 export const FACTION_STYLES: Record<CharacterFaction, FactionStyle> = {
@@ -70,7 +70,7 @@ export const FACTION_STYLES: Record<CharacterFaction, FactionStyle> = {
     hard: [0.22, 0.22, 0.21],
     glove: [0.24, 0.20, 0.17],
     head: [['none', 0.20], ['cap', 0.22], ['beanie', 0.18], ['boonie', 0.14], ['helmet', 0.26]],
-    face: [['none', 0.30], ['balaclava', 0.26], ['shemagh', 0.28], ['halfMask', 0.16]],
+    face: [['none', 0.16], ['balaclava', 0.30], ['shemagh', 0.30], ['halfMask', 0.24]],
     eyes: [['none', 0.52], ['glasses', 0.20], ['goggles', 0.28]],
     carrier: [['none', 0.16], ['chestRig', 0.50], ['plate', 0.34]],
     pNvg: 0.05, pHeadset: 0.22, pBackpack: 0.30, pKneePads: 0.20, pGloves: 0.55, pPatch: 0.15,
@@ -85,7 +85,7 @@ export const FACTION_STYLES: Record<CharacterFaction, FactionStyle> = {
     hard: [0.42, 0.38, 0.30],
     glove: [0.30, 0.26, 0.22],
     head: [['helmet', 0.60], ['helmetCover', 0.26], ['cap', 0.08], ['boonie', 0.06]],
-    face: [['none', 0.34], ['balaclava', 0.22], ['halfMask', 0.30], ['shemagh', 0.14]],
+    face: [['none', 0.18], ['balaclava', 0.28], ['halfMask', 0.40], ['shemagh', 0.14]],
     eyes: [['goggles', 0.44], ['glasses', 0.30], ['none', 0.16], ['visor', 0.10]],
     carrier: [['plate', 0.62], ['heavy', 0.24], ['chestRig', 0.14]],
     pNvg: 0.55, pHeadset: 0.85, pBackpack: 0.45, pKneePads: 0.70, pGloves: 0.92, pPatch: 0.75,
@@ -171,6 +171,10 @@ export interface Appearance {
   wear: number;
 }
 
+function lumOf(c: number[]): number {
+  return c[0] * 0.2126 + c[1] * 0.7152 + c[2] * 0.0722;
+}
+
 function weighted<T extends string>(rand: Rand, table: [T, number][]): T {
   let total = 0;
   for (const [, w] of table) total += w;
@@ -179,13 +183,22 @@ function weighted<T extends string>(rand: Rand, table: [T, number][]): T {
   return table[table.length - 1][0];
 }
 
-function tint(base: number[], rand: Rand, spread: number): THREE.Color {
-  const j = 1 + rand.signed() * spread;
-  const h = rand.signed() * spread * 0.35;
+/**
+ * Turns a palette colour into a *modulation* tint.
+ *
+ * The camo atlas already carries the colour of the cloth; a tint whose average
+ * is 0.4 would multiply that down to mud. So each palette entry is normalised
+ * to unit luminance — it contributes hue and nothing else — and `level` sets how
+ * light or dark the part should be relative to the texture as authored.
+ */
+function tint(base: number[], rand: Rand, spread: number, level = 1): THREE.Color {
+  const lum = Math.max(1e-3, base[0] * 0.2126 + base[1] * 0.7152 + base[2] * 0.0722);
+  const j = level * (1 + rand.signed() * spread);
+  const h = rand.signed() * spread * 0.4;
   return new THREE.Color(
-    Math.max(0.02, base[0] * (j + h)),
-    Math.max(0.02, base[1] * j),
-    Math.max(0.02, base[2] * (j - h)),
+    Math.max(0.02, (base[0] / lum) * (j + h)),
+    Math.max(0.02, (base[1] / lum) * j),
+    Math.max(0.02, (base[2] / lum) * (j - h)),
   );
 }
 
@@ -235,7 +248,7 @@ export function makeAppearance(opts: CharacterOptions): Appearance {
     faceGear: weighted(rand, style.face),
     eyeGear: weighted(rand, style.eyes),
     carrier,
-    sleeves: rand.bool(0.22) ? 'rolled' : (rand.bool(0.08) ? 'short' : 'long'),
+    sleeves: rand.bool(0.12) ? 'rolled' : 'long',
     nvg: helmeted && rand.bool(style.pNvg),
     nvgDown: rand.bool(0.18),
     headset: rand.bool(style.pHeadset),
@@ -250,15 +263,16 @@ export function makeAppearance(opts: CharacterOptions): Appearance {
     shoulderPatchSide: rand.bool(0.5) ? 1 : -1,
     kneePadSide: rand.bool(0.75) ? 0 : (rand.bool(0.5) ? 1 : -1),
 
-    uniformTint: tint(uniformBase, rand, 0.13),
-    webbingTint: tint(style.webbing, rand, 0.12),
-    hardTint: tint(style.hard, rand, 0.10),
-    gloveTint: tint(style.glove, rand, 0.10),
-    bootTint: tint([0.19, 0.16, 0.14], rand, 0.16),
-    skinTint: new THREE.Color(
-      SKIN_TONES[skinIdx][0], SKIN_TONES[skinIdx][1], SKIN_TONES[skinIdx][2],
-    ),
-    accentTint: tint([0.45, 0.32, 0.16], rand, 0.25),
+    uniformTint: tint(uniformBase, rand, 0.10, 1.02),
+    webbingTint: tint(style.webbing, rand, 0.09, 0.88),
+    hardTint: tint(style.hard, rand, 0.08, 0.62),
+    gloveTint: tint(style.glove, rand, 0.08, 0.50),
+    bootTint: tint([0.19, 0.16, 0.14], rand, 0.12, 0.46),
+    // The skin recipe is authored at a light-mid tone; the tint carries the
+    // character's own tone as a ratio against it, so the spread survives
+    // normalisation.
+    skinTint: tint(SKIN_TONES[skinIdx], rand, 0.035, (lumOf(SKIN_TONES[skinIdx]) / 0.709) * 0.80),
+    accentTint: tint([0.45, 0.32, 0.16], rand, 0.18, 0.85),
     wear,
   };
 

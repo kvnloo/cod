@@ -373,7 +373,9 @@ export class Mesher {
     for (let i = 0; i < segments; i++) {
       const j = (i + 1) % count;
       if (!closed && i + 1 >= count) break;
-      this.quadIdx(ring0[i], ring0[j], ring1[j], ring1[i]);
+      // Wound so the outward face is front-facing: cross(b-a, c-a) must point
+      // along the surface normal, not against it.
+      this.quadIdx(ring0[i], ring1[i], ring1[j], ring0[j]);
     }
 
     if (capTop && radiusTop > 1e-5) {
@@ -387,7 +389,7 @@ export class Mesher {
       for (let i = 0; i < segments; i++) {
         const j = (i + 1) % count;
         if (!closed && i + 1 >= count) break;
-        this.tri(centre, ring[i], ring[j]);
+        this.tri(centre, ring[j], ring[i]);
       }
     }
     if (capBottom && radiusBottom > 1e-5) {
@@ -401,7 +403,7 @@ export class Mesher {
       for (let i = 0; i < segments; i++) {
         const j = (i + 1) % count;
         if (!closed && i + 1 >= count) break;
-        this.tri(centre, ring[j], ring[i]);
+        this.tri(centre, ring[i], ring[j]);
       }
     }
   }
@@ -484,7 +486,7 @@ export class Mesher {
     }
     for (let j = 0; j < radialSeg; j++) {
       for (let i = 0; i < tubularSeg; i++) {
-        this.quadIdx(grid[j][i], grid[j + 1][i], grid[j + 1][i + 1], grid[j][i + 1]);
+        this.quadIdx(grid[j][i], grid[j][i + 1], grid[j + 1][i + 1], grid[j + 1][i]);
       }
     }
   }
@@ -594,7 +596,7 @@ export class Mesher {
         const v1 = this.vertex(b.x, y0, b.y, nx, 0, nz, u1, y0 * s);
         const v2 = this.vertex(b.x, y1, b.y, nx, 0, nz, u1, y1 * s);
         const v3 = this.vertex(a.x, y1, a.y, nx, 0, nz, u0, y1 * s);
-        this.quadIdx(v0, v1, v2, v3);
+        this.quadIdx(v3, v2, v1, v0);
       }
     }
 
@@ -602,11 +604,11 @@ export class Mesher {
       const faces = THREE.ShapeUtils.triangulateShape(points, []);
       if (capTop) {
         const ids = points.map((p) => this.vertex(p.x, y1, p.y, 0, 1, 0, p.x * s, p.y * s));
-        for (const f of faces) this.tri(ids[f[0]], ids[f[1]], ids[f[2]]);
+        for (const f of faces) this.tri(ids[f[2]], ids[f[1]], ids[f[0]]);
       }
       if (capBottom) {
         const ids = points.map((p) => this.vertex(p.x, y0, p.y, 0, -1, 0, p.x * s, p.y * s));
-        for (const f of faces) this.tri(ids[f[2]], ids[f[1]], ids[f[0]]);
+        for (const f of faces) this.tri(ids[f[0]], ids[f[1]], ids[f[2]]);
       }
     }
   }
@@ -640,7 +642,8 @@ export class Mesher {
     }
     for (let j = 0; j < nz; j++) {
       for (let i = 0; i < nx; i++) {
-        this.quadIdx(rows[j][i], rows[j][i + 1], rows[j + 1][i + 1], rows[j + 1][i]);
+        // +Y facing: (a, b, c) must wind counter-clockwise seen from above.
+        this.quadIdx(rows[j][i], rows[j + 1][i], rows[j + 1][i + 1], rows[j][i + 1]);
       }
     }
   }

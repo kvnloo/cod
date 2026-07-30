@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>Blackout — character test bed</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #05070a; }
+    #app { position: fixed; inset: 0; }
+    canvas#viewport { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+    #ui-root { position: absolute; inset: 0; pointer-events: none; }
+    #fatal { position: absolute; inset: 0; display: none; padding: 32px; background: #07090d; z-index: 50; }
+    #fatal.show { display: block; }
+    #fatal pre { font: 12px/1.6 ui-monospace, monospace; color: #ff8f7a; white-space: pre-wrap; }
+  </style>
+</head>
+
+<body>
+  <div id="app">
+    <canvas id="viewport"></canvas>
+    <div id="ui-root"></div>
+    <div id="fatal"><pre id="fatal-text"></pre></div>
+  </div>
+  <!--
+    Vite's HMR client reloads the page whenever *any* module in the project
+    changes. Several agents edit this repo concurrently, so a capture run would
+    be navigated away mid-shot. Stubbing the HMR socket keeps the page alive;
+    reload manually to pick up edits.
+  -->
+  <script>
+    (function () {
+      const Real = window.WebSocket;
+      function Stub() {
+        return {
+          readyState: 3, protocol: 'vite-hmr',
+          addEventListener() { }, removeEventListener() { }, send() { }, close() { },
+          set onmessage(_v) { }, set onopen(_v) { }, set onclose(_v) { }, set onerror(_v) { },
+        };
+      }
+      window.WebSocket = function (url, protocols) {
+        const p = Array.isArray(protocols) ? protocols.join(',') : String(protocols ?? '');
+        if (p.includes('vite') || String(url).includes('vite')) return Stub();
+        return new Real(url, protocols);
+      };
+      window.WebSocket.prototype = Real.prototype;
+    })();
+  </script>
+  <script type="module" src="./boot.ts"></script>
+</body>
+
+</html>

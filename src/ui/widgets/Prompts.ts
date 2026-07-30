@@ -1,0 +1,212 @@
+/**
+ * Contextual prompts.
+ *
+ *  · interaction prompt with a hold progress ring driven by the real `use` action
+ *  · reload prompt when the magazine runs dry
+ *  · low-ammo warning
+ *  · "you are down" / spectate line
+ *
+ * The hold ring is the piece with teeth: it reads `input.held('use')` directly,
+ * accumulates against the prompt's own duration, snaps back with a spring if the
+ * player lets go early, and emits a completion cue on the bus. Gameplay only has
+ * to publish the prompt and listen for the completion.
+ */
+
+import { bus } from '../../core/EventBus';
+import { input } from '../../core/Input';
+import { clamp01, damp, Ease, Envelope, motion, Spring, SPRING } from '../Anim';
+import { chamferPath, hairWidth, measureText, text } from '../Draw';
+import type { DrawCtx } from '../Draw';
+import type { HudModel } from '../Model';
+import { lift, rgba, type Palette } from '../Theme';
+import type { UiPromptRequest } from '../UiEvents';
+import type { Widget } from './Widget';
+
+export class Prompts implements Widget {
+  readonly name = 'prompts';
+
+  private prompt: UiPromptRequest | null = null;
+  private progress = 0;
+  private readonly appear = new Spring(0, SPRING.snappy);
+  private readonly complete = new Envelope(0.05, 0.06, 0.42);
+  private readonly off: Array<() => void> = [];
+  private t = 0;
+  /** Seconds of decay suppression after an external `setProgress`. */
+  private externalHold = 0;
+
+  constructor(private pal: () => Palette) {
+    this.off.push(bus.on('ui:prompt', (e) => this.show(e.prompt)));
+  }
+
+  show(prompt: UiPromptRequest | null): void {
+    if (!prompt) { this.prompt = null; this.appear.to(0); return; }
+    if (this.prompt?.id !== prompt.id) this.progress = 0;
+    this.prompt = prompt;
+    this.appear.to(1);
+    this.appear.kick(7);
+  }
+
+  /**
+   * Externally driven progress, for holds simulated by gameplay or posed by a
+   * capture. Suppresses the auto-rewind for a beat so the value survives the
+   * frames that follow the call.
+   */
+  setProgress(v: number): void {
+    this.progress = clamp01(v);
+    this.externalHold = 0.75;
+  }
+
+  update(dt: number, m: HudModel): void {
+    this.t += dt;
+    this.appear.to(this.prompt && !m.menuOpen ? 1 : 0);
+    this.appear.step(dt);
+    this.complete.step(dt);
+
+    if (this.externalHold > 0) this.externalHold = Math.max(0, this.externalHold - dt);
+
+    const p = this.prompt;
+    if (p && p.hold && p.hold > 0) {
+      if (input.held('use')) {
+        this.externalHold = 0;
+        this.progress += dt / p.hold;
+        if (this.progress >= 1) {
+          this.progress = 1;
+          this.complete.fire();
+          bus.emit('ui:sound', { cue: 'promptComplete' });
+          this.prompt = null;
+          this.appear.to(0);
+        }
+      } else if (this.externalHold <= 0) {
+        // Releasing early rewinds rather than snapping to zero.
+        this.progress = damp(this.progress, 0, 6.5, dt);
+        if (this.progress < 0.002) this.progress = 0;
+      }
+    }
+  }
+
+  draw(d: DrawCtx, m: HudModel): void {
+    const p = this.pal();
+    const c = d.c;
+    const s = d.s;
+    const cx = d.w / 2;
+
+    /* --------------------------------------------- interaction prompt -- */
+    const vis = this.appear.value;
+    if (vis > 0.004 && this.prompt) {
+      const q = this.prompt;
+      const y = d.h * 0.605 + (1 - Ease.outBack(clamp01(vis))) * 12 * s * motion();
+      const r = 17 * s;
+
+      c.save();
+      c.globalAlpha = d.alpha * clamp01(vis);
+
+      // Key cap.
+      const capR = r * 0.72;
+      chamferPath(c, cx - capR, y - capR, capR * 2, capR * 2, 4 * s);
+      c.fillStyle = 'rgba(6,10,16,0.72)';
+      c.fill();
+      c.lineWidth = Math.max(1, 1.2 * s);
+      c.strokeStyle = rgba(p.ink, 0.7);
+      c.stroke();
+      text(c, q.key ?? 'F', cx, y + capR * 0.42, {
+        size: 16 * s, weight: 700, family: 'cond', align: 'center',
+        color: rgba(p.ink, 1),
+      });
+
+      // Hold ring.
+      if (q.hold && q.hold > 0) {
+        c.lineWidth = Math.max(1.6, 2.6 * s);
+        c.strokeStyle = rgba(p.hair, 0.22);
+        c.beginPath();
+        c.arc(cx, y, r, 0, Math.PI * 2);
+        c.stroke();
+
+        if (this.progress > 0.001) {
+          c.strokeStyle = rgba(lift(p.accent, 0.25), 1);
+          c.lineCap = 'round';
+          c.beginPath();
+          c.arc(cx, y, r, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * this.progress);
+          c.stroke();
+          c.lineCap = 'butt';
+          // Leading dot.
+          const a = -Math.PI / 2 + Math.PI * 2 * this.progress;
+          c.fillStyle = rgba(lift(p.accent, 0.5), 1);
+          c.beginPath();
+          c.arc(cx + Math.cos(a) * r, y + Math.sin(a) * r, 2.4 * s, 0, Math.PI * 2);
+          c.fill();
+        }
+      }
+
+      // Label + detail.
+      text(c, q.label.toUpperCase(), cx, y + r + 20 * s, {
+        size: 15 * s, weight: 600, family: 'cond', tracking: 4.2 * s, align: 'center',
+        color: rgba(p.ink, 0.96), shadow: Math.max(1, 1.3 * s),
+      });
+      if (q.detail) {
+        text(c, q.detail.toUpperCase(), cx, y + r + 34 * s, {
+          size: 10.5 * s, weight: 500, family: 'cond', tracking: 3 * s, align: 'center',
+          color: rgba(p.inkDim, 0.85),
+        });
+      }
+      c.restore();
+    }
+
+    // Completion flash.
+    const done = this.complete.level;
+    if (done > 0.01) {
+      c.save();
+      c.globalAlpha = d.alpha * done;
+      c.strokeStyle = rgba(lift(p.accent, 0.4), 1);
+      c.lineWidth = Math.max(1, 2 * s * done);
+      c.beginPath();
+      c.arc(cx, d.h * 0.605, (17 + (1 - done) * 26) * s, 0, Math.PI * 2);
+      c.stroke();
+      c.restore();
+    }
+
+    /* ------------------------------------------------- reload / ammo --- */
+    const w = m.weapon;
+    if (w.ammo <= 0 && !w.reloading && m.alive) {
+      const pulse = 0.65 + 0.35 * Math.sin(this.t * 8.5) * motion();
+      c.save();
+      c.globalAlpha = d.alpha;
+      text(c, 'RELOAD', cx, d.h * 0.455, {
+        size: 22 * s, weight: 700, family: 'cond', tracking: 7 * s, align: 'center',
+        color: rgba(lift(p.hostile, 0.72), 0.75 + 0.25 * pulse),
+        shadow: Math.max(1.4, 2 * s),
+        glow: 18 * s, glowColor: rgba(p.hostile, 0.85 * pulse),
+      });
+      text(c, '[ R ]', cx, d.h * 0.455 + 16 * s, {
+        size: 11 * s, weight: 600, family: 'mono', tracking: 2 * s, align: 'center',
+        color: rgba(p.inkDim, 0.9),
+      });
+      c.restore();
+    } else if (w.magSize > 0 && w.ammo / w.magSize <= 0.25 && w.ammo > 0 && !w.reloading) {
+      c.save();
+      c.globalAlpha = d.alpha * 0.9;
+      text(c, 'LOW AMMO', cx, d.h * 0.455, {
+        size: 13 * s, weight: 600, family: 'cond', tracking: 5.5 * s, align: 'center',
+        color: rgba(p.warn, 0.55 + 0.3 * Math.sin(this.t * 5) * motion()),
+        shadow: Math.max(1, 1.2 * s),
+      });
+      c.restore();
+    }
+
+    /* ------------------------------------------------------- downed ---- */
+    if (!m.alive) {
+      c.save();
+      c.globalAlpha = d.alpha;
+      text(c, 'YOU ARE DOWN', cx, d.h * 0.5, {
+        size: 34 * s, weight: 700, family: 'cond', tracking: 9 * s, align: 'center',
+        color: rgba(p.hostile, 0.95), shadow: Math.max(1.4, 2 * s),
+        glow: 18 * s, glowColor: rgba(p.hostile, 0.4),
+      });
+      c.restore();
+    }
+  }
+
+  dispose(): void {
+    for (const f of this.off) f();
+    this.off.length = 0;
+  }
+}

@@ -125,6 +125,7 @@ export class HudModel {
     { name: 'CLUSTER STRIKE', short: 'CLST', cost: 7, progress: 0, ready: false, charges: 0, flash: 0 },
   ];
 
+
   /* --- objectives / match ------------------------------------------- */
   readonly objectives = new Map<string, UiObjectiveMarker>();
   readonly match: MatchView = {
@@ -137,6 +138,8 @@ export class HudModel {
 
   /* --- player transform --------------------------------------------- */
   readonly position = new THREE.Vector3();
+  /** Live camera, for widgets that project world points to the overlay. */
+  camera: THREE.PerspectiveCamera | null = null;
   /** Compass bearing in degrees, 0 = north (−Z), increasing clockwise. */
   bearing = 0;
   pitch = 0;
@@ -154,6 +157,13 @@ export class HudModel {
   recoil = 0;
 
   /* --- flags -------------------------------------------------------- */
+  /**
+   * When false the model stops mirroring gameplay systems and is driven purely
+   * by bus events. Debug scenes disable the gameplay systems and set this false
+   * so the HUD can be posed into any state.
+   */
+  syncMirrors = true;
+
   scoreboardOpen = false;
   menuOpen = false;
   paused = false;
@@ -259,7 +269,7 @@ export class HudModel {
       const slot = this.streaks[e.slot];
       if (!slot) return;
       slot.name = e.name.toUpperCase();
-      slot.short = e.name.slice(0, 4).toUpperCase();
+      slot.short = shortStreakName(e.name);
       const becameReady = e.ready && !slot.ready;
       slot.progress = clamp01(e.progress);
       slot.ready = e.ready;
@@ -299,6 +309,7 @@ export class HudModel {
 
   /** Pulls authoritative numbers from gameplay systems when they exist. */
   private syncFromMirrors(force: boolean): void {
+    if (!this.syncMirrors) return;
     const cur = this.weapons?.current;
     if (cur) {
       if (typeof cur.name === 'string') this.weapon.name = cur.name.toUpperCase();
@@ -326,6 +337,7 @@ export class HudModel {
 
     /* --- transform, bearing, speed ---------------------------------- */
     const cam = ctx.camera;
+    this.camera = cam;
     cam.getWorldDirection(FORWARD);
     this.bearing = (Math.atan2(FORWARD.x, -FORWARD.z) * 180) / Math.PI;
     if (this.bearing < 0) this.bearing += 360;
@@ -404,6 +416,21 @@ export class HudModel {
     for (const d of this.disposers) d();
     this.disposers.length = 0;
   }
+}
+
+/**
+ * Compact tile label for a killstreak: "UAV" → UAV, "COUNTER UAV" → CUAV,
+ * "CLUSTER STRIKE" → CLST. Naive truncation produces "COUN", which looks broken.
+ */
+export function shortStreakName(name: string): string {
+  const words = name.toUpperCase().trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return '';
+  if (words.length === 1) return words[0].slice(0, 4);
+  const last = words[words.length - 1];
+  if (last.length <= 4) {
+    return words.slice(0, -1).map((w) => w[0]).join('') + last;
+  }
+  return words[0].slice(0, 2) + last.slice(0, 2);
 }
 
 /** Maps a weapon id to the glyph family used by the killfeed. */

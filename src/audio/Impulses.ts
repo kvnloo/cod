@@ -22,7 +22,7 @@
  */
 
 import { Rand } from '../core/Rand';
-import { Biquad, clamp, lerp } from './Dsp';
+import { Biquad, clamp, lerp, type F32 } from './Dsp';
 import type { ImpulseId, ImpulseSpec } from './types';
 
 export const IMPULSE_SPECS: Record<ImpulseId, ImpulseSpec> = {
@@ -175,7 +175,7 @@ export interface ImpulseRenderOptions {
  */
 export function renderImpulse(
   sampleRate: number, spec: ImpulseSpec, opts: ImpulseRenderOptions = {},
-): [Float32Array, Float32Array] {
+): [F32, F32] {
   const lengthScale = opts.lengthScale ?? 1;
   const densityScale = opts.densityScale ?? 1;
   const rand = new Rand(`ir:${spec.id}:${opts.seed ?? 0}`);
@@ -184,7 +184,7 @@ export function renderImpulse(
   const n = Math.ceil(seconds * sampleRate);
   const pre = Math.floor(spec.predelay * sampleRate);
 
-  const channels: [Float32Array, Float32Array] = [new Float32Array(n), new Float32Array(n)];
+  const channels: [F32, F32] = [new Float32Array(n), new Float32Array(n)];
 
   /* --- diffuse tail --------------------------------------------------- */
   const impulsesPerSecond = lerp(340, 6200, spec.density) * densityScale;
@@ -268,12 +268,20 @@ export function renderImpulse(
   }
 
   // Energy-normalise so swapping IRs does not change perceived wet level.
+  //
+  // The target matters enormously: for a noise-like input the convolver's
+  // output RMS is the input RMS times sqrt(sum h[n]^2), so an IR carrying an
+  // energy of E multiplies the send by sqrt(E). Unity energy therefore means
+  // "wet is as loud as dry", and the send gains alone decide the wet/dry
+  // balance. Getting this wrong by a factor of the sample rate — which is the
+  // natural mistake, because normalising to a *duration* feels right — buries
+  // every sound under a wall of reverb.
   let energy = 0;
   for (let c = 0; c < 2; c++) {
     const d = channels[c];
     for (let i = 0; i < n; i++) energy += d[i] * d[i];
   }
-  const targetEnergy = 0.09 * sampleRate;
+  const targetEnergy = 0.5;
   const g = energy > 1e-9 ? Math.sqrt(targetEnergy / energy) : 1;
   for (let c = 0; c < 2; c++) {
     const d = channels[c];

@@ -126,6 +126,8 @@ export const AI_WEAPONS: Record<CharacterLoadout, AIWeaponSpec> = {
  */
 export interface TargetLike {
   readonly entityId: number;
+  /** True when damage should be routed to the player via `damage:taken`. */
+  readonly isPlayer: boolean;
   readonly position: THREE.Vector3;
   readonly velocity: THREE.Vector3;
   readonly alive: boolean;

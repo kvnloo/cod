@@ -175,6 +175,9 @@ export class Progression {
 
   constructor(private emit: Emitter, private storage: Storage | null = safeStorage()) { }
 
+  /** Swap the backing store; `null` makes the profile purely in-memory. */
+  setStorage(storage: Storage | null): void { this.storage = storage; }
+
   load(): void {
     if (!this.storage) return;
     try {

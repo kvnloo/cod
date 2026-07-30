@@ -42,6 +42,8 @@ export interface UiPrefs {
   damageNumbers: boolean;
   /** Metric vs imperial in the compass/objective distance readout. */
   units: 'metric' | 'imperial';
+  /** Persisted key rebindings: action name → KeyboardEvent.code. */
+  binds: Record<string, string>;
 }
 
 export const DEFAULT_UI_PREFS: UiPrefs = {
@@ -60,6 +62,7 @@ export const DEFAULT_UI_PREFS: UiPrefs = {
   lowHealthEffects: true,
   damageNumbers: true,
   units: 'metric',
+  binds: {},
 };
 
 const STORAGE_KEY = 'blackout.ui.v1';
@@ -75,7 +78,7 @@ class UiSettingsStore {
         for (const k of Object.keys(this.prefs) as Array<keyof UiPrefs>) {
           if (data[k] !== undefined) {
             // Runtime shapes are validated by construction: only keys we own.
-            (this.prefs as Record<string, unknown>)[k] = data[k] as unknown;
+            (this.prefs as unknown as Record<string, unknown>)[k] = data[k];
           }
         }
       }
@@ -93,6 +96,19 @@ class UiSettingsStore {
     if (key === 'motion') setMotionAmount(this.prefs.motion);
     this.save();
     bus.emit('settings:changed', { key: `ui.${String(key)}`, value });
+  }
+
+  /** Records a rebinding. Object identity changes, so this bypasses `set`. */
+  setBind(action: string, code: string): void {
+    this.prefs.binds = { ...this.prefs.binds, [action]: code };
+    this.save();
+    bus.emit('settings:changed', { key: 'ui.binds', value: this.prefs.binds });
+  }
+
+  clearBinds(): void {
+    this.prefs.binds = {};
+    this.save();
+    bus.emit('settings:changed', { key: 'ui.binds', value: this.prefs.binds });
   }
 
   reset(): void {

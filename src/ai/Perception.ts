@@ -234,15 +234,29 @@ export class Perception {
     this.hasInterest = true;
   }
 
-  /** Squad-shared contact: believable but weaker than seeing it yourself. */
-  share(position: THREE.Vector3, velocity: THREE.Vector3, confidence: number, now: number): void {
+  /**
+   * Squad-shared contact: believable but weaker than seeing it yourself.
+   *
+   * `escalate` is set when a squadmate is *certain* — someone has eyes on and is
+   * calling it. Then everyone goes weapons-hot even without their own line of
+   * sight, which is what makes a squad converge on you instead of half of them
+   * standing around waiting to see you personally.
+   */
+  share(
+    position: THREE.Vector3, velocity: THREE.Vector3, confidence: number, now: number,
+    escalate = false,
+  ): void {
     void now;
     if (confidence <= this.confidence && this.timeSinceSeen < 0.6) return;
     this.lastKnown.copy(position);
     this.lastKnownVelocity.copy(velocity);
     this.confidence = Math.max(this.confidence, confidence * 0.85);
-    this.awareness = Math.max(this.awareness, 0.62);
+    this.awareness = Math.max(this.awareness, escalate ? 0.999 : 0.62);
     this.timeSinceStimulus = 0;
+    if (escalate && this.state !== 'combat') {
+      this.state = 'combat';
+      this.hasContact = true;
+    }
     if (!this.hasLOS) { this.interest.copy(position); this.hasInterest = true; }
   }
 
@@ -369,7 +383,6 @@ export class Perception {
       // there, you do not know exactly what or where.
       const cap = heardFromTarget ? 0.92 : 0.7;
       const add = heardStrength * 2.4 * dt * profile.perceptionScale;
-      this.awareness = Math.min(Math.max(this.awareness, 0), cap === 0 ? 1 : 1);
       if (this.awareness < cap) this.awareness = Math.min(cap, this.awareness + add);
       this.timeSinceStimulus = 0;
       if (heardFromTarget && heardStrength > 0.55) {

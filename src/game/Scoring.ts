@@ -107,9 +107,13 @@ export class Scoring {
     this.emit('hud:score', { amount, reason, total: this.state.score });
   }
 
-  registerShot(hit: boolean): void {
-    this.state.shotsFired++;
-    if (hit) this.state.shotsHit++;
+  /** One round left the muzzle. */
+  registerShot(): void { this.state.shotsFired++; }
+
+  /** One round connected. Kept separate so a hit is not also counted as fired. */
+  registerHit(): void {
+    this.state.shotsHit++;
+    if (this.state.shotsHit > this.state.shotsFired) this.state.shotsFired = this.state.shotsHit;
   }
 
   assist(): void {

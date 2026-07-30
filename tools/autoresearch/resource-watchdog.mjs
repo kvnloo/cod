@@ -12,6 +12,21 @@ function cgroupAllowed(cgroup, allowed) {
   return allowed.some((group) => cgroup === group || cgroup?.startsWith(`${group}/`));
 }
 
+function descendantPids(processes, rootPid) {
+  const allowed = new Set([rootPid]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const item of processes) {
+      if (!allowed.has(item.pid) && allowed.has(item.ppid)) {
+        allowed.add(item.pid);
+        changed = true;
+      }
+    }
+  }
+  return allowed;
+}
+
 export function parsePmon(text) {
   const rows = [];
   for (const line of text.split(/\r?\n/)) {
@@ -65,10 +80,11 @@ async function main() {
     const started = Date.now();
     const processes = await listProcesses();
     const byPid = new Map(processes.map((item) => [item.pid, item]));
+    const allowedPids = descendantPids(processes, config.parentPid);
     const elapsed = Math.max(0.001, (started - previousAt) / 1000);
     if (previous.size) {
       for (const item of processes) {
-        if (cgroupAllowed(item.cgroup, allowed)) continue;
+        if (allowedPids.has(item.pid) || cgroupAllowed(item.cgroup, allowed)) continue;
         const before = previous.get(item.pid);
         if (!before || before.startTime !== item.startTime) continue;
         const cpu = 100 * (item.cpuTicks - before.cpuTicks) / clock / elapsed;
@@ -81,7 +97,7 @@ async function main() {
       }
       for (const gpu of gpuProcesses()) {
         const item = byPid.get(gpu.pid);
-        if (item && !cgroupAllowed(item.cgroup, allowed) && gpu.sm > config.maxExternalGpuPercent) {
+        if (item && !allowedPids.has(item.pid) && !cgroupAllowed(item.cgroup, allowed) && gpu.sm > config.maxExternalGpuPercent) {
           evidence.violations.push({
             at: new Date().toISOString(), resource: 'gpu', pid: item.pid,
             command: item.comm, cgroup: item.cgroup, percent: gpu.sm,

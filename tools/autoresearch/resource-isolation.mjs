@@ -17,6 +17,7 @@ export function parseProcStat(text) {
     comm,
     state: fields[0],
     ppid: Number(fields[1]),
+    ttyNr: Number(fields[4]),
     cpuTicks: Number(fields[11]) + Number(fields[12]),
     startTime: fields[19],
   };
@@ -83,26 +84,62 @@ function sameProcess(record) {
   }
 }
 
-// Legacy SIGSTOP helpers are retained only for stale-state recovery and focused
-// tests. Live isolation uses cgroup v2 freezing, which avoids terminal job-control
-// signals when interactive agents are resumed.
+function processState(record) {
+  try {
+    const parsed = parseProcStat(readFileSync(`/proc/${record.pid}/stat`, 'utf8'));
+    return parsed.startTime === record.startTime ? parsed.state : null;
+  } catch {
+    return null;
+  }
+}
+
+function waitSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// SIGSTOP is reserved for explicitly armed desktop-exclusive mode and only for
+// same-user, non-TTY workloads outside writable user cgroups.
 export function pauseRecords(records) {
   const paused = [];
   for (const record of [...records].sort((a, b) => b.pid - a.pid)) {
     if (!sameProcess(record)) continue;
     try {
       process.kill(record.pid, 'SIGSTOP');
-      paused.push(record);
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        const state = processState(record);
+        if (state == null) break;
+        if (state === 'T' || state === 't') {
+          paused.push(record);
+          break;
+        }
+        waitSync(20);
+      }
     } catch { /* process exited */ }
+  }
+  if (paused.length !== records.filter(sameProcess).length) {
+    throw new Error(`could not verify all signal-paused workloads (${paused.length}/${records.length})`);
   }
   return paused;
 }
 
 export function resumeRecords(records) {
+  const failures = [];
   for (const record of records) {
     if (!sameProcess(record)) continue;
-    try { process.kill(record.pid, 'SIGCONT'); } catch { /* process exited */ }
+    try {
+      process.kill(record.pid, 'SIGCONT');
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        const state = processState(record);
+        if (state == null || (state !== 'T' && state !== 't')) break;
+        waitSync(20);
+      }
+      const state = processState(record);
+      if (state === 'T' || state === 't') failures.push(record.pid);
+    } catch {
+      if (sameProcess(record)) failures.push(record.pid);
+    }
   }
+  return failures;
 }
 
 function safeCgroupPath(relative, uid = process.getuid()) {
@@ -110,6 +147,10 @@ function safeCgroupPath(relative, uid = process.getuid()) {
   const root = `/sys/fs/cgroup/user.slice/user-${uid}.slice/user@${uid}.service`;
   const resolved = path.resolve('/sys/fs/cgroup', `.${relative}`);
   return resolved === root || resolved.startsWith(`${root}/`) ? resolved : null;
+}
+
+function relatedCgroup(left, right) {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
 }
 
 export function selectPauseCgroups(targets, protectedProcesses, uid = process.getuid()) {
@@ -126,6 +167,14 @@ export function selectPauseCgroups(targets, protectedProcesses, uid = process.ge
     groups.set(target.cgroup, record);
   }
   return [...groups.values()];
+}
+
+export function selectSignalPauseTargets(targets, protectedProcesses = []) {
+  const protectedGroups = new Set(protectedProcesses.map((item) => item.cgroup).filter(Boolean));
+  return targets.filter((item) => {
+    if (item.ttyNr !== 0 || item.state === 'T' || item.state === 't' || safeCgroupPath(item.cgroup)) return false;
+    return ![...protectedGroups].some((group) => relatedCgroup(group, item.cgroup));
+  }).map(({ pid, startTime, comm: command }) => ({ pid, startTime, command }));
 }
 
 function cgroupFreezeState(record) {
@@ -177,7 +226,8 @@ async function recoverStaleState(statePath, logger) {
       logger(`[isolation] recovered ${stale.frozen.length} cgroup(s) from stale freeze state`);
     }
     if (Array.isArray(stale.paused)) {
-      resumeRecords(stale.paused);
+      const failures = resumeRecords(stale.paused);
+      if (failures.length) throw new Error(`could not recover stopped PIDs: ${failures.join(', ')}`);
       logger(`[isolation] recovered ${stale.paused.length} process(es) from legacy pause state`);
     }
   } catch (error) {
@@ -307,6 +357,7 @@ export async function enterResourceIsolation(rawConfig, { statePath, auditPath, 
     monitorIntervalMs: Number(rawConfig?.monitorIntervalMs ?? 500),
     maxExternalCpuPercent: Number(rawConfig?.maxExternalCpuPercent ?? 20),
     maxExternalGpuPercent: Number(rawConfig?.maxExternalGpuPercent ?? 5),
+    signalPauseOutsideUserCgroups: rawConfig?.signalPauseOutsideUserCgroups === true,
   };
   if (!statePath) throw new Error('resource isolation requires a private state path');
   if (config.monitor && !auditPath) throw new Error('resource activity monitoring requires an audit path');
@@ -315,6 +366,7 @@ export async function enterResourceIsolation(rawConfig, { statePath, auditPath, 
   const safeLog = (message) => { try { logger(message); } catch { /* diagnostics cannot strand resources */ } };
   const owner = await claimIsolationState(statePath, safeLog);
   let frozen = [];
+  let paused = [];
   let watchdog = null;
   let released = false;
   const audit = {
@@ -339,7 +391,8 @@ export async function enterResourceIsolation(rawConfig, { statePath, auditPath, 
     if (released) return [];
     released = true;
     if (watchdog && watchdog.child.exitCode == null) watchdog.child.kill('SIGTERM');
-    const failures = thawCgroups(frozen);
+    const failures = thawCgroups(frozen).map((group) => `cgroup ${group}`);
+    failures.push(...resumeRecords(paused).map((pid) => `PID ${pid}`));
     if (!failures.length) {
       try { rmSync(statePath, { force: true }); } catch { failures.push('isolation journal'); }
     }
@@ -369,12 +422,18 @@ export async function enterResourceIsolation(rawConfig, { statePath, auditPath, 
       protectedPids,
     });
     const groups = selectPauseCgroups(targets, protectedProcesses);
+    const plannedPaused = config.signalPauseOutsideUserCgroups
+      ? selectSignalPauseTargets(targets, protectedProcesses)
+      : [];
     const planned = groups.map((record) => ({ ...record, wasFrozen: cgroupFreezeState(record) }));
     if (planned.some((record) => record.wasFrozen == null)) throw new Error('could not inspect all competing process cgroups');
-    await writeFile(statePath, `${JSON.stringify({ owner, createdAt: audit.startedAt, frozen: planned }, null, 2)}\n`);
+    await writeFile(statePath, `${JSON.stringify({ owner, createdAt: audit.startedAt, frozen: planned, paused: plannedPaused }, null, 2)}\n`);
     frozen = freezeCgroups(planned);
     if (frozen.length !== groups.length) throw new Error(`could not freeze all competing process cgroups (${frozen.length}/${groups.length})`);
+    paused = plannedPaused;
+    pauseRecords(plannedPaused);
     audit.frozen = frozen.map(({ cgroup, pids, commands }) => ({ cgroup, pids, commands }));
+    audit.paused = paused;
     if (auditPath) await writeFile(auditPath, `${JSON.stringify(audit, null, 2)}\n`);
     safeLog(`[isolation] froze ${frozen.length} competing cgroup(s): ${[...new Set(frozen.flatMap((item) => item.commands))].join(', ') || 'none'}`);
     audit.samples = await waitForQuiet(config, safeLog);

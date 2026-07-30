@@ -15,6 +15,7 @@ const manifest = {
     mode: 'remote-safe',
     pauseCommands: ['claude', 'codex'],
     desktopPauseCommands: ['Hyprland', 'sunshine'],
+    exclusiveSignalPauseCommands: ['python3'],
     maxCpuUtilization: 20,
     maxGpuUtilization: 20,
     quietSamples: 3,

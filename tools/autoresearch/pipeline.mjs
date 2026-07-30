@@ -72,7 +72,12 @@ async function withResourceIsolation(loop, action) {
   const isolation = structuredClone(manifest.resourceIsolation);
   if (process.env.AR_BENCHMARK_EXCLUSIVE === '1') {
     isolation.mode = 'desktop-exclusive';
-    isolation.pauseCommands = [...new Set([...isolation.pauseCommands, ...isolation.desktopPauseCommands])];
+    isolation.pauseCommands = [...new Set([
+      ...isolation.pauseCommands,
+      ...(isolation.desktopPauseCommands || []),
+      ...(isolation.exclusiveSignalPauseCommands || []),
+    ])];
+    isolation.signalPauseOutsideUserCgroups = true;
   }
   const release = await enterResourceIsolation(isolation, {
     statePath: isolationStatePath(),

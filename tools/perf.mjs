@@ -25,6 +25,7 @@ const width = Number(flag('w', 1920));
 const height = Number(flag('h', 1080));
 const port = Number(flag('port', 4174));
 const distDir = String(flag('dist', 'dist'));
+const only = flag('shots') ? String(flag('shots')).split(',').map((shot) => shot.trim()).filter(Boolean) : null;
 
 async function main() {
   if (!has('no-build')) {
@@ -36,7 +37,10 @@ async function main() {
 
   for (const preset of presets) {
     const session = await openSession({ url: base, width, height, quality: preset });
-    const shots = await session.shots();
+    const available = await session.shots();
+    const shots = only ?? available;
+    const missing = shots.filter((shot) => !available.includes(shot));
+    if (missing.length) throw new Error(`unknown performance shot(s): ${missing.join(', ')}`);
     for (const name of shots) {
       const shotDefinition = await session.shotInfo(name);
       await session.setShot(name, {});

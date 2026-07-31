@@ -5,6 +5,9 @@ node_modules/
 dist/
 dist-*/
 .vite/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+site/
 
 # Capture / debug artifacts (regenerable via capture scripts)
 shots/
@@ -17,6 +20,7 @@ shots/
 probe-*.mjs
 tools/_*.mjs
 tools/.*.mjs
+.w4a-tools/
 
 # OS
 .DS_Store

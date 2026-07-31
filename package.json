@@ -3,14 +3,19 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "A AAA-quality first-person shooter built in Three.js",
+  "description": "A browser first-person shooter in Three.js with zero binary assets - every mesh, texture, sound and animation is generated in code.",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview --port 4173 --strictPort",
     "typecheck": "tsc --noEmit",
     "shots": "node tools/capture.mjs",
-    "perf": "node tools/perf.mjs"
+    "perf": "node tools/perf.mjs",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs",
+    "site": "node tools/build-site.mjs",
+    "verify": "npm run typecheck && node tools/net-protocol.mjs && node tools/session-flow.mjs"
   },
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.19.3",
@@ -21,6 +26,7 @@
     "playwright": "^1.62.0",
     "typescript": "^7.0.2",
     "vite": "^8.1.5",
-    "vite-plugin-glsl": "^1.6.1"
+    "vite-plugin-glsl": "^1.6.1",
+    "vitepress": "^1.6.4"
   }
 }

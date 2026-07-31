@@ -2,7 +2,12 @@ import { defineConfig } from 'vite';
 import glsl from 'vite-plugin-glsl';
 import { fileURLToPath, URL } from 'node:url';
 
+// GitHub Pages serves project sites from a sub-path, so the playable build is
+// emitted under `<repo>/play/`. Local builds keep `/` unless BASE_PATH is set.
+const base = process.env.BASE_PATH ?? '/';
+
 export default defineConfig({
+  base,
   plugins: [glsl({ compress: false, watch: true })],
   resolve: {
     alias: {

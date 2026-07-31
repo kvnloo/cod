@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Typecheck, build and contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build game
+        run: npm run build
+
+      - name: Build docs
+        run: npm run docs:build
+
+      # These harnesses are pure Node — no browser or GPU needed.
+      - name: Netcode contract (100 assertions)
+        run: node tools/net-protocol.mjs
+
+      - name: Session contract
+        run: node tools/session-flow.mjs
+
+      - name: Assert no binary assets committed
+        run: |
+          # The project's core constraint: everything is generated in code.
+          if git ls-files | grep -aiE '\.(png|jpe?g|gif|webp|gltf|glb|fbx|obj|wav|mp3|ogg|hdr|exr|ktx2?|bin)$'; then
+            echo "::error::Binary assets are not allowed - generate them in code instead."
+            exit 1
+          fi
+          echo "No binary assets. Good."
+
+      - name: Assert no Math.random() in src
+        run: |
+          # Determinism: all randomness must come from src/core/Rand.ts.
+          # Comment lines are skipped - several files legitimately mention
+          # Math.random() to warn against using it.
+          hits=$(grep -rn 'Math\.random()' src --include='*.ts' \
+            | grep -v '^src/core/Rand\.ts:' \
+            | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|\*|/\*)' || true)
+          if [ -n "$hits" ]; then
+            echo "$hits"
+            echo "::error::Use the seeded RNG in src/core/Rand.ts, not Math.random()."
+            exit 1
+          fi
+          echo "No stray Math.random(). Good."

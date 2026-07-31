@@ -25,7 +25,12 @@ export const GPU_ARGS = [
   '--disable-dev-shm-usage',
   '--ozone-platform=headless',
   '--use-gl=angle',
-  '--use-angle=gl-egl',
+  // `gl-egl` silently falls back to Mesa llvmpipe under GPU contention — three
+  // independent critics graded a software rasteriser at ~3.7 s/frame without
+  // noticing. The Vulkan backend binds the real device or fails loudly, which is
+  // the behaviour we want: a soft fallback here invalidates every visual verdict.
+  // `assertHardwareGpu()` below is the tripwire that catches a regression.
+  '--use-angle=vulkan',
   '--enable-gpu',
   '--ignore-gpu-blocklist',
   '--enable-gpu-rasterization',
@@ -179,6 +184,23 @@ export async function openSession({
     const d = gl?.getExtension('WEBGL_debug_renderer_info');
     return d && gl ? gl.getParameter(d.UNMASKED_RENDERER_WEBGL) : 'unknown';
   });
+
+  // Hard-fail on a software rasteriser. This string was already being captured and
+  // never checked, which is precisely how three separate visual audits ended up
+  // grading llvmpipe output as if it were the shipping renderer. A screenshot from
+  // a software path is not evidence about this game, so refuse to hand one back.
+  if (!/^ANGLE \((NVIDIA|AMD|Intel)/.test(renderer) || /llvmpipe|SwiftShader|Software/i.test(renderer)) {
+    const msg =
+      `harness: refusing to render on a non-hardware GL backend.\n` +
+      `  UNMASKED_RENDERER_WEBGL = ${renderer}\n` +
+      `  Any visual verdict from this session would be about the rasteriser, not the game.\n` +
+      `  Set BLACKOUT_ALLOW_SOFTWARE_GL=1 only for non-visual (timing/logic) runs.`;
+    if (process.env.BLACKOUT_ALLOW_SOFTWARE_GL !== '1') {
+      await browser.close().catch(() => {});
+      throw new Error(msg);
+    }
+    console.warn(`[harness] WARNING — ${msg}`);
+  }
 
   return new Session(browser, context, page, { logs, errors, base, renderer, width, height });
 }

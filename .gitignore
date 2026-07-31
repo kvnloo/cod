@@ -17,3 +17,6 @@ tools/.*.mjs
 
 # OS
 .DS_Store
+
+# Nested git worktrees (never track as gitlinks)
+worktree/

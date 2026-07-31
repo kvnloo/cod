@@ -15,6 +15,7 @@ export default defineConfig({
   ignoreDeadLinks: true,
 
   head: [
+    ['link', { rel: 'icon', href: `${base}favicon.svg`, type: 'image/svg+xml' }],
     ['meta', { name: 'theme-color', content: '#0b0e14' }],
     ['meta', { property: 'og:type', content: 'website' }],
     ['meta', { property: 'og:title', content: 'Operation Blackout' }],
@@ -63,6 +64,8 @@ export default defineConfig({
         items: [{ text: 'The visual bar', link: '/VISUAL-BAR' }],
       },
     ],
+
+    logo: '/favicon.svg',
 
     socialLinks: [{ icon: 'github', link: 'https://github.com/kvnloo/cod' }],
 

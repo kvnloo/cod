@@ -161,11 +161,7 @@ export class PropScatter {
           mesh.name = `prop:${id}:${part.key}:${bucketKey}`;
           for (let i = 0; i < matrices.length; i++) mesh.setMatrixAt(i, matrices[i]);
           mesh.instanceMatrix.needsUpdate = true;
-          // Ground clutter is drawn once per shadow cascade as well as in the
-          // main pass; below about half a metre it contributes nothing a
-          // cascade can resolve, so it is excluded from shadow casting.
-          const big = def.height >= 0.55 || def.radius >= 0.7;
-          mesh.castShadow = big && !def.noShadow && !cat.isAlphaCard(part.key);
+          mesh.castShadow = castsShadow(def, cat.isAlphaCard(part.key));
           mesh.receiveShadow = true;
           mesh.frustumCulled = true;
           tagSurface(mesh, cat.surface(part.key));
@@ -196,6 +192,58 @@ export class PropScatter {
     this.geometries.clear();
     this.placements.clear();
   }
+}
+
+/**
+ * Sun elevation the shadow budget is authored against, as a tangent.
+ *
+ * The level's hero hour puts the sun at 32.4°, so an object's shadow reaches
+ * `height / tan(32.4°)` = height × 1.57 across the ground. Using the tangent
+ * rather than the height directly is the point: the same 12 cm brick that is
+ * pointless at noon throws 19 cm in the afternoon, which is twenty near-cascade
+ * texels and unmistakably a brick.
+ */
+const SHADOW_TAN = 0.635;
+
+/**
+ * Minimum ground-projected shadow length worth an atlas draw, in metres.
+ *
+ * 12 cm is roughly a fist at 3 m, and comfortably above the 0.9 / 2.0 / 4.9 cm
+ * texel footprints of the first three cascades. The old gate was `height ≥ 0.55
+ * || radius ≥ 0.7`, which excluded **2185 of 3978 instances** — every piece of
+ * rubble, every concrete chunk, every tyre, jerry can and toolbox on the map —
+ * so the ground under the debris fields came back one flat unbroken value and
+ * the props read as decals printed on it.
+ */
+const MIN_SHADOW = 0.12;
+
+/**
+ * Does this prop earn a place in the shadow atlas?
+ *
+ * Two exclusions survive, and both are about correctness rather than cost:
+ *
+ *  - **Alpha cards.** The shadow pass runs a single `overrideMaterial`, so there
+ *    is no per-material alpha test in it. Foliage and grates would cast their
+ *    quad, not their cut-out — a black rectangle under every bush.
+ *  - **Flat ground decals.** `noShadow` props under 10 cm tall (manhole covers,
+ *    drifted paper, glass shards) lie *on* the surface that would receive the
+ *    shadow. They project nothing and self-shadow into acne.
+ *
+ * A `noShadow` prop that stands *up* is not ground clutter and does cast — razor
+ * wire is the one that reaches the frame, and its shadow is real geometry, not a
+ * card. (Ivy and window flower boxes carry the flag too but are foliage, so the
+ * alpha rule above already holds them back.) Census after this change: **3325 of
+ * 3978 instances cast, up from 1793**; the 653 that do not are 342 flat ground
+ * decals and 311 alpha-cut cards, and closing that last gap needs an alpha-test
+ * in the shadow depth material, not a threshold here.
+ */
+function castsShadow(def: PropDef, alphaCard: boolean): boolean {
+  if (alphaCard) return false;
+  if (def.noShadow && def.height < 0.10) return false;
+  // Height only: a flat plate lying on the ground projects its own footprint,
+  // which is coincident with the surface receiving it and shows as nothing but
+  // acne. Planar radius does not lengthen a shadow, it just widens it.
+  return def.height / SHADOW_TAN >= MIN_SHADOW;
 }
 
 /** Small clutter stops being worth a draw call long before big props do. */

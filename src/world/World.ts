@@ -33,11 +33,12 @@ import { bus } from '../core/EventBus';
 import { settings } from '../core/Settings';
 import type { ShotDef } from '../core/CaptureAPI';
 import { LAYERS, type RenderAPI } from '../render/types';
+import { LAYER, type PhysicsAPI, type RayHit } from '../physics/types';
 import type { MaterialSystem } from '../material/MaterialLibrary';
 
 import { MatCatalog } from './MatCatalog';
 import { Chunk, ChunkSet } from './geom/Chunk';
-import { FOOTPRINTS, MAP, SPAWN_POINTS } from './Layout';
+import { FOOTPRINTS, MAP, SPAWN_POINTS, insideBuilding } from './Layout';
 import { buildTerrain, groundHeightAt } from './build/Terrain';
 import { buildAllBuildings, buildBoundary } from './build/Buildings';
 import { buildBackdrop } from './build/Backdrop';
@@ -46,7 +47,7 @@ import { PropScatter, type PropCluster } from './props/Scatter';
 import { dressWorld } from './props/Dressing';
 import { ClothSystem, levelCloth } from './Cloth';
 import { PracticalLights, type Practical } from './Lighting';
-import { WorldCulling } from './Culling';
+import { WorldCulling, type CullMode } from './Culling';
 import {
   CompactField, DEFAULT_NAV_CONFIG, Rasteriser, SolidHeightfield, rasteriseScene,
 } from './nav/Heightfield';
@@ -55,25 +56,79 @@ import { NavQuery, navDebugMesh, type CoverQuery, type PathResult, type ScoredCo
 import { WORLD_SHOTS, registerWorldShots } from './Shots';
 
 export interface SpawnPoint { position: THREE.Vector3; yaw: number; team: 'player' | 'enemy' | 'neutral'; }
+
+/** Bounds of the ground-lit census grid; all optional, all in world metres. */
+export interface SunCensusOptions {
+  x0?: number; x1?: number; z0?: number; z1?: number;
+  step?: number; maxDist?: number; lift?: number;
+  /** Start each ray on the surface a player would stand on. Default true. */
+  snap?: boolean;
+}
+
 export type { CoverPoint, TraversalLink, CoverQuery, PathResult, ScoredCover };
 
 /**
- * Golden hour proper — solar elevation ≈ 11°, azimuth just north of west.
+ * Late afternoon — solar elevation ≈ 32.4°, azimuth 86.5° west of north.
  *
- * The previous 16:25 put the sun at 28°, which is mid-afternoon: the key came
- * down steeply enough to light the plaza directly, but the atmosphere was still
- * short enough that both the direct light and the sky read neutral-to-cold, and
- * every frame measured bluer than it was red. A sun this low is the whole point
- * of the setting — the light travels through three times the air, so it lands
- * amber, the shadows it throws run the full width of the square, and the sky
- * itself warms toward the horizon.
+ * 18:00 put the sun at 11.03°, and at 11° a 12 m shop row throws a 62 m shadow
+ * across a map whose playable extent is 68 × 80 m. A deterministic raycast
+ * census against the physics colliders (2 m grid, 1435 ground samples) measured
+ * **187 lit / 13.0%** at that hour: the level was standing inside its own
+ * shadow, so the key direction was unreadable, and the facade turned *into* the
+ * sun measured darker than the one turned away from it — the sun contributed
+ * nothing to either, and the one facing away simply saw more open sky.
  *
- * The trade the old comment worried about — a low key underlighting horizontal
- * surfaces — is real, but it is an *exposure* problem, not a sun-height problem:
- * the meter now anchors to the subject rather than the sky, so a plaza in the
- * shadow of the shop row lands where the eye expects it instead of at 3% grey.
+ * 16.25 puts the disc at 32.4°: `tan(32.4°) = 0.635`, so the same shop row now
+ * throws 19 m instead of 62 m and the census returns 45%+ of the ground lit,
+ * with the shadows still long enough to run a third of the way across the
+ * square and read as afternoon rather than noon.
+ *
+ * The amber the old comment was protecting does not need an 11° sun to exist.
+ * It comes from three places that are all still in play at 32°: the sky's
+ * multiple-scattering warm-up (`Sky.msStrength`), the solar transmittance
+ * integral (which is still running through 1.9 air masses at this elevation,
+ * against 1.0 at the zenith), and the grade. What an 11° sun uniquely provides
+ * is *no direct light anywhere*, which is not a look — it is an outage.
  */
-const TIME_OF_DAY = 18.0;
+const TIME_OF_DAY = 16.25;
+
+/** Sky fill tint. Cool, because sky fill is the cold half of the colour split. */
+const AMBIENT_TINT = 0x7fa9ef;
+
+/**
+ * Sky-probe scale. Left at 3.2 **on measured evidence**, not by omission.
+ *
+ * The wave plan had this dropping to 1.0-1.5 once a real sky-visibility term
+ * existed in the lighting patch, on the theory that an unoccluded probe at 3.2
+ * was what flattened the key-to-fill ratio and collapsed the indoor/outdoor
+ * exposure swing. The term now exists (`boSkyVisibility`). Swept live against
+ * it on `square-north` at 16:15, exposure allowed to fully re-converge at each
+ * step (`__WORLD__.setAmbient` does exactly this):
+ *
+ * ```
+ *   probe  auto-exposure   sunlit vs shadowed plaza   street->warehouse swing
+ *   3.2       1.90              0.17 stops                  1.52 stops
+ *   2.2       2.16              0.17 stops                    —
+ *   1.6       2.40              0.17 stops                    —
+ *   1.5       2.45                —                         1.31 stops
+ *   1.3       2.55              0.17 stops                    —
+ *   1.2       2.61                —                         1.25 stops
+ *   1.0       2.75              0.18 stops                    —
+ * ```
+ *
+ * The ratio does not move at any value, because auto-exposure takes the change
+ * straight back out — a 1.7× cut in fill buys a 1.45× rise in exposure and the
+ * two patches stay the same distance apart on the tone curve. What the cut does
+ * buy is darker interiors (warehouse frame mean 131.9 → 107.2) for a *narrower*
+ * indoor/outdoor swing, which is the wrong direction on both counts.
+ *
+ * So the remaining flatness is not this number: it is that the metered
+ * operating point puts both a sunlit and a shadowed cobble around display 160,
+ * where the curve has no room left to separate them. That is an exposure-key
+ * and tone-curve question (`Exposure.ts`, `Sky.ts`), and this constant should
+ * only move once those do — measured against the same sweep, not assumed.
+ */
+const AMBIENT_INTENSITY = 3.2;
 
 export class WorldSystem implements System {
   readonly name = 'world';
@@ -241,17 +296,17 @@ export class WorldSystem implements System {
     this.renderApi = ctx.engine.tryGet<System & RenderAPI>('render') ?? null;
 
     // Every camera in the level's shot list faces north, south or across the
-    // square. At the hero hour the sun sits WNW at 11 degrees of elevation —
-    // outside all of their frustums — which is how a golden-hour map came back
-    // from review as "there is no sun anywhere in the sky, at any hour". The
-    // sun was there; nothing ever pointed at it. This one does: high enough
-    // that the town's own rooflines drop below the disc, angled straight down
-    // the solar azimuth.
+    // square. At the hero hour the sun sits almost due west — outside all of
+    // their frustums — which is how a map came back from review as "there is no
+    // sun anywhere in the sky, at any hour". The sun was there; nothing ever
+    // pointed at it. This one does: aimed straight down the solar azimuth
+    // (86.5° at 16:15) and pitched up far enough to put the 32.4° disc in the
+    // upper third of the frame with the west shop row's roofline still in shot.
     if (!WORLD_SHOTS.some((s) => s.name === 'sun-west')) {
       WORLD_SHOTS.push({
         name: 'sun-west',
-        description: 'Eye level in the square looking WNW straight into the low sun as it clears the west shop row',
-        position: [30, 11.5, 6], yaw: 73.2, pitch: 0, fov: 72, viewModel: false,
+        description: 'Eye level in the square looking due west into the afternoon sun above the west shop row',
+        position: [30, 11.5, 6], yaw: 86.6, pitch: 20, fov: 72, viewModel: false,
       });
     }
     registerWorldShots(this);
@@ -272,6 +327,8 @@ export class WorldSystem implements System {
     });
     this.buildStats.triangles = Math.round(triangles);
 
+    this.installDebugHandle(ctx);
+
     console.info(
       `[world] Blackout built in ${(performance.now() - t0).toFixed(0)}ms — `
       + `${(this.buildStats.triangles / 1000).toFixed(0)}k tris, ${this.buildStats.props} props, `
@@ -281,6 +338,176 @@ export class WorldSystem implements System {
     );
 
     bus.emit('level:loaded', { name: 'blackout' });
+  }
+
+  /* ------------------------------------------------------- instrumentation */
+
+  /**
+   * Measurement handle for the capture harness, mirroring `__RENDER__`.
+   *
+   * Two of this level's defining numbers — how much of the ground the sun can
+   * actually reach, and how much of the clutter reaches the shadow atlas — are
+   * invisible in a screenshot until they are already wrong, and both were
+   * shipped wrong for several waves because nothing measured them. They are
+   * cheap to compute against data the system already owns, so they are exposed
+   * here rather than re-derived by whatever script happens to be auditing.
+   *
+   * Read-only with respect to the frame loop; `setCulling` is the single
+   * exception and exists so an A/B can isolate visibility from shading.
+   */
+  private installDebugHandle(ctx: EngineContext): void {
+    (globalThis as unknown as Record<string, unknown>).__WORLD__ = {
+      hour: () => TIME_OF_DAY,
+      sunCensus: (arg?: SunCensusOptions) => this.sunCensus(ctx, arg),
+      /** Per-point sun visibility — for probing a wall rather than the ground. */
+      sunVisible: (pts: [number, number, number][]) => this.sunVisible(ctx, pts),
+      propShadowCensus: () => this.propShadowCensus(),
+      /**
+       * Live override of the sky-probe scale. The level ships `AMBIENT_INTENSITY`
+       * and nothing in the frame loop reads this back; it exists so the
+       * key-to-fill ratio can be swept in one session instead of one build per
+       * value. See the note on `AMBIENT_INTENSITY`.
+       */
+      setAmbient: (i: number) => {
+        const api = this.renderApi as unknown as { setAmbient?: (t: THREE.ColorRepresentation, i: number) => void } | null;
+        api?.setAmbient?.(AMBIENT_TINT, i);
+      },
+      setCulling: (mode: CullMode) => { this.culling.mode = mode; },
+      cullStats: () => ({
+        mode: this.culling.mode,
+        visibleObjects: this.culling.visibleObjects,
+        totalObjects: this.culling.totalObjects,
+        shadowOnly: this.culling.shadowOnlyObjects,
+        visibleCells: this.culling.visibleCells,
+      }),
+    };
+  }
+
+  /**
+   * Fraction of the playable ground with an unobstructed line to the sun.
+   *
+   * A 2 m grid over the play space, one physics ray per sample along the live
+   * solar vector. This is the number that says whether the level has a key
+   * light at all: a map where 13% of the ground is lit has no readable sun
+   * direction no matter how good the shadow filtering is.
+   */
+  private sunCensus(ctx: EngineContext, o: SunCensusOptions = {}): Record<string, number | number[]> {
+    const x0 = o.x0 ?? -34, x1 = o.x1 ?? 34;
+    const z0 = o.z0 ?? -34, z1 = o.z1 ?? 46;
+    const step = o.step ?? 2;
+    const maxDist = o.maxDist ?? 260;
+
+    const phys = ctx.engine.tryGet<System & PhysicsAPI>('physics');
+    const api = this.renderApi as unknown as {
+      uniforms?: { boSunDirWorld?: { value: THREE.Vector3 } };
+    } | null;
+    const sun = api?.uniforms?.boSunDirWorld?.value;
+    if (!phys || !sun) return { samples: 0, lit: 0, fraction: 0 };
+
+    const dir = this._tmpA.copy(sun).normalize();
+    const down = new THREE.Vector3(0, -1, 0);
+    const origin = new THREE.Vector3();
+    const hit: RayHit = {
+      hit: false, point: new THREE.Vector3(), normal: new THREE.Vector3(), distance: 0,
+      surface: 'concrete', object: null, entityId: -1, bodyHandle: -1, zone: 'none', backface: false,
+    };
+    const mask = LAYER.STATIC | LAYER.DYNAMIC;
+    const lift = o.lift ?? 0.1;
+    const snap = o.snap ?? true;
+    let samples = 0;
+    let lit = 0;
+    // Outdoor subset: ground under a roof can never see the sun, so it dilutes
+    // the metric by a constant no lighting change can move.
+    let outdoor = 0, litOutdoor = 0;
+    // Occluder distance histogram: near hits are the level's own clutter, far
+    // hits are the buildings. The distinction is the whole diagnosis.
+    let near = 0, mid = 0, far = 0;
+    for (let x = x0; x <= x1 + 1e-6; x += step) {
+      for (let z = z0; z <= z1 + 1e-6; z += step) {
+        samples++;
+        const out = !insideBuilding(x, z, -0.5);
+        if (out) outdoor++;
+        let y = groundHeightAt(x, z);
+        if (snap) {
+          // Pavements, interior slabs and terraces sit above the terrain
+          // function; start the ray on the surface a player would stand on, not
+          // on the height field underneath it.
+          origin.set(x, y + 1.6, z);
+          if (phys.raycast(origin, down, 3.2, mask, hit).hit) y = origin.y - hit.distance;
+        }
+        origin.set(x, y + lift, z);
+        if (!phys.raycast(origin, dir, maxDist, mask, hit).hit) {
+          lit++;
+          if (out) litOutdoor++;
+          continue;
+        }
+        if (hit.distance < 1) near++;
+        else if (hit.distance < 12) mid++;
+        else far++;
+      }
+    }
+    return {
+      samples,
+      lit,
+      fraction: samples ? lit / samples : 0,
+      outdoor,
+      litOutdoor,
+      outdoorFraction: outdoor ? litOutdoor / outdoor : 0,
+      blockedNear: near, blockedMid: mid, blockedFar: far,
+      elevationDeg: (Math.asin(THREE.MathUtils.clamp(dir.y, -1, 1)) * 180) / Math.PI,
+      sunDir: [dir.x, dir.y, dir.z],
+      hours: TIME_OF_DAY,
+    };
+  }
+
+  /** True for each point with a clear line to the sun. */
+  private sunVisible(ctx: EngineContext, pts: [number, number, number][]): boolean[] {
+    const phys = ctx.engine.tryGet<System & PhysicsAPI>('physics');
+    const api = this.renderApi as unknown as {
+      uniforms?: { boSunDirWorld?: { value: THREE.Vector3 } };
+    } | null;
+    const sun = api?.uniforms?.boSunDirWorld?.value;
+    if (!phys || !sun) return pts.map(() => false);
+    const dir = this._tmpA.copy(sun).normalize();
+    const origin = new THREE.Vector3();
+    const hit: RayHit = {
+      hit: false, point: new THREE.Vector3(), normal: new THREE.Vector3(), distance: 0,
+      surface: 'concrete', object: null, entityId: -1, bodyHandle: -1, zone: 'none', backface: false,
+    };
+    return pts.map((p) => {
+      origin.set(p[0], p[1], p[2]).addScaledVector(dir, 0.05);
+      return !phys.raycast(origin, dir, 300, LAYER.STATIC | LAYER.DYNAMIC, hit).hit;
+    });
+  }
+
+  /** Instanced-prop shadow participation, counted per instance and per mesh. */
+  private propShadowCensus(): Record<string, number | Record<string, number>> {
+    let meshes = 0, castingMeshes = 0, instances = 0, castingInstances = 0;
+    let placements = 0, castingPlacements = 0;
+    const off: Record<string, number> = {};
+    for (const c of this.clusters) {
+      placements += c.matrices.length;
+      let anyCast = false;
+      for (const m of c.meshes) {
+        meshes++;
+        instances += m.count;
+        if (m.castShadow) { castingMeshes++; castingInstances += m.count; anyCast = true; }
+        else {
+          // `prop:<id>:<matKey>:<bucket>` — bucket dropped so the tally reads per
+          // prop/material rather than per district.
+          const k = m.name.split(':').slice(1, 3).join(':') || c.id;
+          off[k] = (off[k] ?? 0) + m.count;
+        }
+      }
+      if (anyCast) castingPlacements += c.matrices.length;
+    }
+    return {
+      meshes, castingMeshes, instances, castingInstances,
+      instanceFraction: instances ? castingInstances / instances : 0,
+      placements, castingPlacements,
+      placementFraction: placements ? castingPlacements / placements : 0,
+      off,
+    };
   }
 
   /* ----------------------------------------------------------- environment */
@@ -296,25 +523,10 @@ export class WorldSystem implements System {
     // pushes far more light forward through the haze than a 28° one did, and at
     // the old value the midground of every westward sightline went milky.
     render.setWeather(0, 0.020, 0.4);
-    // Golden hour needs the sun to dominate: the point of a low warm key is the
-    // *ratio* between a sunlit facade and a shaded one, and a full-strength sky
-    // probe lights every face from the whole hemisphere until the two sides of a
-    // corner are within half a stop of each other.
-    //
-    // 2.0 rather than the old 0.55 because the sky bake itself is now 0.65 of
-    // a stop dimmer (SKY_INTENSITY) against a sun 0.7 of a stop stronger. The
-    // key-to-fill ratio is therefore *wider* than it was at 0.55, while the
-    // absolute level of a shaded surface stays where the eye expects it instead
-    // of falling off the bottom of the frame — which is what put the plaza at
-    // 3% grey. The tint stays firmly blue: sky fill is the cool half of the
-    // golden-hour colour split.
-    //
-    // 3.2 rather than 2.0 because `SKY_INTENSITY` came down again (9.5 → 5.2)
-    // to stop the dome bleaching to white on screen. That is a change to what
-    // the *camera* sees; the amount of fill a shaded wall receives should not
-    // move with it, so the probe scale takes the difference back out.
+    // Sky fill. The number and the reason it cannot yet come down are on
+    // `AMBIENT_INTENSITY`.
     const api = render as unknown as { setAmbient?: (tint: THREE.ColorRepresentation, i: number) => void };
-    api.setAmbient?.(0x7fa9ef, 3.2);
+    api.setAmbient?.(AMBIENT_TINT, AMBIENT_INTENSITY);
     this.cloth.setWind(0.75);
   }
 

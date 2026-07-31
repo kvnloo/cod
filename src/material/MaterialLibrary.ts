@@ -151,6 +151,26 @@ const MACRO_DEFAULT: Record<string, [number, number, number, number]> = {
 const MACRO_FALLBACK: [number, number, number, number] = [6.0, 18, 0.075, 0.05];
 
 /**
+ * Masonry lattices, mirroring the `obBrick()` call inside each recipe:
+ * `[blocksAcross, coursesUp, perCourseJitter, recipeSeed]`.
+ *
+ * `obBrick` wraps its per-block random with `mod(id, counts)`, so a baked map
+ * holds only `across × up` distinct blocks and repeats them once per tile. At
+ * cobble scale that is the same 28 setts every 55 cm, unbroken across the whole
+ * square — the single loudest "printed grid" tell in the build. The shader
+ * re-derives this lattice from world position and hashes the *unwrapped* id, so
+ * every block in the level gets its own tone.
+ *
+ * Kept here rather than in the recipe because the recipes are shared with other
+ * packages this wave. If a recipe's lattice ever changes, the mismatch degrades
+ * gracefully: the tint rolls off at cell edges, so a misfit lands in the mortar.
+ */
+const CELL_LATTICE: Record<string, [number, number, number, number]> = {
+  stone: [4, 7, 0.14, 53],
+  brick: [8, 24, 0.05, 37],
+};
+
+/**
  * World-space story layers: [patch, damp, traffic, metalWash].
  *
  * A tiling base map physically cannot say "this bay was resurfaced", "this
@@ -449,6 +469,8 @@ export class MaterialSystem implements System {
       const s = SURF_LAYERS[arch.id] ?? SURF_FALLBACK;
       surfaceLayers = new THREE.Vector4(s[0], s[1], s[2], s[3]);
     }
+    const lat = worldLayers && settings.preset !== 'low' ? CELL_LATTICE[arch.id] : undefined;
+    const cellLattice = lat ? new THREE.Vector4(lat[0], lat[1], lat[2], lat[3]) : null;
 
     const cfg: ShaderExtensionConfig = {
       tile,
@@ -456,12 +478,18 @@ export class MaterialSystem implements System {
       triplanarSharpness: arch.shader?.triplanarSharpness ?? 6,
       detail: !!detailMap,
       detailMap,
-      // The authored figures are repeats per metre of a 512 map whose own
-      // features sit at ~1/34 of a repeat, so a value of 30 asks for 1 mm
-      // grain — an order of magnitude below a pixel at any range the player
-      // ever sees, which is why gravel, tarmac and roofing all resolved as
-      // sensor noise rather than as a surface. Pulled back to a 2-3 mm grain.
-      detailScale: (arch.shader?.detailScale ?? 12) * 0.45 / Math.max(tile / set.tile, 0.05),
+      // `obDetUv` is already world position divided by `tile`, so multiplying by
+      // `repeatsPerMetre * tile` makes the shader's own division cancel and the
+      // layer land at a fixed density in *metres*, independent of world scale.
+      //
+      // The old expression divided the authored figure by `tile` a second time,
+      // so detail frequency scaled as 1/tile²: cobble (recipe tile 2.4 squeezed
+      // to 0.55) came out at 43 repeats/m — 0.7 mm features, an order of
+      // magnitude under a pixel at 1 m — so its grit layer mipped to flat grey
+      // and contributed nothing but aliasing, while plasterCream (tile 4.2) came
+      // out at 1.68/m, near DC. Both are now inside the 4-8 repeats/m band that
+      // puts the detail map's own cells at a legible 3-25 mm.
+      detailScale: detailRepeatsPerMetre(arch) * tile,
       detailStrength: arch.shader?.detailStrength,
       // A long, lazy cross-fade. The old 4-14 m window put the whole
       // transition inside the part of the ground the player is looking at, so
@@ -481,6 +509,7 @@ export class MaterialSystem implements System {
       macro,
       surface: surfaceLayers,
       ground: groundBand,
+      cellTone: cellLattice,
       alphaFromMap,
       uvVariation: arch.shader?.uvVariation ?? false,
       emissiveMode: EMISSIVE_MODES[emissiveKind],
@@ -533,6 +562,25 @@ export class MaterialSystem implements System {
 }
 
 /* ---------------------------------------------------------------- utils -- */
+
+/**
+ * Detail-layer density in repeats per metre.
+ *
+ * Archetypes author `shader.detailScale` as "repeats per base-map tile", which
+ * is a texel-space number and says nothing about how big the grain is in the
+ * world. Reinterpreting it as a *relative* density and clamping to 4-8 per
+ * metre is what keeps the layer legible: the detail maps put their own cells at
+ * 6-150 per repeat, so 4/m gives features from 1.7 mm to 4 cm and 8/m gives
+ * 0.8 mm to 2 cm. Below 4 the layer is a low-frequency stain; above 8 it is
+ * under a pixel at 1 m and mips straight back to grey.
+ */
+const DETAIL_RPM_MIN = 4.0;
+const DETAIL_RPM_MAX = 8.0;
+
+function detailRepeatsPerMetre(arch: MaterialArchetype): number {
+  const authored = arch.shader?.detailScale ?? 12;
+  return Math.min(DETAIL_RPM_MAX, Math.max(DETAIL_RPM_MIN, authored * 0.22));
+}
 
 function stableKey(o: MaterialOptions): string {
   const keys = Object.keys(o).sort();

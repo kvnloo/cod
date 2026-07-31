@@ -18,7 +18,8 @@
 
 import * as THREE from 'three';
 import {
-  GLSL_AERIAL, GLSL_COMMON, GLSL_CONTACT, GLSL_CSM, GLSL_SH, GLSL_SUN, GLSL_ATMOSPHERE,
+  GLSL_AERIAL, GLSL_COMMON, GLSL_CONTACT, GLSL_CSM, GLSL_SH, GLSL_SKYOCC, GLSL_SUN,
+  GLSL_ATMOSPHERE,
 } from './Glsl';
 import type { RenderUniforms } from './RenderUniforms';
 
@@ -138,6 +139,7 @@ const FRAG_PARS_LIT = [
   GLSL_SH,
   GLSL_CSM,
   GLSL_CONTACT,
+  GLSL_SKYOCC,
   /* glsl */ `
 uniform vec3 boAmbientSH[ 9 ];
 uniform vec3 boAmbientTint;
@@ -145,6 +147,20 @@ uniform float boAmbientIntensity;
 uniform mat4 projectionMatrix;
 float boDbgShadow = 1.0;
 float boDbgLit = 0.0;
+/**
+ * Sun visibility at this fragment, in [0,1]. Written by SUN_INJECT (which runs
+ * at lights_fragment_begin) and consumed by MAPS_REPLACE (at
+ * lights_fragment_maps, immediately after) so the one-bounce ground fill can
+ * be gated on it without paying for a second cascade lookup. A surface with
+ * N·L <= 0 receives no direct sun by definition, so it reads 0 without a
+ * lookup at all.
+ */
+float boSunVis = 0.0;
+/**
+ * Sky visibility at this fragment, in [0,1]. Written by MAPS_REPLACE and read
+ * by both the specular IBL below it and the debug view in the G-buffer write.
+ */
+float boSkyVisFrag = 1.0;
 
 /**
  * Diffuse albedo of "the ground", used for the one-bounce fill below. Dusty
@@ -189,11 +205,15 @@ const SUN_INJECT = /* glsl */ `
 	if ( boNdotL > 0.0 && ( boSunColor.r + boSunColor.g + boSunColor.b ) > 0.0001 ) {
 		float boVD = max( - vBoViewPos.z, 0.0 );
 		float boShadow = boSunShadow( vBoWorldPos, boWN, boVD, boNdotL, gl_FragCoord.xy );
-		if ( boShadow > 0.02 && boContactParams.x > 0.0 ) {
+		// A contact shadow is a proximity cue, not a sun-visibility cue: the old
+		// 0.02 gate let only the ~2.5% of the frame the cascades already called
+		// fully lit ever receive one.
+		if ( boShadow > 0.002 && boContactParams.x > 0.0 ) {
 			boShadow = min( boShadow, boContactShadow(
 				vBoViewPos, normalize( normal ), boSunDirView, boNdotL, projectionMatrix, gl_FragCoord.xy ) );
 		}
 		boDbgShadow = boShadow;
+		boSunVis = boShadow;
 		boDbgLit = 1.0;
 		IncidentLight boSun;
 		boSun.direction = boSunDirView;
@@ -220,8 +240,18 @@ const MAPS_REPLACE = /* glsl */ `
 
 		vec3 boIndN = normalize( normal * mat3( viewMatrix ) );
 
-		// Sky fill, straight off the SH probe.
-		vec3 boIndirect = boShIrradiance( boIndN, boAmbientSH );
+		// Sky fill, off the SH probe — scaled by how much sky this point can
+		// actually see.
+		//
+		// Without the visibility term the probe is a flat, unoccluded 3.2x fill
+		// applied identically to the open plaza, the back of a terrace flat and
+		// the middle of a 23x25 m warehouse, which is why auto-exposure moved
+		// 0.05 stops walking from one to the other. Interiors that meter the same
+		// as the street are VISUAL-BAR tell #4 on their own.
+		float boSkyVis = boSkyVisibility( vBoViewPos, normalize( normal ),
+		                                  projectionMatrix, gl_FragCoord.xy );
+		boSkyVisFrag = boSkyVis;
+		vec3 boIndirect = boShIrradiance( boIndN, boAmbientSH ) * boSkyVis;
 
 		// Ground bounce.
 		//
@@ -240,8 +270,26 @@ const MAPS_REPLACE = /* glsl */ `
 		// dusty street albedo, weighted by how much of the receiver's hemisphere
 		// lies below the horizon. Ground-facing-up surfaces get none of it, so
 		// this cannot flatten the cast shadows on the plaza.
-		vec3 boGroundIrr = boShIrradiance( vec3( 0.0, 1.0, 0.0 ), boAmbientSH )
-		                 + boSunColor * max( boSunDirWorld.y, 0.0 );
+		// The catch was that this used the *unshadowed* sun and the *unoccluded*
+		// sky, for every receiver in the level. On a map where most of the ground
+		// is in shade that is a systematic warm lift on every vertical and
+		// downward-facing surface: measured sunlit gravel came out at linear
+		// R:B 3.50 and *shadowed* gravel at 6.09, so the shadows were twice as warm
+		// as the key and the golden-hour split was inverted. Worse, a ceiling
+		// (n.y = -1) took the term at full weight, which is how interior-flat's
+		// ceiling ended up brighter than its own floor.
+		//
+		// So the "ground" is now the ground *here*: it sees the sky this receiver
+		// sees, and it is lit by the sun if the receiver is lit or if the receiver
+		// stands somewhere open enough for the street in front of it to be. A
+		// ceiling in a closed room is neither, and stops pretending it is looking at
+		// a sunlit plaza. Neither gate reaches zero — multiply-scattered light does
+		// not, and zeroing it would re-open the "underside of an awning reads as a
+		// hole cut in the scene" problem this term exists to fix.
+		float boGroundLit = max( boSunVis, boSkyVis * boSkyVis );
+		vec3 boGroundIrr =
+			  boShIrradiance( vec3( 0.0, 1.0, 0.0 ), boAmbientSH ) * mix( 0.18, 1.0, boSkyVis )
+			+ boSunColor * max( boSunDirWorld.y, 0.0 ) * mix( 0.10, 1.0, boGroundLit );
 		boIndirect += boGroundIrr * BO_GROUND_ALBEDO * max( 0.5 - 0.5 * boIndN.y, 0.0 );
 
 		iblIrradiance += boIndirect * boAmbientTint * boAmbientIntensity;
@@ -252,13 +300,17 @@ const MAPS_REPLACE = /* glsl */ `
 
 #if defined( USE_ENVMAP ) && defined( RE_IndirectSpecular )
 
+	// Specular sky radiance is sky too — a warehouse wall cannot reflect a dome
+	// it cannot see, and scene.environmentIntensity is driven from the same 3.2
+	// ambient scale, so leaving this ungated re-admits most of what the diffuse
+	// term just removed.
 	#ifdef USE_ANISOTROPY
 
-		radiance += getIBLAnisotropyRadiance( geometryViewDir, geometryNormal, material.roughness, material.anisotropyB, material.anisotropy );
+		radiance += getIBLAnisotropyRadiance( geometryViewDir, geometryNormal, material.roughness, material.anisotropyB, material.anisotropy ) * boSkyVisFrag;
 
 	#else
 
-		radiance += getIBLRadiance( geometryViewDir, geometryNormal, material.roughness );
+		radiance += getIBLRadiance( geometryViewDir, geometryNormal, material.roughness ) * boSkyVisFrag;
 
 	#endif
 
@@ -296,6 +348,9 @@ function mrtWrite(kind: MaterialKind, hasVelocity: boolean, aerial: boolean, sun
 {
 	${aerial ? `gl_FragColor.rgb = boAerialPerspective( gl_FragColor.rgb, vBoWorldPos, cameraPosition, boSunDirWorld );` : ''}
 	${sun && DEBUG_SHADOW ? `gl_FragColor.rgb = vec3( boDbgShadow, boDbgLit, 0.0 ) * 0.35;` : ''}
+	${sun ? `// A negative sky-occlusion strength paints the visibility term itself, so
+	// "is this uniform even bound" is a screenshot instead of an argument.
+	if ( boSkyOccParams.x < -0.5 ) gl_FragColor.rgb = vec3( boSkyVisFrag * 0.35 );` : ''}
 	float boAO = 1.0;
 	#ifdef USE_AOMAP
 		boAO = ambientOcclusion;
@@ -345,8 +400,44 @@ export class MaterialPatcher {
   private sharedUniforms: Record<string, THREE.IUniform>;
   private warned = new Set<string>();
 
+  /**
+   * Sky-occlusion controls: x strength, y radius (m), z floor, w response
+   * exponent. Owned here rather than in `RenderUniforms` because nothing in the
+   * frame loop drives it — it is a shading-model constant, not per-frame state —
+   * and because only materials this patcher rewrites declare it.
+   *
+   * Strength ships at 1.0, i.e. the term is live. `World.setAmbient`'s intensity
+   * can only come down once this exists; before it, dropping the ambient just
+   * made outdoors flat and dark.
+   */
+  readonly skyOcc: THREE.IUniform = { value: new THREE.Vector4(1.0, 16.0, 0.12, 1.9) };
+
   constructor(private uniforms: RenderUniforms) {
     this.sharedUniforms = uniforms.shared();
+    // Live handles for the capture harness, mirroring `__DOF__`. `skyOcc` is the
+    // shared Vector4 itself, so poking `.y` from a probe retunes every material
+    // in the scene on the next frame with no rebuild. `cascades` exists because
+    // the shadow bias is a function of the live cascade texel size and there was
+    // previously no way to read that number back out of a running frame — which
+    // is how a bias of 1.82 m survived in the far cascade.
+    const g = globalThis as unknown as Record<string, unknown>;
+    g.__SKYOCC__ = this.skyOcc.value;
+    g.__SHADING__ = {
+      skyOcc: this.skyOcc.value,
+      csmInfo: () => uniforms.boCsmInfo.value.toArray(),
+      cascades: () => uniforms.boCsmParams.value.map((v) => {
+        // Mirrors boCascadeSample: slope-scaled bias in metres, clamped.
+        const bias = (ndl: number) => {
+          const slope = Math.min(Math.tan(Math.acos(Math.min(Math.max(ndl, 0.05), 1))), 2);
+          return Math.min(Math.max(v.z * (0.85 + 1.25 * slope), v.z * 0.85), Math.max(0.06, v.z * 1.5));
+        };
+        return {
+          extent: v.x, zRange: v.y, texelW: v.z, splitFar: v.w,
+          biasFlatGroundM: +bias(0.191).toFixed(4),
+          biasSteepM: +bias(0.9).toFixed(4),
+        };
+      }),
+    };
   }
 
   /** True when the material now carries our injection. */
@@ -398,6 +489,7 @@ export class MaterialPatcher {
       for (const k in shared) shader.uniforms[k] = shared[k];
       shader.uniforms.boMatId = matId;
       shader.uniforms.boPrevModelMatrix = prevMatrix;
+      if (wantSun) shader.uniforms.boSkyOccParams = this.skyOcc;
 
       // --- vertex -------------------------------------------------------
       if (hasVertexAnchor) {

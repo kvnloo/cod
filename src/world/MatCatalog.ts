@@ -126,9 +126,26 @@ const D: Record<MatKey, MatDef> = {
   concreteWet: { archetype: 'concrete', surface: 'concrete', fallback: 0x6a6862, opts: { scale: 2.2, tint: 0x8d8a84, roughness: 0.55, wear: 0.9 } },
   stone: { archetype: 'stone', surface: 'stone', fallback: 0x8a8880, opts: { scale: 3.2, tint: 0x8b8779, saturation: 0.9, wear: 0.6, blendWith: 'dirt', blendScale: 1.2 } },
   stoneTrim: { archetype: 'stone', surface: 'stone', fallback: 0x9d9a90, opts: { scale: 1.4, tint: 0xa39e8f, wear: 0.45 } },
-  cobble: { archetype: 'stone', surface: 'stone', fallback: 0x6f6d66, opts: { scale: 0.55, tint: 0x47443f, saturation: 0.7, wear: 0.95, pom: false, blendWith: 'dirt', blendScale: 3.2 } },
+  /* Setts. Three things were making the square read as a printed sheet:
+   *
+   *  - `pom: false`, so a 2 cm-deep setted street was geometrically flat and
+   *    showed no inter-stone occlusion at the grazing angles the map is mostly
+   *    seen at. Parallax is fully faded out by 13 m, so the cost is bounded.
+   *  - the base map only holds 4x7 distinct stones and repeats them once per
+   *    tile; `CELL_LATTICE` in MaterialLibrary now re-hashes them per block in
+   *    world space, which is what actually stops the lattice being countable,
+   *    and the same block darkens the joints the map draws too light.
+   *
+   * `blendScale` is left at 3.2/3.0. The wave brief reads it as "the dirt map
+   * tiles every 31 cm"; it is metres *per repeat* (`obBlendTile = 1/blendScale`,
+   * `MaterialShaders` line ~575), so 3.2 already means one dirt repeat every
+   * 3.2 m against a 14 cm sett. Lowering it — measured on `close-cobble-1m` —
+   * removes local variation rather than adding it. The hard-bordered blotches
+   * the brief is describing come from the height-blend threshold, which is
+   * fixed there instead. */
+  cobble: { archetype: 'stone', surface: 'stone', fallback: 0x6f6d66, opts: { scale: 0.55, tint: 0x47443f, saturation: 0.7, wear: 0.95, pom: true, blendWith: 'dirt', blendScale: 3.2 } },
   /* Dark granite setts: the tram trackbed, laid flush into the square. */
-  setts: { archetype: 'stone', surface: 'stone', fallback: 0x4b4a47, opts: { scale: 0.5, tint: 0x565350, saturation: 0.55, wear: 0.9, pom: false, blendWith: 'dirt', blendScale: 3.0 } },
+  setts: { archetype: 'stone', surface: 'stone', fallback: 0x4b4a47, opts: { scale: 0.5, tint: 0x565350, saturation: 0.55, wear: 0.9, pom: true, blendWith: 'dirt', blendScale: 3.0 } },
 
   /* -------------------------------------------------------------- ground */
   asphalt: { archetype: 'asphalt', surface: 'asphalt', fallback: 0x3b3c3e, opts: { scale: 3.0, wear: 0.6, tint: 0x4a4b4e, saturation: 0.7, pom: false, blendWith: 'dirt', blendScale: 0.9 } },
@@ -164,10 +181,20 @@ const D: Record<MatKey, MatDef> = {
   crate: { archetype: 'crate', surface: 'crate', fallback: 0x9c7a4e, opts: { scale: 1.0, instanced: true, wear: 0.4 } },
 
   /* -------------------------------------------------------------- metals */
-  steel: { archetype: 'metal', surface: 'metal', fallback: 0x6c7a72, opts: { scale: 1.6, wear: 0.5 } },
+  steel: { archetype: 'metal', surface: 'metal', fallback: 0x6c7a72, opts: { scale: 1.6, wear: 0.5, instanced: true } },
   steelPaint: { archetype: 'metal', surface: 'metal', fallback: 0x3f5b5e, opts: { scale: 1.6, tint: 0x53757a, saturation: 0.9, wear: 0.7 } },
-  rust: { archetype: 'metal', surface: 'metal', fallback: 0x7a4526, opts: { scale: 1.4, tint: 0x9c6438, saturation: 1.25, roughness: 1.0, wear: 1.0 } },
-  sheet: { archetype: 'metalThin', surface: 'metalThin', fallback: 0x9aa0a4, opts: { scale: 1.6, wear: 0.6 } },
+  /* Weathered steel, not orange plastic.
+   *
+   * `roughness: 1.0, wear: 1.0` was a dielectric: `wear` darkens and roughens
+   * every cavity in the map to 0.92, and the recipe's own oxide already
+   * collapses metalness wherever rust wins, so the tram flank, the handrails,
+   * the lamp columns and the hedgehogs all came out flat diffuse orange with no
+   * environment reflection and no specular gradient down a cylinder — under a
+   * bright sky, which is the easiest condition there is in which to sell steel.
+   * The rust is also less saturated than it was: 1.25 pushed the oxide toward a
+   * printed orange rather than the brown-red of real corrosion. */
+  rust: { archetype: 'metal', surface: 'metal', fallback: 0x7a4526, opts: { scale: 1.4, tint: 0x93673f, saturation: 0.92, roughness: 0.72, wear: 0.55, instanced: true } },
+  sheet: { archetype: 'metalThin', surface: 'metalThin', fallback: 0x9aa0a4, opts: { scale: 1.6, wear: 0.6, instanced: true } },
   alu: { archetype: 'aluminium', surface: 'metalThin', fallback: 0xb6b9bc, opts: { scale: 1.2, wear: 0.4 } },
   grate: { archetype: 'grate', surface: 'grate', fallback: 0x53565a, opts: { scale: 0.8 } },
   pipe: { archetype: 'pipe', surface: 'pipe', fallback: 0x8a7e46, opts: { scale: 1.2, wear: 0.6 } },
@@ -188,10 +215,13 @@ const D: Record<MatKey, MatDef> = {
   canvasRed: { archetype: 'fabric', surface: 'fabric', fallback: 0x8c3a30, opts: { scale: 1.0, tint: 0x9c4638, saturation: 1.2, doubleSided: true } },
   canvasGreen: { archetype: 'fabric', surface: 'fabric', fallback: 0x3f5836, opts: { scale: 1.0, tint: 0x516b42, saturation: 1.0, doubleSided: true } },
   canvasCream: { archetype: 'fabric', surface: 'fabric', fallback: 0xa89c7e, opts: { scale: 1.0, tint: 0xc2b694, saturation: 0.7, doubleSided: true } },
-  sandbag: { archetype: 'sandbag', surface: 'sandbag', fallback: 0x9a8158, opts: { scale: 1.1 } },
-  rubber: { archetype: 'rubber', surface: 'rubber', fallback: 0x2c2c2e, opts: { scale: 1.0 } },
-  plastic: { archetype: 'plastic', surface: 'plastic', fallback: 0x3c3e42, opts: { scale: 1.0 } },
-  hazard: { archetype: 'plastic', surface: 'plastic', fallback: 0xc07a1c, opts: { scale: 1.0, tint: 0xe09a2c, saturation: 1.4 } },
+  /* Every sandbag in the level was the same pale plaid pillow — no tint, no
+   * wear, no instancing — which reads as glazed ceramic. Hessian is dirty,
+   * matte and never twice the same colour. */
+  sandbag: { archetype: 'sandbag', surface: 'sandbag', fallback: 0x9a8158, opts: { scale: 1.1, tint: 0x8d7855, saturation: 0.72, wear: 0.65, instanced: true } },
+  rubber: { archetype: 'rubber', surface: 'rubber', fallback: 0x2c2c2e, opts: { scale: 1.0, wear: 0.4, instanced: true } },
+  plastic: { archetype: 'plastic', surface: 'plastic', fallback: 0x3c3e42, opts: { scale: 1.0, wear: 0.35, instanced: true } },
+  hazard: { archetype: 'plastic', surface: 'plastic', fallback: 0xc07a1c, opts: { scale: 1.0, tint: 0xd8952e, saturation: 1.2, wear: 0.5, instanced: true } },
   foliage: { archetype: 'foliage', surface: 'foliage', fallback: 0x465c2c, opts: { scale: 0.7, doubleSided: true, instanced: true } },
   foliageDry: { archetype: 'foliage', surface: 'foliage', fallback: 0x6a6232, opts: { scale: 0.7, tint: 0xa89a58, saturation: 0.7, doubleSided: true, instanced: true } },
 

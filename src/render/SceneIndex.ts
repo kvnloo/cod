@@ -17,19 +17,36 @@ import type { MaterialPatcher, PatchOptions } from './MaterialPatch';
 const PREV = '__boPrevMatrix';
 const HOOKED = '__boHooked';
 
+/**
+ * `userData` flag meaning "hidden from the colour pass, but the sun can still
+ * see it".
+ *
+ * Visibility culling and shadow casting are different questions with the same
+ * answer slot: `Object3D.visible` gates both the colour pass and the shadow
+ * atlas, so anything a main-camera frustum test rejects silently stops casting.
+ * Whoever hides an object sets this flag when the object should still occlude
+ * the sun; the index collects those separately and shows them for the duration
+ * of the shadow passes.
+ */
+export const SHADOW_VISIBLE = '__boShadowVisible';
+
 interface Hooked {
   [PREV]?: THREE.Matrix4;
   [HOOKED]?: boolean;
+  [SHADOW_VISIBLE]?: boolean;
 }
 
 export class SceneIndex {
   readonly meshes: THREE.Mesh[] = [];
   readonly nonCasters: THREE.Object3D[] = [];
+  /** Culled from the colour pass, still required by the shadow atlas. */
+  readonly shadowOnly: THREE.Object3D[] = [];
   readonly pointLights: THREE.PointLight[] = [];
   readonly directionalLights: THREE.DirectionalLight[] = [];
   readonly hemisphereLights: THREE.HemisphereLight[] = [];
 
   private hiddenCount = 0;
+  private shownCount = 0;
 
   constructor(private patcher: MaterialPatcher, private patchOptions: PatchOptions = {}) { }
 
@@ -37,6 +54,7 @@ export class SceneIndex {
   scan(root: THREE.Object3D): void {
     this.meshes.length = 0;
     this.nonCasters.length = 0;
+    this.shadowOnly.length = 0;
     this.pointLights.length = 0;
     this.directionalLights.length = 0;
     this.hemisphereLights.length = 0;
@@ -44,7 +62,13 @@ export class SceneIndex {
   }
 
   private visit(o: THREE.Object3D): void {
-    if (!o.visible) return;
+    if (!o.visible) {
+      // Hidden, but flagged as still occluding the sun. Collected here and shown
+      // for the shadow passes only; the subtree below it stays hidden, because
+      // the flag is written per drawable by whoever did the hiding.
+      if ((o.userData as Hooked)[SHADOW_VISIBLE] === true) this.shadowOnly.push(o);
+      return;
+    }
 
     const mesh = o as THREE.Mesh;
     if (mesh.isMesh || (o as THREE.Points).isPoints || (o as THREE.Line).isLine) {
@@ -96,16 +120,26 @@ export class SceneIndex {
     }
   }
 
-  /** Temporarily hides everything that must not appear in the shadow atlas. */
+  /**
+   * Swaps the scene graph into its shadow-pass configuration: non-casters out,
+   * off-screen casters in. Paired with `restoreNonCasters`, which must be called
+   * before anything else reads `visible`.
+   */
   hideNonCasters(): void {
-    const list = this.nonCasters;
-    this.hiddenCount = list.length;
-    for (let i = 0; i < list.length; i++) list[i].visible = false;
+    const hide = this.nonCasters;
+    this.hiddenCount = hide.length;
+    for (let i = 0; i < hide.length; i++) hide[i].visible = false;
+    const show = this.shadowOnly;
+    this.shownCount = show.length;
+    for (let i = 0; i < show.length; i++) show[i].visible = true;
   }
 
   restoreNonCasters(): void {
-    const list = this.nonCasters;
-    for (let i = 0; i < this.hiddenCount; i++) list[i].visible = true;
+    const hide = this.nonCasters;
+    for (let i = 0; i < this.hiddenCount; i++) hide[i].visible = true;
     this.hiddenCount = 0;
+    const show = this.shadowOnly;
+    for (let i = 0; i < this.shownCount; i++) show[i].visible = false;
+    this.shownCount = 0;
   }
 }

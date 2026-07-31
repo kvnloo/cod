@@ -66,6 +66,7 @@ uniform float uRadius;
 uniform float uThickness;
 uniform float uFrame;
 uniform float uFar;
+uniform float uHorizonBias;
 layout(location = 0) out vec4 fragColor;
 
 vec3 viewFromLinear(vec2 uv, float z) {
@@ -166,8 +167,13 @@ void main() {
       float w0 = sat(fb0 * falloffMul + falloffAdd);
       float w1 = sat(fb1 * falloffMul + falloffAdd);
 
-      float shc0 = dot(d0 / len0, viewVec);
-      float shc1 = dot(d1 / len1, viewVec);
+      // Angle bias. The horizon is accumulated with max(), which turns *any*
+      // symmetric depth noise into a one-sided lift — the flatter and more
+      // grazing the surface, the bigger the spurious occlusion. Nudging each
+      // candidate horizon back by a fixed cosine costs a sliver of true contact
+      // darkening and removes the veil over every large flat panel.
+      float shc0 = dot(d0 / len0, viewVec) - uHorizonBias;
+      float shc1 = dot(d1 / len1, viewVec) - uHorizonBias;
       shc0 = mix(horizonCos0, shc0, w0);
       shc1 = mix(horizonCos1, shc1, w1);
 
@@ -306,6 +312,9 @@ uniform float uNear;
 uniform float uFar;
 uniform float uIntensityPower;
 uniform float uDirectPreserve;
+uniform float uAoFloor;
+uniform float uUpsampleSharpness;
+uniform float uDebug;
 layout(location = 0) out vec4 fragColor;
 
 vec3 multiBounce(float ao, vec3 albedo) {
@@ -329,17 +338,31 @@ void main() {
 
 #if AO_SCALE_HALF
   // Depth-weighted bilateral upsample from the half-res AO buffer.
+  //
+  // The weight used to be 1/(1e-3 + |zs-z|/max(z,0.1)) — unbounded as the depths
+  // converge. A tap matching to within a micron outvotes its three neighbours by
+  // ~1000:1, so along a silhouette the winning tap alternates from pixel to
+  // pixel and the edge comes back as a 1-px checkerboard that TAA then smears
+  // into a crawling fringe. A Gaussian in relative depth is bounded above by 1
+  // and never reaches zero, so all four taps always contribute something and the
+  // result varies smoothly across the edge. Clamping to the local tap range on
+  // top of that keeps a bilateral overshoot from inventing values the AO buffer
+  // never contained.
   vec4 ao4 = vec4(0.0);
   float wsum = 0.0;
+  float alo = 1.0, ahi = 0.0;
   for (int i = 0; i < 4; i++) {
     vec2 o = vec2(i == 0 || i == 2 ? -0.5 : 0.5, i < 2 ? -0.5 : 0.5);
     vec2 uv = vUv + o * uAoTexel;
     float zs = texture(tAoDepth, uv).r;
-    float w = 1.0 / (1e-3 + abs(zs - z) / max(z, 0.1));
-    ao4 += texture(tAo, uv) * w;
+    float w = exp(-uUpsampleSharpness * abs(zs - z) / max(z, 0.1)) + 1e-3;
+    vec4 s = texture(tAo, uv);
+    alo = min(alo, s.a); ahi = max(ahi, s.a);
+    ao4 += s * w;
     wsum += w;
   }
   vec4 g = ao4 / max(wsum, 1e-4);
+  g.a = clamp(g.a, alo, ahi);
 #else
   vec4 g = texture(tAo, vUv);
 #endif
@@ -351,8 +374,24 @@ void main() {
   float emissive = mat.a;
   float rough = clamp(nr.w, 0.02, 1.0);
 
+  // Visibility -> occlusion. uIntensityPower was 1.0 + 1.9*ssaoIntensity = 2.9
+  // at ultra, which turns a perfectly ordinary visibility of 0.55 into 0.19 and
+  // took an unoccluded shop sign to 11/255 (121/255 with the pass off) — a black
+  // veil, not ambient occlusion. AO is also a *bounded* term: no real surface
+  // loses all of its ambient light to a sub-metre crease, so the result is
+  // floored rather than allowed to reach zero.
   float ao = sat(pow(sat(g.a), uIntensityPower));
+  ao = mix(uAoFloor, 1.0, ao);
   ao = min(ao, bakedAo > 0.0 ? bakedAo : 1.0);
+
+  // Diagnostic channels; ship at 0. There was previously no way to tell a
+  // genuinely occluded pixel from an integrator artefact without rebuilding.
+  //   1 raw visibility   2 floored occlusion   3 baked AO   4 metalness
+  if (uDebug > 0.5) {
+    float d = uDebug < 1.5 ? sat(g.a) : (uDebug < 2.5 ? ao : (uDebug < 3.5 ? bakedAo : metal));
+    fragColor = vec4(vec3(d), color.a);
+    return;
+  }
 
   // Hue-preserving pseudo-albedo: the shaded buffer is all we have here, and the
   // multi-bounce curve only needs the chromaticity to be roughly right.
@@ -417,6 +456,32 @@ export class GtaoPass extends BasePass {
   private tier: QualityTier = { slices: 3, steps: 6, half: false };
   private flip = 0;
   private lastFrame = -1;
+
+  /**
+   * Live tuning, published on `__GTAO__` for the capture harness exactly like
+   * `__DOF__`. Nothing in the frame loop writes it.
+   *
+   * `radiusScale` is what turns the preset's *detail* radius into the world
+   * radius the horizon search actually uses. It was 2.1 (= 1.47 m at ultra),
+   * wide enough that a whole 1 m panel sat inside the search and got occluded by
+   * its own plane. GTAO is now the sub-metre crease term it should be; grounding
+   * an object against the floor is the contact-shadow ray's job, and that ray is
+   * no longer running at 19% strength.
+   */
+  readonly tuning = {
+    /** uIntensityPower = 1 + intensityGain * gfx.ssaoIntensity. */
+    intensityGain: 0.4,
+    /** World radius = gfx.ssaoRadius * radiusScale. */
+    radiusScale: 1.05,
+    /** Lowest the diffuse occlusion multiplier may reach. */
+    floor: 0.50,
+    /** Depth falloff of the half-res bilateral upsample weight. */
+    upsampleSharpness: 8,
+    /** Cosine subtracted from each candidate horizon; see the note in GTAO_FRAG. */
+    horizonBias: 0.04,
+    /** 0 off, 1 raw visibility, 2 occlusion, 3 baked AO, 4 metalness. */
+    debug: 0,
+  };
   /** Reused every frame — no allocation in the render path. */
   private readonly projVec = new THREE.Vector4(1, 1, 0, 0);
 
@@ -456,6 +521,7 @@ export class GtaoPass extends BasePass {
         uThickness: { value: 0.55 },
         uFrame: { value: 0 },
         uFar: { value: 1000 },
+        uHorizonBias: { value: 0.04 },
       },
     });
 
@@ -506,8 +572,13 @@ export class GtaoPass extends BasePass {
         uFar: { value: 1000 },
         uIntensityPower: { value: 2.2 },
         uDirectPreserve: { value: 0.25 },
+        uAoFloor: { value: 0.50 },
+        uUpsampleSharpness: { value: 8 },
+        uDebug: { value: 0 },
       },
     });
+
+    (globalThis as unknown as Record<string, unknown>).__GTAO__ = this.tuning;
   }
 
   render(ctx: PassContext, input: THREE.Texture, output: THREE.WebGLRenderTarget | null): boolean {
@@ -557,12 +628,11 @@ export class GtaoPass extends BasePass {
     (gu.uTexel.value as THREE.Vector2).set(1 / aw, 1 / ah);
     (gu.uProj.value as THREE.Vector4).copy(projVec);
     gu.uPixelsPerMeter.value = 0.5 * ah * proj[5];
-    // The preset's radius is the *detail* scale (creases, window reveals). World
-    // grounding — the darkening under a crate, in a doorway, along a kerb — needs
-    // roughly a metre and a half of reach, so scale it up here rather than
-    // asking every preset to carry a second number.
-    gu.uRadius.value = Math.max(0.05, g.ssaoRadius) * 2.1;
+    // The preset's radius is the *detail* scale (creases, window reveals).
+    // See `tuning.radiusScale` for why this is no longer a metre and a half.
+    gu.uRadius.value = Math.max(0.05, g.ssaoRadius) * this.tuning.radiusScale;
     gu.uThickness.value = 0.55;
+    gu.uHorizonBias.value = this.tuning.horizonBias;
     gu.uFrame.value = ctx.frame % 64;
     gu.uFar.value = ctx.cameraFar;
     ctx.blit(this.gtao, raw);
@@ -606,11 +676,14 @@ export class GtaoPass extends BasePass {
     (au.uAoTexel.value as THREE.Vector2).set(1 / aw, 1 / ah);
     au.uNear.value = ctx.cameraNear;
     au.uFar.value = ctx.cameraFar;
-    au.uIntensityPower.value = 1.0 + 1.9 * Math.max(0, g.ssaoIntensity);
+    au.uIntensityPower.value = 1.0 + this.tuning.intensityGain * Math.max(0, g.ssaoIntensity);
     // Direct light should survive occlusion, but not this much: at 0.25 a sunlit
     // wall base kept a quarter of its ambient occlusion budget back and the
     // contact never read.
     au.uDirectPreserve.value = 0.14;
+    au.uAoFloor.value = this.tuning.floor;
+    au.uUpsampleSharpness.value = this.tuning.upsampleSharpness;
+    au.uDebug.value = this.tuning.debug;
     ctx.blit(this.apply, output);
     return true;
   }

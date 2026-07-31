@@ -6,8 +6,11 @@ dist/
 dist-*/
 .vite/
 
-# Capture / debug artifacts
+# Capture / debug artifacts (regenerable via capture scripts)
 shots/
+.w4b/
+.mmout/
+.loadout-bundle/
 *.log
 
 # Scratch agent tooling (temporary capture/debug drivers)

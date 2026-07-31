@@ -1,8 +1,19 @@
+# Dependencies
 node_modules/
+
+# Build output
 dist/
 dist-*/
+.vite/
+
+# Capture / debug artifacts
 shots/
 *.log
+
+# Scratch agent tooling (temporary capture/debug drivers)
+probe-*.mjs
+tools/_*.mjs
+tools/.*.mjs
+
+# OS
 .DS_Store
-.vite/
-dist-*/

@@ -56,6 +56,30 @@ synthesised. This makes the project unusually reviewable — every visual result
 traces back to source you can read, rather than to a binary someone exported
 from Blender years ago.
 
+## Why it exists
+
+Not to ship a game. Two other reasons.
+
+**To develop taste.** Real-time 3D is a discipline you cannot learn by reading
+about it — you have to look at a scene, decide it is wrong, and work out *why*.
+[The visual bar](/VISUAL-BAR) is the written residue of exactly that: every
+entry started as "this looks fake" and had to be sharpened into something
+specific enough to act on. Building a full FPS forces that judgement across
+lighting, materials, composition, scale and movement feel all at once.
+
+**As a stepping stone to digital twins.** Games and digital twins are the same
+technical problem at different tolerances: procedural geometry, physically based
+materials, real-time lighting, physics, spatial reasoning, netcode for shared
+state, and a frame budget you have to respect. A game is the version where being
+wrong is free and "does this feel right" is a valid acceptance test. The skills
+transfer; the stakes do not.
+
+The economics are the enabling condition. A codebase this size used to be a
+multi-year team effort, so only people intending to sell a game could justify
+one. That cost has fallen far enough that a 148k-line engine is now a
+reasonable way to *learn something* — cheap enough to treat as an experiment,
+and cheap enough to discard and redo.
+
 ## How it was built
 
 This repository was produced by Claude Code from [a single

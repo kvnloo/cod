@@ -236,6 +236,9 @@ export class RenderSystem implements System, RenderAPI {
    * gate forbids (wave-3: 50 ms rebuild followed by two 50 ms siblings).
    */
   private hitchCoolDown = 0;
+  /** Prior camera Y for freefall / void detection. */
+  private prevCamY = 0;
+  private freefallFrames = 0;
   private exposureClock = 0;
   /** Wall seconds since the last exposure metering; handed to eye adaptation. */
   private exposureAccum = 0;
@@ -685,8 +688,32 @@ export class RenderSystem implements System, RenderAPI {
     // post + atlas bill. Measured perf-session over50s sat at y < -10 with
     // low draw counts — the CPU was already gone before we drew.
     const camY = this.camera.position.y;
+    // Void / freefall: camera Y below the playable floor band, or sustained
+    // rapid descent (perf-session fall-through spikes). Player eye is ~1.6 m;
+    // a multi-frame drop of >8 m/s while under 3 m is not a jump.
+    const dy = camY - this.prevCamY;
+    this.prevCamY = camY;
+    if (camY < 0.8 && dy < -0.25) this.freefallFrames = Math.min(30, this.freefallFrames + 2);
+    else if (camY < -1) this.freefallFrames = Math.min(30, this.freefallFrames + 3);
+    else if (this.freefallFrames > 0) this.freefallFrames--;
+    const fallen = camY < -1 || camY > 200 || this.freefallFrames >= 3;
     const liteFrame = settings.gfx.adaptive
-      && (this.hitchCoolDown > 0 || camY < -8 || camY > 200);
+      && (this.hitchCoolDown > 0 || fallen);
+
+    // Freefall / out-of-world: the perf-session worst frames sat in free-fall
+    // paying full graph while physics already owned the CPU. Present a clear
+    // and bail — no atlas, no main, no post.
+    if (settings.gfx.adaptive && fallen) {
+      const r = this.renderer;
+      r.setRenderTarget(null);
+      r.setClearColor(0x080a10, 1);
+      r.clear(true, true, true);
+      this.lastShadowMs = 0;
+      this.lastExposureMs = 0;
+      this.frameIndex++;
+      this.timer.end();
+      return;
+    }
 
     const gb = this.graph.gbuffer;
     const width = gb.width;

@@ -239,14 +239,36 @@ export const PRESETS: Record<QualityPreset, GfxSettings> = {
   /**
    * The 60 fps tier, and the default for any discrete GPU.
    *
-   * Everything here is chosen for tail latency rather than average: the shadow
-   * atlas rebuilds at 40 Hz (the largest single CPU cost, and the one the eye
-   * notices least), and the adaptive governor holds a 16.7 ms p90.
+   * Authored to hold p99 ≤ 16.7 ms on the reference machine (RTX 3080 Ti /
+   * 1080p / live firefight). The shadow atlas is ~70% of draw calls and the
+   * single largest CPU cost: high therefore does **not** inherit ultra's 4
+   * cascades, 140 m range, contact shadows or depth prepass. It keeps a 40 Hz
+   * atlas cadence so the adaptive ladder's first real step (30 Hz + contact +
+   * prepass off) is still a concession, and leaves cascade cuts for the
+   * governor when a machine still cannot hold the tier.
+   *
+   * Wave-1 live firefight on the previous high (4×1536 @ 40 Hz, contact on)
+   * measured frame-p99 25–29 ms with shadowMs max 15–16 ms alone. That is why
+   * these knobs moved.
    */
   high: derive(ULTRA, {
-    shadowMapSize: 1536, ssrSteps: 28, volumetricSteps: 40, taaSamples: 8,
-    ssaoQuality: 0.7, maxParticles: 24000, lensDirt: 0.35, dofQuality: 0.7,
-    shadowUpdateHz: 40, exposureUpdateHz: 30,
+    // Atlas cost dominates the frame. Wave-1 live firefight on 4×1536 @ 40 Hz
+    // with contact+prepass measured p99 25–29 ms and shadowMs max 15–16 ms —
+    // alone a full 60 fps budget. high must author a rebuild that fits inside
+    // the claim, not hope the adaptive dial will clean it up mid-fight.
+    shadowMapSize: 1024,
+    shadowCascades: 2,
+    shadowDistance: 80,
+    // Contact shadows force a second full opaque submission (depth prepass)
+    // and a per-pixel ray march. Neither fits a hard 16.7 ms p99 claim.
+    contactShadows: false,
+    depthPrepass: false,
+    ssrSteps: 20, volumetricSteps: 24, taaSamples: 8,
+    ssaoQuality: 0.55, maxParticles: 16000, lensDirt: 0.25, dofQuality: 0.5,
+    pcssSoftness: 0.6,
+    // 24 Hz leaves the ladder room to step to 16/12 Hz without a no-op first rung.
+    // Motion blur off: a post pass that does not define the gunfight feel.
+    shadowUpdateHz: 24, exposureUpdateHz: 20, motionBlur: false,
     adaptive: true, targetFrameMs: 16.7,
   }),
 
@@ -255,6 +277,8 @@ export const PRESETS: Record<QualityPreset, GfxSettings> = {
     renderScale: 0.85, maxPixelRatio: 1, shadowCascades: 3, shadowMapSize: 1024,
     pcssSoftness: 0.5, ssr: false, volumetricSteps: 24, ssaoQuality: 0.5,
     motionBlur: false, maxParticles: 12000, contactShadows: false, dof: false,
+    // No contact shadows and a modest particle budget: the prepass is pure cost.
+    depthPrepass: false,
     anisotropy: 8, drawDistance: 500, taaSamples: 8,
     shadowUpdateHz: 30, exposureUpdateHz: 20,
     adaptive: true, targetFrameMs: 8.3,

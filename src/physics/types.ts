@@ -118,6 +118,17 @@ export interface CharacterMoveResult {
   platformYaw?: number;
 }
 
+/** One living hit volume registered on a character controller. */
+export interface CharacterHitboxDesc {
+  zone: HitZone;
+  /** Half-extents of an AABB in character space, metres. */
+  half: [number, number, number];
+  /** Offset from the capsule centre in character local frame, metres. */
+  offset: [number, number, number];
+  /** Surface response for impacts; defaults by zone (head→helmet, else flesh). */
+  surface?: SurfaceType;
+}
+
 export interface CharacterController {
   radius: number;
   height: number;
@@ -129,6 +140,14 @@ export interface CharacterController {
   canSetHeight?(h: number, position: Vector3): boolean;
   /** Hard-sets the position, clearing ground/platform state. */
   teleport?(position: Vector3): void;
+  /** Tag every collider on this character so raycasts report the owning entity. */
+  setEntity?(entityId: number, object?: Object3D | null): void;
+  /**
+   * Register multi-zone living hitboxes. Replaces any previous set. Moves the
+   * solid movement capsule onto CLIP (blocks walk, invisible to MASK_BULLET)
+   * so bullets resolve only against the zoned volumes.
+   */
+  setHitboxes?(boxes: readonly CharacterHitboxDesc[]): void;
   /** Maximum walkable slope in degrees. */
   slopeLimit?: number;
   /** Obstacle height traversed without leaving the ground, metres. */

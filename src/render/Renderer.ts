@@ -225,6 +225,8 @@ export class RenderSystem implements System, RenderAPI {
    * the frames that need help are exactly the slow ones. */
   private shadowClock = 0;
   private shadowDue = true;
+  /** Wall frames since last atlas rebuild; enforces a minimum gap under adaptive. */
+  private shadowFramesSince = 99;
   private exposureClock = 0;
   /** Wall seconds since the last exposure metering; handed to eye adaptation. */
   private exposureAccum = 0;
@@ -284,6 +286,14 @@ export class RenderSystem implements System, RenderAPI {
   private tmpE = new THREE.Euler();
   private tmpColor = new THREE.Color();
   private gradeVec = new THREE.Vector4(1.05, 1.03, 0.0, 0.0);
+  /** Scratch for getDrawingBufferSize — never allocate inside applyQuality/resize. */
+  private readonly dbSize = new THREE.Vector2();
+  /**
+   * Fingerprint of the last shadow knobs applied. `applyQuality` only forces an
+   * atlas rebuild when this changes — a budget commit that only flips DoF must
+   * not pay a full multi-cascade re-submit.
+   */
+  private shadowApplyKey = '';
   private borrowed: THREE.WebGLRenderTarget[] = [];
   private warnedLights = false;
   private readonly atmosphere: AtmosphereState = {
@@ -388,7 +398,7 @@ export class RenderSystem implements System, RenderAPI {
     this.viewModelScene.add(this.vmFill, this.vmFill.target);
     this.viewModelScene.add(this.vmRim, this.vmRim.target);
 
-    const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+    const size = renderer.getDrawingBufferSize(this.dbSize);
     this.graph.resize(size.x, size.y);
 
     registerRenderDebugScene(this);
@@ -473,20 +483,41 @@ export class RenderSystem implements System, RenderAPI {
    */
   private applyQuality(full = true): void {
     const g = settings.gfx;
-    this.renderer.setPixelRatio(this.pixelRatio * g.renderScale);
+    // Only touch pixel ratio when the scale product actually changed — three
+    // reallocates the drawing buffer on setPixelRatio, and a budget commit that
+    // only flipped DoF used to pay that stall on every dial step.
+    const wantPr = this.pixelRatio * g.renderScale;
+    if (Math.abs(this.renderer.getPixelRatio() - wantPr) > 1e-4) {
+      this.renderer.setPixelRatio(wantPr);
+    }
     this.lights.setBudget(this.lightBudget());
     this.decals.setCapacity(g.maxDecals);
     if (full) {
       this.sky.invalidate();
       this.exposure.reset();
     }
-    const size = this.renderer.getDrawingBufferSize(new THREE.Vector2());
+    const size = this.renderer.getDrawingBufferSize(this.dbSize);
     const changed = size.x !== this.graph.width || size.y !== this.graph.height;
-    this.graph.resize(size.x, size.y);
-    if (full || changed) for (const p of this.passes) p.resize(this.graph.width, this.graph.height);
-    // A new cadence must take effect on the next frame, not after the old
-    // interval expires.
-    this.shadowDue = true;
+    if (changed || full) {
+      this.graph.resize(size.x, size.y);
+      for (const p of this.passes) p.resize(this.graph.width, this.graph.height);
+    }
+    // Only force an atlas rebuild when shadow knobs actually moved. A budget
+    // commit that only disables DoF used to set shadowDue=true and manufacture
+    // a hitch on a zero-visual-change step — including the old high-preset
+    // no-op dial to shadows-40hz.
+    // Force an immediate rebuild only when the atlas itself must change
+    // (cascades / resolution / enabled). Cadence and distance alone take
+    // effect on the next natural tick — forcing shadowDue on every Hz step
+    // used to cluster full rebuilds right after a budget commit and manufacture
+    // the p99 tail the dial was trying to close.
+    const shadowKey = [
+      g.shadows ? 1 : 0, g.shadowCascades, g.shadowMapSize, g.pcssSoftness,
+    ].join('|');
+    if (shadowKey !== this.shadowApplyKey) {
+      this.shadowApplyKey = shadowKey;
+      this.shadowDue = true;
+    }
   }
 
   /**
@@ -569,7 +600,7 @@ export class RenderSystem implements System, RenderAPI {
     const r = this.renderer;
     r.setPixelRatio(pixelRatio * settings.gfx.renderScale);
     r.setSize(width, height, false);
-    const size = r.getDrawingBufferSize(new THREE.Vector2());
+    const size = r.getDrawingBufferSize(this.dbSize);
     this.graph.resize(size.x, size.y);
     this.viewModelCamera.aspect = width / Math.max(1, height);
     this.viewModelCamera.updateProjectionMatrix();
@@ -690,8 +721,15 @@ export class RenderSystem implements System, RenderAPI {
     // previous atlas at zero cost and the published cascade matrices stay
     // consistent with it. `shadowUpdateHz` sets how often it is rebuilt.
     if (g.shadows) {
-      if (this.shadowDue || this.shadowTick(g.shadowUpdateHz)) {
+      this.shadowFramesSince++;
+      // Adaptive: never rebuild on consecutive display frames. The atlas is
+      // persistent; a 1-frame lag on moving casters is invisible, and it
+      // prevents a hitch frame from immediately queueing another full submit.
+      const minGap = g.adaptive ? 2 : 1;
+      const due = this.shadowDue || this.shadowTick(g.shadowUpdateHz);
+      if (due && this.shadowFramesSince >= minGap) {
         this.shadowDue = false;
+        this.shadowFramesSince = 0;
         const t0 = performance.now();
         this.shadows.render(this.scene, this.camera, u.boSunDirWorld.value, this.worldIndex, {
           cascades: g.shadowCascades,
@@ -701,6 +739,18 @@ export class RenderSystem implements System, RenderAPI {
           lambda: 0.86,
         });
         this.lastShadowMs = performance.now() - t0;
+        // If this rebuild itself blew the budget, push the next one out so a
+        // single expensive atlas does not chain into a visible hitch pair.
+        if (this.lastShadowMs > 8 && g.adaptive) {
+          this.shadowClock = 0;
+          this.shadowFramesSince = -1;
+        }
+      } else {
+        // Reused the previous atlas — document 0 so playtest mean/worst1pct
+        // can tell rebuild frames from skip frames. Leaving the sticky rebuild
+        // cost here used to mis-attribute hitches (e.g. 57 ms frame, shadow 5.8
+        // that was the previous rebuild).
+        this.lastShadowMs = 0;
       }
     } else {
       this.shadows.setDisabled();

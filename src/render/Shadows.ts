@@ -92,7 +92,7 @@ const MIN_SHADOW = 0.12;
 const MIN_CASTER_HEIGHT = MIN_SHADOW * SHADOW_TAN;
 
 /** Frames between full scene walks looking for newly built alpha-cut geometry. */
-const RESCAN_INTERVAL = 30;
+const RESCAN_INTERVAL = 90;
 
 /** How many instances of a cluster are measured for the height gate. */
 const HEIGHT_SAMPLES = 64;
@@ -206,6 +206,7 @@ export class ShadowSystem {
   private readonly centre = new THREE.Vector3();
   private readonly lightPos = new THREE.Vector3();
   private readonly up = new THREE.Vector3(0, 1, 0);
+  private readonly origin = new THREE.Vector3(0, 0, 0);
   private readonly tmpV = new THREE.Vector3();
   private readonly tmpM = new THREE.Matrix4();
   private readonly lightBasis = new THREE.Matrix4();
@@ -364,7 +365,7 @@ export class ShadowSystem {
     this.up.set(0, 1, 0);
     if (Math.abs(sunDir.y) > 0.995) this.up.set(0, 0, 1);
     this.tmpV.copy(sunDir).multiplyScalar(-1);
-    this.lightBasis.lookAt(new THREE.Vector3(0, 0, 0), this.tmpV, this.up);
+    this.lightBasis.lookAt(this.origin, this.tmpV, this.up);
     this.lightBasisInv.copy(this.lightBasis).invert();
 
     const renderer = this.renderer;
@@ -519,7 +520,11 @@ export class ShadowSystem {
    * player turns round.
    */
   private syncAlphaCasters(scene: THREE.Scene): void {
-    const want = this.alphaWanted && settings.preset !== 'low';
+    // Alpha-cut casters cost ~60 extra atlas draws and a material swap per mesh.
+    // Keep them on ultra/cinematic where the player opted into uncapped cost;
+    // high/medium already struggle on CPU submit of the solid casters alone.
+    const want = this.alphaWanted
+      && (settings.preset === 'ultra' || settings.preset === 'cinematic');
     if (!want) {
       if (this.alphaActive) this.releaseAlphaCasters();
       this.frame = 0;

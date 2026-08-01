@@ -50,6 +50,8 @@ export class Killfeed implements Widget {
   private readonly off: Array<() => void> = [];
   /** Name shown for the local player in feed entries. */
   playerName = 'YOU';
+  /** Last known player weapon class — entity:death has no weapon payload. */
+  private playerWeapon: WeaponKind = 'ar';
 
   constructor(private pal: () => Palette) {
     this.off.push(bus.on('entity:death', (e) => {
@@ -57,14 +59,19 @@ export class Killfeed implements Widget {
       this.push({
         killer: e.byPlayer ? this.playerName : 'HOSTILE',
         victim: (e.name || 'ENEMY').toUpperCase(),
-        weapon: 'ar',
+        weapon: e.byPlayer ? this.playerWeapon : 'ar',
         headshot: e.headshot,
         killerIsPlayer: e.byPlayer,
         victimIsPlayer: false,
         friendlyKiller: e.byPlayer,
       });
     }));
-    this.off.push(bus.on('weapon:switch', () => { /* keeps weapon glyph in sync */ }));
+    this.off.push(bus.on('weapon:switch', (e) => {
+      this.playerWeapon = classifyWeapon(e.to);
+    }));
+    this.off.push(bus.on('weapon:fire', (e) => {
+      this.playerWeapon = classifyWeapon(e.weaponId);
+    }));
   }
 
   /** Public entry point — game modes push fully-formed records here. */

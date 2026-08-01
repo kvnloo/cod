@@ -93,6 +93,21 @@ const CFG = {
   quiet: has('quiet'),
 };
 
+
+/** Classify UNMASKED_RENDERER_WEBGL into a display path + contamination reasons. */
+function classifyDisplay(renderer) {
+  const r = String(renderer || '');
+  const software = /llvmpipe|SwiftShader|Softpipe|Software|Microsoft Basic Render/i.test(r)
+    || !/^ANGLE \((NVIDIA|AMD|Intel)/i.test(r);
+  const reasons = [];
+  if (software) reasons.push('software-gl');
+  return {
+    displayPath: software ? 'software' : 'hardware',
+    softwareGL: software,
+    contamination: reasons,
+  };
+}
+
 /* --------------------------------------------------------------- gate spec -- */
 
 /**
@@ -135,19 +150,45 @@ const GATES = [
   {
     id: 'frame-p99', hard: true,
     what: `p99 wall-clock frame time at ${CFG.width}x${CFG.height}/${CFG.quality} (ms)`,
-    target: `<= ${CFG.p99Budget}`,
+    target: `<= ${CFG.p99Budget} on hardware GL`,
     read: (r) => r.frame.p99,
-    ok: (v) => Number.isFinite(v) && v <= CFG.p99Budget,
+    ok: (v, r) => {
+      if (r && r.meta && r.meta.displayPath === 'software') return false;
+      return Number.isFinite(v) && v <= CFG.p99Budget;
+    },
     why: '16.7 ms is the 60 fps budget. p99 rather than mean, because the framerate '
-      + 'a player complains about is the bad frames, not the average.',
+      + 'a player complains about is the bad frames, not the average. Software GL '
+      + 'cannot pass frame gates — that grades the rasteriser, not the game.',
   },
   {
     id: 'frame-spikes', hard: true,
     what: 'frames over 50 ms after warm-up',
-    target: '== 0',
+    target: '== 0 on hardware GL',
     read: (r) => r.frame.over50,
-    ok: (v) => v === 0,
-    why: 'A 50 ms frame is a visible hitch. After warm-up there is no excuse for one.',
+    ok: (v, r) => {
+      if (r && r.meta && r.meta.displayPath === 'software') return false;
+      return v === 0;
+    },
+    why: 'A 50 ms frame is a visible hitch. After warm-up there is no excuse for one. '
+      + 'Software GL cannot pass frame gates.',
+  },
+  {
+    id: 'display-path-hardware', hard: true,
+    what: 'wall-clock / visual gates require a hardware GL display path',
+    target: "displayPath === 'hardware'",
+    read: (r) => r.meta.displayPath,
+    ok: (v) => v === 'hardware',
+    why: 'A software rasteriser (llvmpipe/SwiftShader) is not evidence about shipping '
+      + 'frame times or visuals. meta.contamination lists why.',
+  },
+  {
+    id: 'frame-capture-sync', hard: true,
+    what: 'wall-clock sample must not pay capture-mode GPU sync flush',
+    target: 'captureSync === false',
+    read: (r) => r.frame.captureSync,
+    ok: (v) => v === false,
+    why: 'capture=1 forces Exposure readRenderTargetPixels (~7 ms/frame) and freezes '
+      + 'FrameBudget. Frame gates measured under that regime grade the instrument.',
   },
   {
     id: 'ttk-lethal', hard: true,
@@ -802,6 +843,9 @@ function INSTALL_PROBE() {
         dc: rs ? rs.drawCalls : 0,
         tri: rs ? rs.triangles : 0,
         gpu: rs ? +rs.gpuMs.toFixed(3) : 0,
+        shadow: rs ? +rs.shadowMs.toFixed(3) : 0,
+        captureSync: rs ? !!rs.captureSync : null,
+        dial: rs && rs.budget ? rs.budget.dial : -1,
         px: +player.position.x.toFixed(2),
         py: +player.position.y.toFixed(2),
         pz: +player.position.z.toFixed(2),
@@ -825,6 +869,7 @@ function INSTALL_PROBE() {
     return { wall: L.wall, cpu: L.cpu, ctx: L.ctx, durationMs: performance.now() - L.t0 };
   };
 
+  const rs0 = render && render.stats ? render.stats() : null;
   return {
     ok: true,
     systems: e.systems.map((s) => s.name),
@@ -833,6 +878,7 @@ function INSTALL_PROBE() {
     aiNavCells: ai && ai.nav && ai.nav.cells ? (ai.nav.cells.length || ai.nav.cells.size || 0) : 0,
     actorBackend: actorProto.constructor.name,
     weapons: weapons.slots.map((s) => s.runtime.id),
+    captureSync: rs0 ? !!rs0.captureSync : null,
   };
 }
 
@@ -878,21 +924,71 @@ function classify(wallP50, cpuP50, gpuMean) {
 
 /* ------------------------------------------------------------------ phases -- */
 
-/** Traversal beats. Each is (hold, press, frames) at the 120 Hz fixed step. */
+/**
+ * Traversal beats at the 120 Hz fixed step.
+ *
+ * Skill beats use `phases` so a single label can wind up, slide, jump, and
+ * air-strafe — a flat hold list from rest cannot express the Apex chain
+ * (crouch+sprint from rest is crouchSpeed forever; jump without crouch never
+ * fires slideJump; W-only air is capped by airWishCap).
+ */
 const MOVE_BEATS = [
   { label: 'idle', hold: [], frames: 60 },
   { label: 'walk', hold: ['forward'], frames: 180 },
   { label: 'sprint', hold: ['forward', 'sprint'], frames: 240 },
-  { label: 'slide', hold: ['forward', 'sprint', 'crouch'], frames: 150 },
-  { label: 'slide-jump', hold: ['forward', 'sprint', 'jump'], frames: 120, jump: true },
+  // Wind up standing sprint, then crouch into a slide — never crouch from rest.
+  {
+    label: 'slide',
+    phases: [
+      { hold: ['forward', 'sprint'], frames: 160 },
+      { hold: ['forward', 'sprint', 'crouch'], frames: 100 },
+    ],
+  },
+  // Full slide-jump: windup → slide → jump out of slide → carry.
+  {
+    label: 'slide-jump',
+    phases: [
+      { hold: ['forward', 'sprint'], frames: 160 },
+      { hold: ['forward', 'sprint', 'crouch'], frames: 28 },
+      { hold: ['forward', 'sprint', 'crouch'], frames: 4, jump: true },
+      { hold: ['forward', 'sprint'], frames: 80 },
+    ],
+  },
   { label: 'strafe-left', hold: ['forward', 'left'], frames: 120 },
   { label: 'strafe-right', hold: ['forward', 'right'], frames: 120 },
-  { label: 'bhop-1', hold: ['forward', 'jump'], frames: 90, jump: true },
-  { label: 'bhop-2', hold: ['forward', 'jump'], frames: 90, jump: true },
+  // Bunny-hop with lateral wish so air-accel has something to project onto.
+  {
+    label: 'bhop-1',
+    phases: [
+      { hold: ['forward', 'sprint'], frames: 100 },
+      { hold: ['forward', 'sprint'], frames: 3, jump: true },
+      { hold: ['left', 'sprint'], frames: 40 },
+      { hold: ['forward', 'sprint'], frames: 3, jump: true },
+      { hold: ['right', 'sprint'], frames: 40 },
+    ],
+  },
+  {
+    label: 'bhop-2',
+    phases: [
+      { hold: ['forward', 'sprint'], frames: 80 },
+      { hold: ['forward', 'sprint'], frames: 3, jump: true },
+      { hold: ['left', 'sprint'], frames: 36 },
+      { hold: ['forward', 'sprint'], frames: 3, jump: true },
+      { hold: ['right', 'sprint'], frames: 36 },
+      { hold: ['forward', 'sprint'], frames: 3, jump: true },
+      { hold: ['left', 'sprint'], frames: 36 },
+    ],
+  },
   { label: 'backpedal', hold: ['back'], frames: 120 },
   { label: 'crouch-walk', hold: ['forward', 'crouch'], frames: 120 },
   { label: 'settle', hold: [], frames: 60 },
 ];
+
+/** Expand a beat into a flat list of per-frame holds. */
+function beatPhases(beat) {
+  if (beat.phases && beat.phases.length) return beat.phases;
+  return [{ hold: beat.hold || [], frames: beat.frames || 0, jump: !!beat.jump }];
+}
 
 async function runMovement(session) {
   return session.exec((beats) => {
@@ -918,16 +1014,26 @@ async function runMovement(session) {
       const t0 = e.time.elapsed;
       const p0 = player.position.clone();
       let peak = 0, air = 0, maxY = p0.y, minY = p0.y;
-      for (let i = 0; i < beat.frames; i++) {
-        if (beat.jump) a.markJump();
-        hold(beat.hold, []);
-        e.stepFrame(1 / 120);
-        const v = player.velocity;
-        const hs = Math.hypot(v.x, v.z);
-        if (hs > peak) peak = hs;
-        if (!player.grounded) air++;
-        if (player.position.y > maxY) maxY = player.position.y;
-        if (player.position.y < minY) minY = player.position.y;
+      let frames = 0;
+      let anyHold = false;
+      const phases = beat.phases && beat.phases.length
+        ? beat.phases
+        : [{ hold: beat.hold || [], frames: beat.frames || 0, jump: !!beat.jump }];
+      for (const phase of phases) {
+        const n = phase.frames | 0;
+        if ((phase.hold || []).length) anyHold = true;
+        for (let i = 0; i < n; i++) {
+          if (phase.jump) a.markJump();
+          hold(phase.hold || [], []);
+          e.stepFrame(1 / 120);
+          frames++;
+          const v = player.velocity;
+          const hs = Math.hypot(v.x, v.z);
+          if (hs > peak) peak = hs;
+          if (!player.grounded) air++;
+          if (player.position.y > maxY) maxY = player.position.y;
+          if (player.position.y < minY) minY = player.position.y;
+        }
       }
       hold([], []);
       const p1 = player.position;
@@ -944,7 +1050,7 @@ async function runMovement(session) {
         endState: player.state,
         // A beat that goes nowhere ran into level geometry; its speed numbers
         // describe the wall, not the movement model.
-        blockedByGeometry: beat.hold.length > 0 && travel < peak * seconds * 0.25,
+        blockedByGeometry: anyHold && travel < peak * seconds * 0.25,
       });
     }
     const d = a.dump(false);
@@ -1369,6 +1475,16 @@ async function runLive(session, ms, warmupMs, timeline = LIVE_TIMELINE) {
   frame.triangles = { mean: Math.round(avg(tris)), max: tris.length ? Math.max(...tris) : 0 };
   frame.gpuMs = gpu.length ? { mean: +avg(gpu).toFixed(3), max: +Math.max(...gpu).toFixed(3) } : null;
   frame.bound = classify(frame.p50, frame.cpuMs.p50, frame.gpuMs ? frame.gpuMs.mean : 0);
+  const syncFlags = ctx.map((c) => c && c.captureSync).filter((v) => v !== null && v !== undefined);
+  // Any true means the instrument polluted the sample; all false is honest live.
+  frame.captureSync = syncFlags.length ? syncFlags.some(Boolean) : null;
+  const shadows = ctx.map((c) => (c && c.shadow) || 0);
+  frame.shadowMs = {
+    mean: +avg(shadows).toFixed(3),
+    max: shadows.length ? +Math.max(...shadows).toFixed(3) : 0,
+  };
+  const dials = ctx.map((c) => (c && c.dial !== undefined ? c.dial : -1)).filter((d) => d >= 0);
+  frame.budgetDialEnd = dials.length ? dials[dials.length - 1] : -1;
   return { frame, ctx };
 }
 
@@ -1391,28 +1507,45 @@ async function main() {
     if (r.status !== 0) { console.error(r.stdout + r.stderr); throw new Error('vite build failed'); }
   }
   const base = await ensureServer({ port: CFG.port, outDir: CFG.dist });
-  const url = `${base}/?capture=1&quality=${CFG.quality}&mode=${CFG.mode}&seed=${CFG.seed}`;
-  const session = await openSession({ url, width: CFG.width, height: CFG.height, quality: CFG.quality, seed: CFG.seed });
+  // capture=0: honest wall clocks. capture=1 forces Exposure sync readback
+  // (~7 ms/frame GPU flush) and freezes FrameBudget — measuring the instrument.
+  const url = `${base}/?capture=0&quality=${CFG.quality}&mode=${CFG.mode}&seed=${CFG.seed}`;
+  const session = await openSession({
+    url, width: CFG.width, height: CFG.height, quality: CFG.quality, seed: CFG.seed, capture: 0,
+  });
   log(`${stamp()} GPU ${session.renderer}`);
 
+  const display = classifyDisplay(session.renderer);
   const report = {
     tool: 'playtest', version: '1.0.0',
     meta: {
       gpu: session.renderer, quality: CFG.quality, width: CFG.width, height: CFG.height,
       seed: CFG.seed, mode: CFG.mode, dist: CFG.dist, port: CFG.port,
       startedAt: new Date().toISOString(), errors: [],
+      displayPath: display.displayPath,
+      softwareGL: display.softwareGL,
+      contamination: display.contamination.slice(),
     },
     frame: {}, enemies: {}, combat: {}, deaths: {}, movement: {}, recoil: {},
   };
+  if (display.softwareGL) {
+    log(`${stamp()} WARNING: software GL — frame/visual gates will hard-fail (${session.renderer})`);
+  }
 
   try {
     await session.exec(INSTALL_INPUT_BRIDGE);
     const boot = await session.exec(INSTALL_PROBE);
+    // capture=0 boots the free rAF loop; park it so fixed-step phases are pure.
+    // runLive() restarts it for the wall-clock sample.
+    await session.exec(() => { const e = globalThis.engine; if (e && e.stop) e.stop(); });
     log(`${stamp()} probe installed — actors=${boot.actorBackend} `
-      + `ai.agents=${boot.aiAgents} ai.cover=${boot.aiCover} weapons=[${boot.weapons.join(',')}]`);
+      + `ai.agents=${boot.aiAgents} ai.cover=${boot.aiCover} weapons=[${boot.weapons.join(',')}]`
+      + ` captureSync=${boot.captureSync}`);
     Object.assign(report.enemies, {
       actorBackend: boot.actorBackend, aiAgents: boot.aiAgents, aiCover: boot.aiCover,
     });
+    report.meta.captureSync = boot.captureSync;
+    report.meta.capture = 0;
 
     /* ------------------------------------------------ phase 1: baseline -- */
     log(`${stamp()} phase 1/7 — warm-up, match start`);
@@ -1504,6 +1637,14 @@ async function main() {
     log(`${stamp()}   >16.7 ms ${live.frame.over16_7}   >33 ms ${live.frame.over33}   >50 ms ${live.frame.over50}`);
     log(`${stamp()}   cpu p50 ${live.frame.cpuMs.p50} ms  gpu mean ${live.frame.gpuMs ? live.frame.gpuMs.mean : 'n/a'} ms  `
       + `${live.frame.drawCalls.mean} draws  ${(live.frame.triangles.mean / 1000).toFixed(0)}k tris  → ${live.frame.bound}`);
+    log(`${stamp()}   captureSync=${live.frame.captureSync}  shadowMs mean ${live.frame.shadowMs ? live.frame.shadowMs.mean : 'n/a'}  `
+      + `budgetDialEnd=${live.frame.budgetDialEnd}`);
+    report.meta.captureSync = live.frame.captureSync;
+    if (live.frame.captureSync) {
+      if (!report.meta.contamination.includes('capture-sync')) {
+        report.meta.contamination.push('capture-sync');
+      }
+    }
     for (const w of live.frame.worst1pct.slice(0, 5)) {
       log(`${stamp()}     worst ${String(w.ms).padStart(8)} ms @ t=${w.t}ms  state=${w.st}  `
         + `enemies=${w.live}  draws=${w.dc}  tris=${w.tri}`);
@@ -1565,7 +1706,10 @@ async function main() {
     let measured;
     try { measured = g.read(report); } catch { measured = undefined; }
     let pass = false;
-    try { pass = !!g.ok(measured); } catch { pass = false; }
+    try {
+      // Always pass report so frame gates can hard-fail on software GL.
+      pass = !!g.ok(measured, report);
+    } catch { pass = false; }
     return { id: g.id, hard: g.hard, what: g.what, target: g.target, measured, pass, why: g.why };
   });
   report.gates = results;

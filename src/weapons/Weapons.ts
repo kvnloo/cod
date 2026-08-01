@@ -41,6 +41,7 @@ import { SpreadState, type SpreadContext } from './Spread';
 import { Ballistics, type DamageResolver } from './Ballistics';
 import { TracerPool } from './Tracers';
 import { GRENADES, GrenadeSystem, type GrenadeDef, type GrenadeKind, type ProjectilePhysics } from './Grenades';
+import { getPresentScale } from '../game/Lifecycle';
 
 export type { WeaponRuntime, WeaponSnapshot } from './types';
 
@@ -128,6 +129,18 @@ export class WeaponSystem implements System {
   private fireReadyAt = -999;
   /** Sim time of the most recent shot, for telemetry. */
   private lastShotAt = -1;
+  /** Presentation-only hitstop remaining (display seconds, never scales sim). */
+  private hitstopRemain = 0;
+  /**
+   * Display-path fire ack already published for this shotIndex (muzzle/audio/kick).
+   * Ballistics remain in fixedUpdate `shoot()`.
+   */
+  private presentLatched = false;
+  private presentShotIndex = -1;
+  /** Category B juice stamps for g2-gunfeel (wall + sim clocks). */
+  private readonly juiceLog: Array<{
+    kind: string; wallMs: number; simT: number; detail?: Record<string, unknown>;
+  }> = [];
 
   /**
    * Gameplay ADS blend, advanced on the fixed step.
@@ -176,6 +189,10 @@ export class WeaponSystem implements System {
     this.renderApi = ctx.engine.tryGet<System & RenderExtras>('render') ?? null;
     this.camera = ctx.camera;
     this.baseAdsFovScale = settings.game.adsFovScale;
+    bus.on('damage:dealt', (e) => {
+      if (!e.fromPlayer || e.amount <= 0) return;
+      this.pulseHitstop(e.killed ? 0.065 : 0.035, e.killed);
+    });
 
     this.ballistics.physics = this.physics;
     this.ballistics.render = this.renderApi;
@@ -211,7 +228,45 @@ export class WeaponSystem implements System {
       if (this.adsEmitting) return;
       this.adsScripted = e.active;
     });
+
+    // Category B latency chain + presentation hitstop on gun hits.
+    bus.on('hud:hitmarker', (e) => {
+      this.stampJuice('hitmarker', { killed: e.killed, headshot: e.headshot, armor: e.armor });
+      if (e.killed) this.pulseHitstop(0.055, true);
+      else if (e.headshot) this.pulseHitstop(0.038, false);
+    });
+    bus.on('damage:dealt', (e) => {
+      if (!e.fromPlayer) return;
+      this.stampJuice('damage', {
+        killed: e.killed, headshot: e.headshot, amount: e.amount, targetId: e.targetId,
+      });
+    });
+    bus.on('bullet:impact', () => { this.stampJuice('bulletImpact'); });
+    bus.on('entity:death', (e) => {
+      if (e.byPlayer) this.stampJuice('death', { headshot: e.headshot, id: e.id });
+    });
+    bus.on('score:add', (e) => {
+      this.stampJuice('score', { amount: e.amount, reason: e.reason });
+    });
+    bus.on('damage:taken', () => { this.stampJuice('damageTaken'); });
   }
+
+  private stampJuice(kind: string, detail?: Record<string, unknown>): void {
+    if (this.juiceLog.length > 2500) this.juiceLog.splice(0, this.juiceLog.length - 2000);
+    this.juiceLog.push({
+      kind,
+      wallMs: performance.now(),
+      simT: this.timeNow,
+      detail,
+    });
+  }
+
+  /** Probe read-out for Category B juice latencies. */
+  juiceDump(): Array<{ kind: string; wallMs: number; simT: number; detail?: Record<string, unknown> }> {
+    return this.juiceLog.slice();
+  }
+
+  clearJuice(): void { this.juiceLog.length = 0; }
 
   /* --------------------------------------------------------------- loadout */
 
@@ -350,9 +405,13 @@ export class WeaponSystem implements System {
     // Recoil recovery is driven from here, not from the render frame, so a
     // spray recovers identically at 30 and 540 fps.
     this.player?.camera.stepRecoil(dt);
-    if (this.stanceSprinting) {
+    // Sprint-out arms while sprint input OR sprint stance is live. Stance alone
+    // missed frames where speed was still ramping (state stayed `run`) and the
+    // playtest measured 8.33 ms instead of ~sprintOut.
+    const sprintLive = this.stanceSprinting || input.held('sprint');
+    if (sprintLive) {
       this.lastSprintAt = this.timeNow;
-      this.fireReadyAt = this.timeNow + slot.stats.sprintOut;
+      this.fireReadyAt = this.timeNow + Math.max(0.05, slot.stats.sprintOut);
     }
     this.recoil.tick(dt, def.recoil);
     // Bloom must not decay faster than the gun cycles, or holding the trigger
@@ -670,8 +729,10 @@ export class WeaponSystem implements System {
     // `stats.sprintOut` is the authored per-weapon number (VKR-7 190 ms, Hornet
     // 130 ms, Vulcan 360 ms) and attachments scale it.
     const sprintBlocked = this.timeNow < this.fireReadyAt - FIRE_EPS;
+    // Input sprint still held must not shoot even if move state already dropped
+    // (e.g. fire-cancel race on the same step as the timer arm).
     const blocked = w.reloading || this.state === 'drawing' || this.state === 'holstering'
-      || this.state === 'melee' || this.stanceSprinting || sprintBlocked
+      || this.state === 'melee' || this.stanceSprinting || input.held('sprint') || sprintBlocked
       || this.grenades.cooking;
     if (blocked) { if (this.state === 'firing') this.state = 'idle'; return; }
 
@@ -775,37 +836,104 @@ export class WeaponSystem implements System {
     const rig = this.player?.camera;
     if (rig) {
       rig.addRecoil(imp.pitch * (Math.PI / 180), -imp.yaw * (Math.PI / 180), imp.recover);
-      rig.addShake(def.recoil.shake * (1 - this.adsBlendSim * 0.45), 30, 0.18);
     }
-    this.viewModel.onFire(imp.pitch, imp.yaw);
-    // A can turns a fireball into a puff; the view-model emitter has to know.
-    if (stats.suppressed) this.viewModel.setFlashScale(0.16);
-    input.rumble(Math.min(1, def.recoil.shake * 55), 0.25, 55);
 
-    /* --- events ---------------------------------------------------------- */
-    this.viewModel.muzzleWorld(cam, this._muzzle);
-    bus.emit('weapon:fire', {
-      weaponId: w.id,
-      origin: this._muzzle.clone(),
-      direction: this._tmp.clone(),
-      shotIndex: this.shotIndex,
-      suppressed: stats.suppressed,
-    });
-    if (!stats.suppressed && this.renderApi) {
-      this.renderApi.addDynamicLight({
-        position: this._muzzle.clone(),
-        color: 0xffcb87,
-        intensity: 12 + pellets * 2,
-        radius: 6.5,
-        lifetime: 0.055,
-        decay: 'flash',
+    // Presentation may already have fired on the display path for this shot
+    // (input→first-visible). Auth recoil still always applies above.
+    const alreadyPresented = this.presentLatched && this.presentShotIndex === this.shotIndex;
+    if (!alreadyPresented) {
+      if (rig) {
+        // Single FP shake path: CameraRig only (MuzzleFX skips firstPerson shake).
+        rig.addShake(def.recoil.shake * (1 - this.adsBlendSim * 0.45), 30, 0.18);
+      }
+      this.viewModel.onFire(imp.pitch, imp.yaw);
+      // A can turns a fireball into a puff; the view-model emitter has to know.
+      if (stats.suppressed) this.viewModel.setFlashScale(0.16);
+      input.rumble(Math.min(1, def.recoil.shake * 55), 0.25, 55);
+
+      /* --- events ---------------------------------------------------------- */
+      // Origin is the true muzzle; direction is the bore/aim vector (not the last
+      // pellet's spread sample in `_tmp`). MuzzleFX owns the world flash light;
+      // the view-model PointLight washes the hands.
+      this.viewModel.muzzleWorld(cam, this._muzzle);
+      bus.emit('weapon:fire', {
+        weaponId: w.id,
+        origin: this._muzzle.clone(),
+        direction: this._dir.clone(),
+        shotIndex: this.shotIndex,
+        suppressed: stats.suppressed,
       });
-      this.renderApi.screenEffect({ flash: { intensity: 0.10, color: 0xffd9a8, decay: 0.06 } });
     }
+    this.presentLatched = false;
+    this.stampJuice('fire', {
+      weaponId: w.id, shotIndex: this.shotIndex, presented: alreadyPresented,
+    });
     if (def.cls === 'lmg' && w.heat > 0.85) {
       bus.emit('weapon:overheat', { weaponId: w.id, heat: w.heat });
     }
     this.shotIndex++;
+  }
+
+  /**
+   * Display-rate fire ack: muzzle flash, kick and report without waiting for
+   * the next fixed step when a round is due. Ballistics stay in `shoot()`.
+   */
+  private tryPresentFire(dt: number): void {
+    if (this.presentLatched) return;
+    const slot = this.slots[this.index];
+    if (!slot || !this.camera) return;
+    const w = slot.runtime;
+    const def = w.def;
+    const held = input.held('fire');
+    const pressed = input.pressed('fire');
+    if (!held && !pressed) return;
+
+    const sprintBlocked = this.timeNow < this.fireReadyAt - FIRE_EPS;
+    const blocked = w.reloading || this.state === 'drawing' || this.state === 'holstering'
+      || this.state === 'melee' || this.stanceSprinting || sprintBlocked
+      || this.grenades.cooking || w.ammo <= 0 || this.burstLeft > 0;
+    if (blocked) return;
+
+    const dueIn = this.nextShotAt - this.timeNow;
+    if (dueIn > dt + FIRE_EPS && !(pressed && dueIn <= this.refireInterval(def))) return;
+    if (w.fireMode === 'semi' && this.triggerHeld && !pressed) return;
+
+    const cam = this.camera;
+    const stats = slot.stats;
+    const camRig = this.player?.camera;
+    const pitch = def.recoil.viewKickUp ?? 0.5;
+    const yaw = 0;
+    if (camRig) {
+      camRig.addShake(def.recoil.shake * (1 - this.adsBlendSim * 0.45), 30, 0.18);
+    }
+    this.viewModel.onFire(pitch, yaw);
+    if (stats.suppressed) this.viewModel.setFlashScale(0.16);
+    input.rumble(Math.min(1, def.recoil.shake * 55), 0.25, 55);
+    this.viewModel.muzzleWorld(cam, this._muzzle);
+    this._dir.set(0, 0, -1).applyQuaternion(cam.quaternion).normalize();
+    bus.emit('weapon:fire', {
+      weaponId: w.id,
+      origin: this._muzzle.clone(),
+      direction: this._dir.clone(),
+      shotIndex: this.shotIndex,
+      suppressed: stats.suppressed,
+    });
+    this.presentLatched = true;
+    this.presentShotIndex = this.shotIndex;
+    this.stampJuice('present', { weaponId: w.id, shotIndex: this.shotIndex, dueIn });
+  }
+
+  /**
+   * Brief presentation freeze on impactful hits. Counts down on the display
+   * clock inside `update` and never writes `Time.scale`, so fixed-step combat
+   * (TTD, fire rate, bleedout) stays unscaled.
+   */
+  private pulseHitstop(seconds: number, heavy: boolean): void {
+    this.hitstopRemain = Math.max(this.hitstopRemain, seconds);
+    if (heavy) {
+      this.player?.camera.addShake(0.035, 40, seconds * 1.2);
+      this.renderApi?.screenEffect({ flash: { intensity: 0.08, color: 0xffe0c0, decay: seconds } });
+    }
   }
 
   private resolveMelee(range: number, damage: number): void {
@@ -815,6 +943,12 @@ export class WeaponSystem implements System {
     this._dir.set(0, 0, -1).applyQuaternion(cam.quaternion);
     const hit = phys.raycast(cam.position, this._dir, range, MASK_MELEE, _hit, this.player?.entityId ?? 1);
     if (!hit.hit) return;
+    // Flesh and world both publish impact so FX/audio share one surface path.
+    bus.emit('bullet:impact', {
+      point: hit.point.clone(), normal: hit.normal.clone(),
+      surface: hit.surface || (hit.entityId >= 0 ? 'flesh' : 'concrete'),
+      incoming: this._dir.clone(), energy: 40, penetrated: false,
+    });
     if (hit.entityId >= 0) {
       const res = this.ballistics.damageResolver?.(hit.entityId, damage, false, hit.point, this._dir, true)
         ?? { killed: false, applied: damage };
@@ -822,12 +956,8 @@ export class WeaponSystem implements System {
         targetId: hit.entityId, amount: res.applied, headshot: false,
         killed: res.killed, point: hit.point.clone(), fromPlayer: true,
       });
-      bus.emit('hud:hitmarker', { headshot: false, killed: res.killed, armor: false });
-    } else {
-      bus.emit('bullet:impact', {
-        point: hit.point.clone(), normal: hit.normal.clone(), surface: hit.surface,
-        incoming: this._dir.clone(), energy: 40, penetrated: false,
-      });
+      bus.emit('hud:hitmarker', { headshot: false, killed: res.killed, armor: !!res.armor });
+      this.pulseHitstop(res.killed ? 0.07 : 0.04, res.killed);
     }
   }
 
@@ -837,13 +967,14 @@ export class WeaponSystem implements System {
     const cam = this.camera;
     if (!cam) return;
 
+    // Tactical is the stim (see Combat / GameDirector). Only the lethal key
+    // cooks a grenade so mid-fight heal is never stolen by a flash cook.
     const wantFrag = input.pressed('grenade');
-    const wantTac = input.pressed('tactical');
-    if ((wantFrag || wantTac) && !this.grenades.cooking && this.state !== 'holstering') {
-      this.grenades.select(wantFrag ? 'frag' : this.grenades.stock.flash > 0 ? 'flash' : 'smoke');
+    if (wantFrag && !this.grenades.cooking && this.state !== 'holstering') {
+      this.grenades.select('frag');
       this.grenades.beginCook();
     }
-    if (this.grenades.cooking && (input.released('grenade') || input.released('tactical'))) {
+    if (this.grenades.cooking && input.released('grenade')) {
       this._dir.set(0, 0, -1).applyQuaternion(cam.quaternion);
       this.grenades.release(
         cam.position, this._dir, input.held('crouch'),
@@ -872,7 +1003,14 @@ export class WeaponSystem implements System {
     }
 
     const s = input.state;
-    this.viewModel.update(dt, {
+    // Presentation hitstop: freeze the view-model clock briefly without
+    // touching fixedUpdate / Time.scale. Lifecycle owns the shared present
+    // scale; local hitstopRemain covers melee pulses.
+    const realDt = ctx.time?.deltaReal ?? dt;
+    if (this.hitstopRemain > 0) this.hitstopRemain = Math.max(0, this.hitstopRemain - realDt);
+    const lifeScale = getPresentScale();
+    const presentDt = (this.hitstopRemain > 0 || lifeScale < 0.99) ? dt * Math.min(lifeScale, 0.12) : dt;
+    this.viewModel.update(presentDt, {
       ads: this.adsActive ? 1 : 0,
       sprint: this.stanceSprinting && this.state !== 'melee' ? 1 : 0,
       speed01: this.stanceSpeed01,
@@ -887,6 +1025,9 @@ export class WeaponSystem implements System {
       boltLocked: slot.runtime.ammo <= 0 && slot.runtime.def.cls !== 'shotgun',
       ammo: slot.runtime.ammo,
     });
+
+    // Input→first-visible: acknowledge fire on the display path when due.
+    this.tryPresentFire(dt);
 
     // Aiming through a magnified optic narrows the view-model FOV too, or the
     // scope body swells to fill the screen.
@@ -921,6 +1062,7 @@ export class WeaponSystem implements System {
     fireReadyAt: number; lastSprintAt: number; sprintOut: number;
     adsProgress: number; adsBlend: number; viewAdsBlend: number;
     bloom: number; coneDeg: number; patternIndex: number; shotIndex: number;
+    juiceCount: number; presentLatched: boolean; hitstopRemain: number;
   } {
     const slot = this.slots[this.index];
     const def = slot.runtime.def;
@@ -939,6 +1081,9 @@ export class WeaponSystem implements System {
       coneDeg: this.spread.cone(def, this.spreadCtx),
       patternIndex: this.recoil.index,
       shotIndex: this.shotIndex,
+      juiceCount: this.juiceLog.length,
+      presentLatched: this.presentLatched,
+      hitstopRemain: this.hitstopRemain,
     };
   }
 

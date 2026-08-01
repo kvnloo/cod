@@ -48,9 +48,29 @@ import {
   playAds, playFootstep, playGearRustle, playLanding, playMantle, playOverheat,
   playReload, playSlide, playWeaponSwitch, type ReloadHandle, type SlideHandle,
 } from './Foley';
-import { playHitmarker, playReward, playUi } from './Ui';
+import { playReward, playUi, type UiSound } from './Ui';
+import type { UiCue } from '../ui/UiEvents';
 
 import './DebugScene';
+
+/** Maps HUD/menu `ui:sound` cues onto the synthesised UiSound bank. */
+const UI_CUE_TO_SOUND: Partial<Record<UiCue, UiSound>> = {
+  hit: 'hitmarker',
+  hitArmor: 'hitmarkerArmor',
+  hitCrit: 'hitmarkerHead',
+  hitKill: 'kill',
+  streakReady: 'killstreak',
+  xp: 'pickup',
+  objective: 'objective',
+  alarm: 'error',
+  lowAmmo: 'lowAmmo',
+  menuMove: 'hover',
+  menuSelect: 'select',
+  menuBack: 'back',
+  menuOpen: 'select',
+  menuClose: 'back',
+  promptComplete: 'notify',
+};
 
 /** Default acoustic zoning until the level publishes its own. */
 const DEFAULT_FALLBACK: ImpulseId = 'streetCanyon';
@@ -404,14 +424,14 @@ export class AudioSystem implements System, AudioAPI {
       }
     });
 
-    this.on('damage:dealt', (e) => {
+    // Hitmarker + menu cues share one bus. HitMarkers (and menus) publish
+    // `ui:sound`; listening here — and nowhere else — keeps one kill blip per
+    // kill and one menu click per hover. `damage:dealt` / `hud:hitmarker` used
+    // to double- and triple-fire the same cue on every round.
+    this.on('ui:sound', (e) => {
       if (!this.running) return;
-      if (e.fromPlayer) playHitmarker(this.sfx, e.headshot, e.killed, false);
-    });
-
-    this.on('hud:hitmarker', (e) => {
-      if (!this.running) return;
-      playHitmarker(this.sfx, e.headshot, e.killed, e.armor);
+      const cue = UI_CUE_TO_SOUND[e.cue];
+      if (cue) playUi(this.sfx, cue, e.gain ?? 1);
     });
 
     /* ------------------------------------------------------------ player -- */

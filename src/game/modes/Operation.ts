@@ -11,6 +11,7 @@
  */
 
 import * as THREE from 'three';
+import { input } from '../../core/Input';
 import { ARCHETYPES } from '../Archetypes';
 import { KILLSTREAK_DEFS } from '../Killstreaks';
 import {
@@ -23,7 +24,7 @@ import type { KillContext } from '../Scoring';
 
 const TOTAL_WAVES = 12;
 const WARMUP = 8;
-const INTERMISSION = 22;
+const INTERMISSION = 8;
 const LIVES = 3;
 
 type Stage = 'warmup' | 'wave' | 'cleared' | 'intermission' | 'extract' | 'over';
@@ -67,7 +68,7 @@ export class OperationMode extends GameMode {
     d.faction = 'militia';
 
     const lc = host.lifecycle.config;
-    lc.respawnDelay = 6;
+    lc.respawnDelay = 3.5;
     lc.allowLastStand = true;
     lc.respawnEnabled = true;
     lc.regenDelay = 4.6;
@@ -183,11 +184,15 @@ export class OperationMode extends GameMode {
     host.services.actors?.setCombatEnabled?.(false);
     this.offers = this.rollOffers(host);
     host.setOffers(this.offers);
-    host.banner('RESUPPLY', 'Press [1] [2] [3] to purchase', 'objective', 3.4);
+    host.banner('RESUPPLY', 'Press [1][2][3] to buy · hold SPACE to skip', 'objective', 2.8);
   }
 
   private stepIntermission(dt: number, host: MatchHost): void {
     this.stageTimer -= dt;
+    // Space (jump) after 1.2 s skips the buy stretch — CoD-like tempo (cat F).
+    if (this.stageTimer < INTERMISSION - 1.2 && input.held('jump')) {
+      this.stageTimer = 0;
+    }
     host.countdown(Math.max(0, this.stageTimer), `WAVE ${this.wave + 1}`);
     // Refresh affordability so the HUD greys out what the player cannot buy.
     for (const o of this.offers) o.affordable = host.cash >= o.cost;
@@ -206,6 +211,8 @@ export class OperationMode extends GameMode {
     this.offers.splice(slot, 1);
     host.setOffers(this.offers);
     host.log.record(host.tick, 'buy', slot, offer.cost);
+    // Buying ends the stretch once the rack is empty — no dead wait.
+    if (this.offers.length === 0) this.stageTimer = Math.min(this.stageTimer, 1.2);
   }
 
   /** Three deterministic offers drawn from a weighted catalogue. */

@@ -796,6 +796,7 @@ interface DamageFunnelHost {
 type BallisticResolver = (
   entityId: number, amount: number, headshot: boolean,
   point: THREE.Vector3, direction: THREE.Vector3, fromPlayer: boolean,
+  zone?: HitZone,
 ) => { killed: boolean; applied: number; armor?: boolean };
 
 interface WeaponsHost {
@@ -1138,9 +1139,17 @@ export class CombatModel {
     const model = this;
     // Reused: `Ballistics` consumes the result before the next round exists.
     const out = { killed: false, applied: 0, armor: false };
-    w.setDamageResolver((entityId, amount, headshot, point, direction, fromPlayer) => {
-      const priced = model.priceRound(entityId, amount, headshot, point, direction, fromPlayer);
-      const r = prev(entityId, priced, headshot, point, direction, fromPlayer);
+    w.setDamageResolver((entityId, amount, headshot, point, direction, fromPlayer, zone) => {
+      const priced = model.priceRound(
+        entityId, amount, headshot, point, direction, fromPlayer, zone,
+      );
+      // Forward the priced zone (collider or geometric) so ActorAPI.hurt does
+      // not collapse arm/leg/stomach back to binary head/chest.
+      const pend = model.pending;
+      const r = prev(
+        entityId, priced, pend?.headshot ?? headshot, point, direction, fromPlayer,
+        pend?.zone ?? zone,
+      );
       model.pending = null;
       out.killed = !!r?.killed;
       out.applied = priced;
@@ -1164,6 +1173,7 @@ export class CombatModel {
   private priceRound(
     entityId: number, amount: number, headshot: boolean,
     point: THREE.Vector3, direction: THREE.Vector3, fromPlayer: boolean,
+    zone?: HitZone,
   ): number {
     this.pending = null;
     if (!fromPlayer) return amount;
@@ -1178,8 +1188,11 @@ export class CombatModel {
       return amount;
     }
     const info = this._info;
+    // Prefer the physics-authored band when the ray already resolved one;
+    // otherwise resolveRound falls back to the geometric hitbox rig.
     const opts: DamageOpts = {
       point, direction, headshot, fromPlayer: true, source: 'player',
+      zone: zone && zone !== 'none' ? zone : undefined,
     };
     const r = this.resolveRound({
       id: entityId, archetype: info.archetype, position: info.position,

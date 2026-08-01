@@ -56,7 +56,7 @@ export class PlayerSystem implements System {
   async init(ctx: EngineContext): Promise<void> {
     this.physics = ctx.engine.tryGet<System & PhysicsAPI>('physics') ?? null;
     this.renderApi = ctx.engine.tryGet<System & RenderAPI>('render') ?? null;
-    if (this.physics) this.movement.attach(this.physics);
+    if (this.physics) this.movement.attach(this.physics, this.entityId);
 
     this.movement.teleport(this._spawn, this.spawnYaw);
     this.camera.reset(this.spawnYaw);
@@ -101,11 +101,15 @@ export class PlayerSystem implements System {
         force: out.landImpact,
         surface: out.groundSurface,
       });
-      // Fall damage above a survivable drop.
+      // Fall damage above a survivable drop. Publish `damage:taken` so regen,
+      // vitals, lifecycle and the HUD all see the same path as bullet damage
+      // (applyDamage alone is the private end of that path, not a second source).
       if (out.landImpact > 15.5) {
         const dmg = (out.landImpact - 15.5) * 9;
         this._dir.set(0, 1, 0);
-        this.applyDamage(dmg, this._dir, false);
+        bus.emit('damage:taken', {
+          amount: dmg, fromDirection: this._dir.clone(), sourceId: -1, lethal: false,
+        });
       }
     }
     if (out.state !== prevState) bus.emit('player:move:state', { state: out.state });

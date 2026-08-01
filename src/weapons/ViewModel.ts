@@ -177,7 +177,13 @@ export class ViewModel {
     // just ahead of the crown, where the fireball actually is.
     this.root.add(this.flash);
     const mz = rig.point('muzzle');
-    this.flash.position.set(0, 0, (mz?.z ?? -0.6) - 0.045);
+    // Full authored muzzle xyz — discarding X/Y put the wash beside the barrel
+    // (floating-flash). A small −Z bias keeps the emitter just ahead of the crown.
+    this.flash.position.set(
+      mz?.x ?? 0,
+      mz?.y ?? 0,
+      (mz?.z ?? -0.6) - 0.045,
+    );
     this.rig = rig;
     this.def = def;
     this.stats = stats;

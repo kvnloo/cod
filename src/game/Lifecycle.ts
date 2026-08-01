@@ -15,6 +15,7 @@
  */
 
 import * as THREE from 'three';
+import { bus } from '../core/EventBus';
 import type { Emitter } from './Services';
 import type { GameServices } from './Services';
 
@@ -57,6 +58,12 @@ export function defaultLifecycle(): LifecycleConfig {
   };
 }
 
+/** Presentation clock scale written by Lifecycle hitstop; sim ignores it. */
+let presentClockScale = 1;
+
+/** View-model / HUD presentation dt multiplier (1 = real time, ~0 = frozen). */
+export function getPresentScale(): number { return presentClockScale; }
+
 export class Lifecycle {
   config: LifecycleConfig = defaultLifecycle();
   state: LifeState = 'alive';
@@ -67,6 +74,17 @@ export class Lifecycle {
   sinceDamage = 999;
   /** Set once we detect that something else already heals the player. */
   externalRegen = false;
+
+  /**
+   * Presentation-only hitstop remaining, in real/sim seconds of the lifecycle
+   * clock. Never fed into `setTimeScale` — authoritative fixed steps keep
+   * running at full rate while the view model freezes.
+   */
+  hitstopRemaining = 0;
+  /** Last authored hitstop pulse duration (for Category B probes). */
+  lastHitstopDuration = 0;
+  /** Presentation scale while hitstop is active (0..1). */
+  presentScale = 1;
 
   /** Filled by the owner: chooses a respawn transform. Returns the yaw. */
   pickSpawn: ((out: THREE.Vector3) => number) | null = null;
@@ -81,8 +99,39 @@ export class Lifecycle {
   private lastStandUsed = false;
   private readonly _p = new THREE.Vector3();
   private readonly _dir = new THREE.Vector3(0, 1, 0);
+  private readonly off: Array<() => void> = [];
 
-  constructor(private services: GameServices, private emit: Emitter) { }
+  /** Kill / headshot / heavy-hit freeze windows (presentation only). */
+  private static readonly HITSTOP_KILL = 0.055;
+  private static readonly HITSTOP_HEAD = 0.038;
+  private static readonly HITSTOP_HEAVY = 0.028;
+  private static readonly HITSTOP_SCALE = 0.12;
+
+  constructor(private services: GameServices, private emit: Emitter) {
+    // Own the juice bus edges so hitstop does not require Match wiring.
+    this.off.push(bus.on('hud:hitmarker', (e) => {
+      if (e.killed) this.pulseHitstop('kill');
+      else if (e.headshot) this.pulseHitstop('headshot');
+    }));
+    this.off.push(bus.on('damage:dealt', (e) => {
+      if (e.fromPlayer && !e.killed && !e.headshot && e.amount >= 45) {
+        this.pulseHitstop('heavy');
+      }
+    }));
+  }
+
+  /** Brief presentation freeze. Does **not** touch authoritative time scale. */
+  pulseHitstop(kind: 'kill' | 'headshot' | 'heavy'): void {
+    const d = kind === 'kill' ? Lifecycle.HITSTOP_KILL
+      : kind === 'headshot' ? Lifecycle.HITSTOP_HEAD
+        : Lifecycle.HITSTOP_HEAVY;
+    if (d >= this.hitstopRemaining) {
+      this.hitstopRemaining = d;
+      this.lastHitstopDuration = d;
+    }
+    this.presentScale = Lifecycle.HITSTOP_SCALE;
+    presentClockScale = this.presentScale;
+  }
 
   reset(): void {
     this.state = 'alive';
@@ -92,6 +141,9 @@ export class Lifecycle {
     this.slowMoTimer = 0;
     this.lastHealth = -1;
     this.lastStandUsed = false;
+    this.hitstopRemaining = 0;
+    this.presentScale = 1;
+    presentClockScale = 1;
     this.services.setTimeScale(1);
   }
 
@@ -138,9 +190,16 @@ export class Lifecycle {
   private enterDeath(): void {
     this.state = 'dead';
     this.respawnRemaining = this.config.respawnDelay;
+    // Presentation-only death juice. Never write Time.scale here: Engine multiplies
+    // fixedDelta by scale, so a 0.32 death slow-mo stretched sim TTD/bleedout and
+    // every other fixed-step clock. Screen damage + a short presentation timer
+    // keep the beat without touching the authoritative step.
     this.slowMoTimer = this.config.slowMoDuration;
-    this.services.setTimeScale(this.config.slowMoScale);
+    this.services.setTimeScale(1);
     this.services.render?.screenEffect({ damage: { intensity: 1 } });
+    this.services.render?.screenEffect({
+      flash: { intensity: 0.35, color: 0xff2200, decay: this.config.slowMoDuration * 0.55 },
+    } as never);
     this.emit('player:respawn:timer', {
       seconds: this.respawnRemaining, total: this.config.respawnDelay,
     });
@@ -150,18 +209,29 @@ export class Lifecycle {
   }
 
   fixedUpdate(dt: number): void {
-    const scale = Math.max(0.05, this.services.getTimeScale());
-    const real = dt / scale;
+    // `dt` is already the fixed step; keep all lifecycle clocks on unscaled sim time.
+    const real = dt;
     this.sinceDamage += real;
 
-    /* --- slow motion ease-out --- */
+    /* --- presentation hitstop (never setTimeScale) --- */
+    if (this.hitstopRemaining > 0) {
+      this.hitstopRemaining = Math.max(0, this.hitstopRemaining - real);
+      if (this.hitstopRemaining <= 0) {
+        this.presentScale = 1;
+        presentClockScale = 1;
+      } else {
+        this.presentScale = Lifecycle.HITSTOP_SCALE;
+        presentClockScale = this.presentScale;
+      }
+    }
+
+    /* --- presentation death beat (no Time.scale) --- */
     if (this.slowMoTimer > 0) {
       this.slowMoTimer -= real;
-      const k = THREE.MathUtils.clamp(1 - this.slowMoTimer / Math.max(0.001, this.config.slowMoDuration), 0, 1);
-      // Ease back to real time with a cubic so it does not snap.
-      const s = THREE.MathUtils.lerp(this.config.slowMoScale, 1, k * k * (3 - 2 * k));
-      this.services.setTimeScale(this.slowMoTimer > 0 ? s : 1);
-      if (this.slowMoTimer <= 0) this.services.setTimeScale(1);
+      if (this.slowMoTimer <= 0) {
+        this.slowMoTimer = 0;
+        this.services.setTimeScale(1);
+      }
     }
 
     const player = this.services.player;
@@ -237,6 +307,9 @@ export class Lifecycle {
     const player = this.services.player;
     this.services.setTimeScale(1);
     this.slowMoTimer = 0;
+    this.hitstopRemaining = 0;
+    this.presentScale = 1;
+    presentClockScale = 1;
     if (!player) { this.state = 'alive'; return; }
 
     const yaw = this.pickSpawn ? this.pickSpawn(this._p) : 0;

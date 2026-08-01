@@ -29,6 +29,13 @@ export class Time {
   private accumulator = 0;
   private last = 0;
   private maxFrameTime = 0.25;
+  /**
+   * Hard ceiling on fixed steps per display frame.
+   *
+   * Must be large enough that a single hitch does not permanently drop input
+   * edges and weapon clocks. Eight steps is ~67 ms of sim; a 100 ms hitch still
+   * leaves residual debt that the next frames repay instead of erasing.
+   */
   private maxSteps = 8;
 
   /** In deterministic mode delta comes from the caller, not the wall clock. */
@@ -70,7 +77,13 @@ export class Time {
       this.accumulator -= this.fixedDelta;
       steps++;
     }
-    if (steps >= this.maxSteps) this.accumulator = 0; // avoid spiral of death
+    // Spiral-of-death guard: cap residual debt to one step instead of wiping the
+    // accumulator. Zeroing used to drop the remainder of a hitch — and with it
+    // any input edge that landed in the discarded window — so a single 50 ms
+    // frame could swallow a jump/fire that the player still felt they pressed.
+    if (steps >= this.maxSteps) {
+      this.accumulator = Math.min(this.accumulator, this.fixedDelta);
+    }
     this.alpha = this.accumulator / this.fixedDelta;
     this.steps = steps;
     return steps;

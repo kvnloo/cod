@@ -20,7 +20,9 @@ import { CharacterSystem } from '../characters/CharacterSystem';
 import type { CharacterFactory } from '../characters/types';
 import { MatchRunner } from './Match';
 import { AIActorBridge, resolveServices, type GameServices } from './Services';
-import type { DirectorAPI, DirectorSnapshot, GameModeId, MatchPhase } from './types';
+import type { DirectorAPI, DirectorSnapshot, GameModeId, MatchPhase, Archetype } from './types';
+import { ARCHETYPES } from './Archetypes';
+import { combat } from './Combat';
 import './events';
 import './DebugScene';
 
@@ -30,6 +32,7 @@ interface WeaponsLike {
     fn: ((
       entityId: number, amount: number, headshot: boolean, point: THREE.Vector3,
       direction: THREE.Vector3, fromPlayer: boolean,
+      zone?: import('../physics/types').HitZone,
     ) => { killed: boolean; applied: number; armor?: boolean }) | null,
   ): void;
 }
@@ -44,6 +47,14 @@ function paramMode(): GameModeId | null {
 /** `?actors=fallback` forces the stand-in sim even when the AI module is live. */
 function paramActors(): string {
   return new URLSearchParams(globalThis.location?.search ?? '').get('actors') ?? '';
+}
+
+/** True when the archetype table puts plates or a suit over at least one zone. */
+function profileHasArmor(archetype: string): boolean {
+  const p = ARCHETYPES[archetype as Archetype];
+  if (!p) return false;
+  const a = p.armor;
+  return a.chest < 1 || a.stomach < 1 || a.head < 1 || a.neck < 1 || a.arm < 1 || a.leg < 1;
 }
 
 function paramSeed(): number {
@@ -157,7 +168,7 @@ export class GameDirector implements System, DirectorAPI {
     this.weapons = w;
     this.unbindBlast = bus.on('explosion', () => { this.blastInFlight = true; });
 
-    w.setDamageResolver((entityId, amount, headshot, point, direction, fromPlayer) => {
+    w.setDamageResolver((entityId, amount, headshot, point, direction, fromPlayer, zone) => {
       const bridge = this.aiBridge;
       if (!bridge) return { killed: false, applied: amount };
       const view = bridge.viewOf(entityId);
@@ -175,10 +186,20 @@ export class GameDirector implements System, DirectorAPI {
         return { killed: !view.alive, applied: amount };
       }
 
+      // Prefer the physics-resolved band (arm/leg/stomach/neck/…) over the
+      // binary headshot flag so flinch, ragdoll and priced damage match the
+      // collider that actually stopped the round.
+      const resolvedZone = (zone && zone !== 'none')
+        ? zone
+        : (headshot ? 'head' as const : undefined);
       const killed = bridge.hurt(view, amount, {
-        headshot, point, direction, fromPlayer, source: fromPlayer ? 'player' : 'ai',
+        headshot, point, direction, fromPlayer,
+        source: fromPlayer ? 'player' : 'ai',
+        zone: resolvedZone,
       });
-      return { killed, applied: amount, armor: view.archetype === 'juggernaut' };
+      // Any profile with a sub-1 zone multi (plate carrier, breacher kit,
+      // juggernaut suit) must light the armour hitmarker — not only the suit.
+      return { killed, applied: amount, armor: profileHasArmor(view.archetype) };
     });
   }
 
@@ -276,7 +297,12 @@ export class GameDirector implements System, DirectorAPI {
       return;
     }
 
-    if (input.pressed('tactical')) this.match.command('activateKillstreak');
+    // Tactical = stim mid-fight (CoD heal). Killstreak activates only when
+    // stim cannot spend a charge (full HP, zero charges, already injecting).
+    if (input.pressed('tactical')) {
+      const spent = combat.vitals.useStim();
+      if (!spent) this.match.command('activateKillstreak');
+    }
     if (input.pressed('flashlight')) this.match.command('cycleKillstreak');
 
     if (this.match.phase === 'intermission') {

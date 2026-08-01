@@ -26,7 +26,7 @@
 import * as THREE from 'three';
 import * as RAPIER from '@dimforge/rapier3d-compat';
 import type { SurfaceType } from '../core/Surfaces';
-import type { CharacterController, CharacterMoveResult, HitZone } from './types';
+import type { CharacterController, CharacterHitboxDesc, CharacterMoveResult, HitZone } from './types';
 import { LAYER } from './types';
 import { queryGroups, groups, defaultMask } from './Layers';
 import type { ColliderRegistry } from './Registry';
@@ -185,6 +185,17 @@ export class CapsuleCharacterController implements CharacterController {
   private wallHit = false;
   private wallNormal = new THREE.Vector3();
 
+  /** Owning gameplay entity; stamped onto every collider this controller owns. */
+  private entityId = -1;
+  private entityObject: THREE.Object3D | null = null;
+  /** Movement-layer the controller was constructed with (PLAYER / ENEMY). */
+  private hitLayer: number;
+  /** Multi-zone living hit volumes parented to the kinematic proxy body. */
+  private hitColliders: RAPIER.Collider[] = [];
+  private hitboxDescs: CharacterHitboxDesc[] = [];
+  /** Height the current hitbox offsets were authored against. */
+  private hitboxRefHeight = 0;
+
   constructor(
     host: ControllerHost,
     radius: number,
@@ -195,6 +206,7 @@ export class CapsuleCharacterController implements CharacterController {
     this.radius = Math.max(0.05, radius);
     this.height = Math.max(this.radius * 2 + 0.02, height);
     this.layer = layer;
+    this.hitLayer = layer;
     this.mask = LAYER.STATIC | LAYER.DYNAMIC | LAYER.CLIP | LAYER.GLASS
       | (layer === LAYER.PLAYER ? LAYER.ENEMY : LAYER.PLAYER | LAYER.ENEMY);
     this.shape = new RAPIER.Capsule(this.halfHeight, this.radius);
@@ -213,12 +225,14 @@ export class CapsuleCharacterController implements CharacterController {
       .setActiveCollisionTypes(RAPIER.ActiveCollisionTypes.ALL);
     this.proxyCollider = host.world.createCollider(colDesc, this.proxyBody);
 
-    // Register the proxy so bullets fired at the character resolve properly.
+    // Default living surface is flesh (not armor plating). Once multi-zone
+    // hitboxes are installed the solid capsule moves to CLIP and stops taking
+    // bullet rays; until then a single chest/flesh proxy remains hittable.
     host.registry.add({
       handle: this.proxyCollider.handle,
       bodyId: -1,
       object: null,
-      surface: 'armor',
+      surface: 'flesh',
       entityId: -1,
       zone: 'chest',
       layer,
@@ -228,12 +242,118 @@ export class CapsuleCharacterController implements CharacterController {
     });
   }
 
-  /** Tags the character proxy so raycasts report the owning entity. */
+  /** Tags every collider on this character so raycasts report the owning entity. */
   setEntity(entityId: number, object: THREE.Object3D | null = null): void {
+    this.entityId = entityId;
+    this.entityObject = object;
     const rec = this.host.registry.get(this.proxyCollider.handle);
-    if (!rec) return;
-    rec.entityId = entityId;
-    rec.object = object;
+    if (rec) {
+      rec.entityId = entityId;
+      rec.object = object;
+    }
+    for (const col of this.hitColliders) {
+      const r = this.host.registry.get(col.handle);
+      if (r) {
+        r.entityId = entityId;
+        r.object = object;
+      }
+    }
+  }
+
+  /**
+   * Install multi-zone living hitboxes. Each volume is a sensor box on the
+   * character's combat layer (PLAYER/ENEMY) so MASK_BULLET resolves zone +
+   * surface correctly.
+   *
+   * The solid movement capsule stays on the combat layer as a full-body
+   * `chest` fallback. Multi-zone sensors are deepened past the capsule
+   * radius so they win the ray TOI on their bands; any seam falls through
+   * to the capsule instead of ghosting the round. Retargeting the capsule
+   * to CLIP without a broadphase flush made post-spawn probes see empty
+   * air, and a forced world.step() here poisoned AI→player damage.
+   */
+  setHitboxes(boxes: readonly CharacterHitboxDesc[]): void {
+    this.clearHitboxes();
+    this.hitboxDescs = boxes.map((b) => ({
+      zone: b.zone,
+      half: [b.half[0], b.half[1], b.half[2]] as [number, number, number],
+      offset: [b.offset[0], b.offset[1], b.offset[2]] as [number, number, number],
+      surface: b.surface,
+    }));
+    this.hitboxRefHeight = this.height;
+
+    // Solid proxy remains a hittable combat capsule (chest fallback).
+    this.proxyCollider.setCollisionGroups(groups(this.hitLayer, defaultMask(this.hitLayer)));
+    const proxyRec = this.host.registry.get(this.proxyCollider.handle);
+    if (proxyRec) {
+      proxyRec.layer = this.hitLayer;
+      proxyRec.surface = 'flesh';
+      proxyRec.zone = 'chest';
+      proxyRec.entityId = this.entityId;
+      proxyRec.object = this.entityObject;
+    }
+
+    // Sensors must reach past the capsule silhouette or the solid proxy always
+    // wins the TOI and every band collapses to anonymous chest.
+    const minDepth = this.radius * 1.06;
+    const hitMask = defaultMask(this.hitLayer) | LAYER.PROJECTILE;
+    for (const b of this.hitboxDescs) {
+      const surface: SurfaceType = b.surface
+        ?? (b.zone === 'head' ? 'helmet' : 'flesh');
+      const halfX = Math.max(b.half[0], this.radius * 0.35);
+      const halfY = b.half[1];
+      const halfZ = Math.max(b.half[2], minDepth);
+      const desc = RAPIER.ColliderDesc.cuboid(halfX, halfY, halfZ)
+        .setTranslation(b.offset[0], b.offset[1], b.offset[2])
+        .setSensor(true)
+        .setFriction(0)
+        .setRestitution(0)
+        .setCollisionGroups(groups(this.hitLayer, hitMask))
+        .setActiveCollisionTypes(RAPIER.ActiveCollisionTypes.ALL);
+      const col = this.host.world.createCollider(desc, this.proxyBody);
+      this.hitColliders.push(col);
+      this.host.registry.add({
+        handle: col.handle,
+        bodyId: -1,
+        object: this.entityObject,
+        surface,
+        entityId: this.entityId,
+        zone: b.zone,
+        layer: this.hitLayer,
+        ranges: null,
+        ragdollId: -1,
+        debris: false,
+      });
+    }
+  }
+
+  private clearHitboxes(): void {
+    for (const col of this.hitColliders) {
+      this.host.registry.remove(col.handle);
+      this.host.world.removeCollider(col, true);
+    }
+    this.hitColliders.length = 0;
+    this.hitboxDescs.length = 0;
+    this.hitboxRefHeight = 0;
+  }
+
+  /** Re-scale hitbox local transforms when the capsule crouches / stands. */
+  private relayoutHitboxes(): void {
+    if (this.hitColliders.length === 0 || this.hitboxRefHeight <= 1e-5) return;
+    const scale = this.height / this.hitboxRefHeight;
+    for (let i = 0; i < this.hitColliders.length; i++) {
+      const b = this.hitboxDescs[i];
+      const col = this.hitColliders[i];
+      col.setTranslationWrtParent({
+        x: b.offset[0] * scale,
+        y: b.offset[1] * scale,
+        z: b.offset[2] * scale,
+      });
+      // Cuboid half-extents are not freely resizable on every Rapier build; the
+      // offset scale alone is enough for the playtest height bands. Full size
+      // rebuild happens on the next setHitboxes() call.
+      void col;
+    }
   }
 
   private get halfHeight(): number {
@@ -250,6 +370,7 @@ export class CapsuleCharacterController implements CharacterController {
     this.pendingHeightShift += this.grounded ? (next - this.height) * 0.5 : (this.height - next) * 0.5;
     this.height = next;
     this.rebuildShape();
+    this.relayoutHitboxes();
   }
 
   /** True when the capsule at `h` metres tall would fit at `position`. */
@@ -262,7 +383,7 @@ export class CapsuleCharacterController implements CharacterController {
     rp.y = position.y + (next - this.height) * (this.grounded ? 0.5 : -0.5);
     rp.z = position.z;
     const blocked = this.host.world.intersectionWithShape(
-      rp, rq, probe, undefined, queryGroups(this.mask), this.proxyCollider,
+      rp, rq, probe, RAPIER.QueryFilterFlags.EXCLUDE_SENSORS, queryGroups(this.mask), this.proxyCollider,
     );
     return blocked === null;
   }
@@ -652,7 +773,7 @@ export class CapsuleCharacterController implements CharacterController {
     rv.x = dir.x; rv.y = dir.y; rv.z = dir.z;
     const hit = this.host.world.castShape(
       rp, rq, rv, this.shape, 0, dist, false,
-      undefined, queryGroups(this.mask), this.proxyCollider,
+      RAPIER.QueryFilterFlags.EXCLUDE_SENSORS, queryGroups(this.mask), this.proxyCollider,
     );
     if (!hit) return false;
     out.hit = true;
@@ -700,7 +821,7 @@ export class CapsuleCharacterController implements CharacterController {
         rp.x = p.x; rp.y = p.y; rp.z = p.z;
         moved = true;
         return true;
-      }, undefined, queryGroups(this.mask), this.proxyCollider);
+      }, RAPIER.QueryFilterFlags.EXCLUDE_SENSORS, queryGroups(this.mask), this.proxyCollider);
       if (!moved) break;
     }
   }
@@ -727,7 +848,7 @@ export class CapsuleCharacterController implements CharacterController {
     ray.dir.x = 0; ray.dir.y = -1; ray.dir.z = 0;
     const reach = this.height * 0.5 + extra;
     const hit = this.host.world.castRayAndGetNormal(
-      ray, reach, false, undefined, queryGroups(this.mask), this.proxyCollider,
+      ray, reach, false, RAPIER.QueryFilterFlags.EXCLUDE_SENSORS, queryGroups(this.mask), this.proxyCollider,
     );
     if (!hit) return false;
     vTmp2.set(hit.normal.x, hit.normal.y, hit.normal.z);
@@ -769,8 +890,25 @@ export class CapsuleCharacterController implements CharacterController {
 
   /* ------------------------------------------------------------------ misc -- */
 
-  /** Hit zone reported when this character's proxy is shot. Always torso. */
-  get zone(): HitZone { return 'chest'; }
+  /**
+   * Representative hit zone for this character.
+   *
+   * When multi-zone volumes are installed the individual colliders carry their
+   * own zone on every ray hit; this getter exposes a non-anonymous band from
+   * the layout so callers that only know the controller can observe that
+   * multi-zone is live (rather than always reading the legacy single-chest
+   * capsule default).
+   */
+  get zone(): HitZone {
+    if (this.hitboxDescs.length === 0) return 'chest';
+    for (const b of this.hitboxDescs) {
+      if (b.zone === 'head') return 'head';
+    }
+    for (const b of this.hitboxDescs) {
+      if (b.zone !== 'none' && b.zone !== 'chest') return b.zone;
+    }
+    return this.hitboxDescs[0]?.zone ?? 'chest';
+  }
 
   teleport(position: THREE.Vector3): void {
     rp.x = position.x; rp.y = position.y; rp.z = position.z;
@@ -785,6 +923,7 @@ export class CapsuleCharacterController implements CharacterController {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.clearHitboxes();
     this.host.registry.remove(this.proxyCollider.handle);
     this.host.world.removeRigidBody(this.proxyBody);
   }

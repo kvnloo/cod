@@ -134,6 +134,8 @@ export async function openSession({
   timeoutMs = 180_000,
   onConsole,
   seed = 1337,
+  /** 1 = still/screenshot determinism; 0 = live wall-clock (no sync Exposure flush). */
+  capture = 1,
 } = {}) {
   const base = url ?? (await ensureServer());
   const browser = await chromium.launch({
@@ -167,8 +169,16 @@ export async function openSession({
     if (!/ERR_ABORTED/.test(f)) errors.push(`requestfailed ${r.url()} ${f}`);
   });
 
+  // Honour an already-specified `capture=` (playtest wall-clock sampling needs
+  // capture=0 so Exposure does not sync-flush and FrameBudget stays live).
+  // Screenshot / still tools keep the default of capture=1.
+  const has = (k) => new RegExp(`[?&]${k}=`).test(base);
   const sep = base.includes('?') ? '&' : '/?';
-  const target = `${base}${sep}capture=1&quality=${encodeURIComponent(quality)}&seed=${seed}`;
+  const extras = [];
+  if (!has('capture')) extras.push(`capture=${capture ? 1 : 0}`);
+  if (!has('quality')) extras.push(`quality=${encodeURIComponent(quality)}`);
+  if (!has('seed')) extras.push(`seed=${seed}`);
+  const target = extras.length ? `${base}${sep}${extras.join('&')}` : base;
   await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 60_000 });
 
   // Wait for the game to report readiness through the capture contract.

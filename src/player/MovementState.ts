@@ -82,6 +82,30 @@ export interface MovementState {
 
   /** Buttons from the previous command, so press edges survive a restore. */
   prevButtons: number;
+
+  /* ---- Apex skill timers (must survive copyMovementState / netcode) --------
+   * HostBridge.authoritativeUpdateFromEntity, Predictor.recordState, and
+   * Reconciler.hardReset all go through `copyMovementState`. Forgetting a
+   * timer here resets tap-strafe windows, wall-bounce locks, slide air grace
+   * and mantle entry speed on every correction — skill chains desync. */
+  /** Forward axis of the previous command (tap-strafe edge). */
+  axPrevMoveY: number;
+  /** Seconds of amplified air control remaining. */
+  axTapWindow: number;
+  /** Wall-bounce cooldown / air-control lock residual. */
+  axWallCooldown: number;
+  /** Mantle re-entry cooldown residual. */
+  axMantleCooldown: number;
+  /** Height of the ledge currently being climbed (animation / restore). */
+  axMantleHeight: number;
+  /** MantleKind index into MANTLE_KINDS. */
+  axMantleKind: number;
+  /** Foot height of the last ground contact — climb reach datum. */
+  axGroundY: number;
+  /** Seconds the current slide has been airborne (slideAirGrace). */
+  axSlideAirTime: number;
+  /** Horizontal speed captured at mantle start, restored on exit. */
+  axMantleEntrySpeed: number;
 }
 
 export function createMovementState(): MovementState {
@@ -100,6 +124,15 @@ export function createMovementState(): MovementState {
     mex: 0, mey: 0, mez: 0,
     grounded: true, groundSurface: 'concrete',
     prevButtons: 0,
+    axPrevMoveY: 0,
+    axTapWindow: 0,
+    axWallCooldown: 0,
+    axMantleCooldown: 0,
+    axMantleHeight: 0,
+    axMantleKind: 0,
+    axGroundY: 0,
+    axSlideAirTime: 0,
+    axMantleEntrySpeed: 0,
   };
 }
 
@@ -129,6 +162,15 @@ export function copyMovementState(dst: MovementState, src: MovementState): Movem
   dst.grounded = src.grounded;
   dst.groundSurface = src.groundSurface;
   dst.prevButtons = src.prevButtons;
+  dst.axPrevMoveY = src.axPrevMoveY ?? 0;
+  dst.axTapWindow = src.axTapWindow ?? 0;
+  dst.axWallCooldown = src.axWallCooldown ?? 0;
+  dst.axMantleCooldown = src.axMantleCooldown ?? 0;
+  dst.axMantleHeight = src.axMantleHeight ?? 0;
+  dst.axMantleKind = src.axMantleKind ?? 0;
+  dst.axGroundY = src.axGroundY ?? 0;
+  dst.axSlideAirTime = src.axSlideAirTime ?? 0;
+  dst.axMantleEntrySpeed = src.axMantleEntrySpeed ?? 0;
   return dst;
 }
 

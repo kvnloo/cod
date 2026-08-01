@@ -63,3 +63,12 @@ jobs:
             exit 1
           fi
           echo "No stray Math.random(). Good."
+
+      # Playtest hard gates (movement, TTK/TTD, frame honesty). Fails the job
+      # when any hard gate is red — including software-GL contamination of
+      # frame/visual numbers (see docs/PLAYTEST.md).
+      - name: Playtest hard gates
+        run: |
+          npx vite build --outDir dist-gp-h
+          node tools/playtest.mjs --no-build --json shots/playtest/report-ci.json
+

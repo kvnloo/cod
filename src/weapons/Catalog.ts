@@ -209,7 +209,7 @@ const HORNET: WeaponDef = {
   zones: ZONES_SMG,
   ballistics: ballistics({
     muzzleVelocity: 400, drag: 0.00150, penetration: 0.42,
-    penetrationDamage: 0.48, hitscanRange: 42, tracerEvery: 5,
+    penetrationDamage: 0.48, hitscanRange: 55, tracerEvery: 5,
   }),
   recoil: recoil({
     vertical: [0.62, 0.58, 0.54, 0.50, 0.46, 0.44, 0.42, 0.40, 0.38],
@@ -603,7 +603,7 @@ const SIDEWINDER: WeaponDef = {
   zones: ZONES_SMG,
   ballistics: ballistics({
     muzzleVelocity: 320, drag: 0.00180, penetration: 0.30,
-    penetrationDamage: 0.40, hitscanRange: 45, tracerEvery: 0,
+    penetrationDamage: 0.40, hitscanRange: 55, tracerEvery: 0,
   }),
   recoil: recoil({
     vertical: [1.35, 1.25, 1.18, 1.12],

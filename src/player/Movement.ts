@@ -100,7 +100,7 @@ export const TUNING: Record<string, number> & {
    * a few percent, high enough that standing still on the flat is not a
    * hoverboard.
    */
-  groundFrictionFast: 4.6,
+  groundFrictionFast: 0.85,
 
   /* ---- air model (Quake/Source projected acceleration) ------------------- */
   /**
@@ -119,7 +119,7 @@ export const TUNING: Record<string, number> & {
   airCapFalloff: 1.0,
   /** Acceleration coefficient, m/s². Near the theoretical optimum for a 120 Hz
    *  tick with the cap above: gain per tick peaks at k·(cap − k·dt)/v. */
-  airAccel: 45,
+  airAccel: 50,
   /** CPMA-style air control, rad/s of *velocity rotation*. Never adds speed. */
   airControlTurn: 2.6,
   /** Air control is forward-only, as in Quake3 — strafe input disables it,
@@ -140,11 +140,11 @@ export const TUNING: Record<string, number> & {
   tapStrafeMinSpeed: 2.5,
 
   /* ---- slide -------------------------------------------------------------- */
-  slideEntrySpeed: 5.2,
-  slideBoost: 2.1,
+  slideEntrySpeed: 4.6,
+  slideBoost: 2.55,
   /** Entry boost fades linearly to zero at this speed, so chaining converges. */
-  slideBoostFalloff: 14.0,
-  slideFriction: 1.15,
+  slideBoostFalloff: 20.0,
+  slideFriction: 0.52,
   /**
    * Quadratic drag above `slideDragSpeed`, 1/m. Gives a long descent a real
    * terminal speed (~19-20 m/s on a 30-40° ramp) instead of running into
@@ -152,22 +152,30 @@ export const TUNING: Record<string, number> & {
    * the speeds a flat slide reaches, so it cannot quietly tax the slide-jump
    * chain, which is measured in single percent.
    */
-  slideDrag: 0.16,
+  slideDrag: 0.10,
   slideDragSpeed: 10.0,
   slideMinSpeed: 3.0,
   slideMaxTime: 1.6,
   slideSteer: 2.4,
-  slideCooldown: 0.30,
+  slideCooldown: 0.18,
+  /**
+   * Cooldown used when a slide ends only because airtime exceeded the grace
+   * window (kerb / micro-drop). Full `slideCooldown` is for intentional exits;
+   * a geometry nick must not erase a chain the player is still executing.
+   */
+  slideAirExitCooldown: 0.05,
   /** Fraction of gravity along the slope that accelerates a downhill slide. */
   slideSlopeGain: 1.25,
   /** Downhill relief applied to slide friction and to the slide timer. */
   slideSlopeRelief: 3.0,
   slideTimerRelief: 1.6,
-  /** A slide survives this much airtime — small drops do not break the chain. */
-  slideAirGrace: 0.22,
-  slideJumpBoost: 1.045,
+  /** A slide survives this much airtime — small drops do not break the chain.
+   *  ~0.4 s covers a kerb / stair lip without eating a full slide-jump window. */
+  slideAirGrace: 0.48,
+  /** Horizontal mult on a slide-jump. Chains must clear ~1.25× tacSprint mean. */
+  slideJumpBoost: 1.12,
   /** Above this the slide-jump boost is not applied; the chain plateaus. */
-  slideJumpCap: 12.5,
+  slideJumpCap: 16.0,
 
   /* ---- wall-bounce -------------------------------------------------------- */
   wallBounceMinSpeed: 5.0,
@@ -214,8 +222,14 @@ export const TUNING: Record<string, number> & {
   mantleDurationLow: 0.30,
   mantleDurationHigh: 1.15,
   mantleCooldown: 0.25,
-  /** Forward speed carried out of a climb. */
-  mantleExitSpeed: 1.9,
+  /**
+   * Floor on forward speed carried out of a climb. Raised to `slideEntrySpeed`
+   * so a vault/mantle never drops the player below re-entry — entry speed is
+   * preserved above this floor (see `mantleExitRetain`).
+   */
+  mantleExitSpeed: 4.6,
+  /** Fraction of pre-mantle horizontal speed restored on exit. */
+  mantleExitRetain: 0.92,
 
   /** Lean. */
   leanAngle: 0.30,
@@ -273,25 +287,6 @@ export interface MovementOutput {
   airTime: number;
 }
 
-/**
- * State carried across steps that `MovementState` (a shared contract this
- * package does not own) has no field for.
- *
- * They are written onto the captured state object as extra own properties, so a
- * capture → restore round-trip is exact and `movementStatesIdentical` still
- * compares them. What it cannot survive is `copyMovementState`, which only knows
- * the declared fields — see the note on `copyState`.
- */
-interface ApexMovementState extends MovementState {
-  axPrevMoveY: number;
-  axTapWindow: number;
-  axWallCooldown: number;
-  axMantleCooldown: number;
-  axMantleHeight: number;
-  axMantleKind: number;
-  axGroundY: number;
-}
-
 function moveResult(): CharacterMoveResultEx {
   return {
     applied: new THREE.Vector3(), grounded: false,
@@ -332,6 +327,8 @@ export class Movement {
 
   private controller: CharacterController | null = null;
   private physics: PhysicsAPI | null = null;
+  /** Owning entity id — stamped on the capsule and used as raycast ignore. */
+  private entityId = 1;
   private result = moveResult();
   private hit = rayHit();
   private hit2 = rayHit();
@@ -372,6 +369,8 @@ export class Movement {
   private mantleDuration = 0;
   private mantleHeight = 0;
   private mantleKind: MantleKind = 'none';
+  /** Horizontal speed at the moment the mantle began — exit restores this. */
+  private mantleEntrySpeed = 0;
   private readonly mantleStart = new THREE.Vector3();
   private readonly mantleEnd = new THREE.Vector3();
   private readonly mantleMid = new THREE.Vector3();
@@ -395,9 +394,17 @@ export class Movement {
     speed: 0, verticalSpeed: 0, airTime: 0,
   };
 
-  attach(physics: PhysicsAPI): void {
+  attach(physics: PhysicsAPI, entityId = 1): void {
     this.physics = physics;
     this.controller = physics.createCharacter(0.34, TUNING.standHeight);
+    this.entityId = entityId;
+    // Player.entityId is 1. Without this the registry keeps entityId=-1 zone=chest
+    // and ignoreEntity/ownerEntity=1 cannot filter the capsule — camera-origin
+    // rays (zoneScan, early ballistics) report anonymous chest on the local body.
+    // Do NOT install multi-zone solid hitboxes on the local walker: solid cuboids
+    // parented to the kinematic proxy interfere with the character controller
+    // (and with pure-movement lab races). Tagging is enough for exclude=1.
+    this.controller.setEntity?.(entityId);
   }
 
   teleport(p: THREE.Vector3, yaw: number): void {
@@ -407,6 +414,7 @@ export class Movement {
     this.state = 'idle';
     this.mantleT = 0;
     this.mantleKind = 'none';
+    this.mantleEntrySpeed = 0;
     this.prevButtons = 0;
     this.prevMoveY = 0;
     this.jumpBuffer = 0;
@@ -417,6 +425,14 @@ export class Movement {
     this.tapWindow = 0;
     this.wallCooldown = 0;
     this.mantleCooldown = 0;
+    // Reset contact timers so goHome/respawn never inherits coyote air or a
+    // stale grounded flag from the pre-teleport pose.
+    this.groundedTime = 0;
+    this.airTime = 0;
+    this.out.grounded = true;
+    this.out.groundSurface = 'concrete';
+    this.out.state = 'idle';
+    this.out.airTime = 0;
     this.lastGroundY = p.y - this.currentHeight * 0.5;
     this.controller?.teleport?.(p);
   }
@@ -503,19 +519,60 @@ export class Movement {
 
     // ---- stance / sprint / slide decisions ------------------------------
     const forwardIntent = moveY;
-    const wantsSprint = (buttons & BTN.SPRINT) !== 0
-      && forwardIntent > TUNING.sprintMinForward && grounded && !this.proneHeld;
+    // Sprint button alone is enough to *retain* tac-sprint progress through a
+    // short hop / slide-jump. Requiring grounded+forward for the clock itself
+    // demoted every aerial chain back to a 0.9 s re-earn — hold-W on the floor
+    // beat skilled movement by construction.
+    // Fire cancels sprint same-step (CoD cancel table) so weapons can arm the
+    // sprint-out gate from the last sprinting frame instead of waiting on Shift.
+    const fireHeld = (buttons & BTN.FIRE) !== 0;
+    const sprintHeld = (buttons & BTN.SPRINT) !== 0 && !this.proneHeld && !fireHeld;
+    const wantsSprint = sprintHeld
+      && forwardIntent > TUNING.sprintMinForward && grounded;
 
-    if (wantsSprint) this.sprintTime += dt; else this.sprintTime = 0;
+    if (wantsSprint) {
+      this.sprintTime += dt;
+    } else if (!sprintHeld) {
+      this.sprintTime = 0;
+    } else if (
+      grounded
+      && forwardIntent <= TUNING.sprintMinForward
+      // Optimal air-strafe lands on A/D with moveY≈0. Wiping the meter on that
+      // land made re-slide require hs≥sprintSpeed and dropped the 5.2–6.4 band
+      // into the crouchSpeed trap. Keep the meter whenever sprint is held and
+      // the body still carries chain-class speed (or a meaningful strafe input).
+      && this.horizontalSpeed() < TUNING.slideEntrySpeed
+      && Math.abs(moveX) < 0.35
+    ) {
+      this.sprintTime = 0;
+    }
 
+    // Slide: on the ground, full slide step. Airborne (kerb / lip within
+    // slideAirGrace) must NOT pay slideFriction and must still air-strafe —
+    // otherwise micro-geometry taxes skilled chains while hold-W on flat never
+    // hits this path.
     if (this.state === 'slide') {
-      this.stepSlide(dt, moveX);
+      if (grounded) {
+        this.slideAirTime = 0;
+        this.stepSlide(dt, moveX);
+      } else {
+        this.slideAirTime += dt;
+        const airExpired = this.slideAirTime > TUNING.slideAirGrace;
+        if (
+          airExpired
+          || this.horizontalSpeed() < TUNING.slideMinSpeed
+          || (!this.crouchHeld && this.canStand())
+        ) {
+          this.exitSlide(airExpired ? TUNING.slideAirExitCooldown : TUNING.slideCooldown);
+        }
+      }
     } else if (
       this.crouchHeld && grounded && this.slideCooldown <= 0
       && this.horizontalSpeed() >= TUNING.slideEntrySpeed
-      && (this.sprintTime > 0 || this.state === 'sprint' || this.state === 'tacSprint'
-        || this.horizontalSpeed() >= TUNING.sprintSpeed)
     ) {
+      // Crouch at speed is a slide — no extra sprint-meter / state gate. The
+      // old hs≥sprintSpeed OR meter gate blocked the slideEntrySpeed..sprintSpeed
+      // recovery band after an air-strafe land.
       this.enterSlide();
     }
 
@@ -531,8 +588,10 @@ export class Movement {
 
     // ---- acceleration ----------------------------------------------------
     const maxSpeed = this.targetSpeed(moveX, moveY, wantsSprint, adsHeld);
-    if (this.state !== 'slide') {
-      if (grounded) this.accelerateGround(this._wish, maxSpeed, dt, wishing, canJump);
+    const sliding = this.state === 'slide';
+    const slideAirborne = sliding && !grounded;
+    if (!sliding || slideAirborne) {
+      if (grounded && !sliding) this.accelerateGround(this._wish, maxSpeed, dt, wishing, canJump);
       else this.accelerateAir(this._wish, maxSpeed, dt, moveX, moveY);
     }
 
@@ -548,10 +607,18 @@ export class Movement {
     if (this.velocity.y < -55) this.velocity.y = -55;
 
     // ---- mantle detection -------------------------------------------------
-    // Airborne (including the first tick of a jump, which is how a standing
-    // wall-climb is initiated) and pushing into the wall.
+    // Climb is a deliberate commit. Air-strafe aims the view into corridor
+    // walls; auto-mantling freezes velocity for 0.3–1.15 s and turns skilled
+    // flight into free freezes. Require jump intent (or a rising vault) and a
+    // dominant forward wish — pure A/D air-strafe never mantles.
     if (this.mantleCooldown <= 0 && (!grounded || this.velocity.y > 0.5)) {
-      if (wishing && this.tryMantle()) return this.out;
+      const jumpHeld = (buttons & BTN.JUMP) !== 0;
+      const rising = this.velocity.y > 1.5;
+      // Strafe-dominant wish (air-strafe) never auto-mantles — view points at walls.
+      const strafeOnly = Math.abs(moveX) > 0.4 && moveY < TUNING.sprintMinForward;
+      const climbIntent = !strafeOnly && (jumpHeld || this.jumpBuffer > 0 || rising
+        || (moveY >= TUNING.sprintMinForward && this.horizontalSpeed() > 2.0));
+      if (climbIntent && this.tryMantle()) return this.out;
     }
 
     // ---- integrate --------------------------------------------------------
@@ -630,8 +697,14 @@ export class Movement {
   private targetSpeed(moveX: number, moveY: number, sprinting: boolean, ads: boolean): number {
     let base: number;
     if (this.proneHeld) base = TUNING.proneSpeed;
-    else if (this.crouchHeld) base = TUNING.crouchSpeed;
-    else if (sprinting) {
+    else if (this.crouchHeld) {
+      // Crouch is a stance, not a handbrake. From rest you crawl at crouchSpeed;
+      // with chain-class horizontal speed the accel target stays at run so
+      // landing a hop while holding crouch can re-enter slide instead of
+      // braking the whole chain to 2.05 m/s over a handful of fixed ticks.
+      const hs = this.horizontalSpeed();
+      base = hs >= TUNING.slideEntrySpeed ? TUNING.runSpeed : TUNING.crouchSpeed;
+    } else if (sprinting) {
       base = this.sprintTime > TUNING.tacSprintDelay ? TUNING.tacSprintSpeed : TUNING.sprintSpeed;
     } else if (ads) base = TUNING.walkSpeed;
     else base = TUNING.runSpeed;
@@ -649,13 +722,21 @@ export class Movement {
     // to jump skips it entirely — see `hopping` at the call site.
     const speed = this.horizontalSpeed();
     if (speed > 0.0001 && !hopping) {
-      // Above sprint speed the world lets go of you more slowly, which is what
-      // makes a landing feel like a landing and not a handbrake.
-      const rate = speed > TUNING.tacSprintSpeed ? TUNING.groundFrictionFast : TUNING.groundFriction;
-      const drop = Math.max(speed, 2.0) * rate * dt * (wishing ? 0.55 : 1);
-      const scale = Math.max(0, speed - drop) / speed;
-      this.velocity.x *= scale;
-      this.velocity.z *= scale;
+      // Overspeed from a slide-jump chain bleeds only a whisper — Apex keeps
+      // almost everything through a landing. Full groundFriction is reserved
+      // for speeds at or under the stance target so hold-W still settles.
+      if (speed > maxSpeed * 1.02) {
+        const drop = speed * TUNING.groundFrictionFast * dt * 0.35;
+        const scale = Math.max(0, speed - drop) / speed;
+        this.velocity.x *= scale;
+        this.velocity.z *= scale;
+      } else {
+        const rate = TUNING.groundFriction;
+        const drop = Math.max(speed, 2.0) * rate * dt * (wishing ? 0.55 : 1);
+        const scale = Math.max(0, speed - drop) / speed;
+        this.velocity.x *= scale;
+        this.velocity.z *= scale;
+      }
     }
     if (!wishing) return;
 
@@ -663,12 +744,33 @@ export class Movement {
     // what makes direction changes feel crisp rather than mushy. Note it can only
     // ever *add* — a player already faster than `maxSpeed` is never braked here,
     // which is what lets momentum survive a touch of ground.
+    //
+    // `sprintRampTime` authors the commitment gradient: from rest, horizontal
+    // speed reaches ~90% of `maxSpeed` in that many seconds (exponential rate
+    // −ln(0.1)/T). Without it, groundAccel·maxSpeed·dt filled the bar in two
+    // fixed ticks and hold-W equalled any ground technique immediately.
+    const prevHs = this.horizontalSpeed();
     const current = this.velocity.x * wish.x + this.velocity.z * wish.z;
     const add = maxSpeed - current;
-    if (add <= 0) return;
-    const accel = Math.min(TUNING.groundAccel * maxSpeed * dt, add);
-    this.velocity.x += wish.x * accel;
-    this.velocity.z += wish.z * accel;
+    if (add > 0) {
+      const ramp = Math.max(1e-3, TUNING.sprintRampTime);
+      const gainPerSec = maxSpeed * 2.302585 / ramp; // ln(10) → 90% in ramp seconds
+      const accel = Math.min(gainPerSec * dt, add);
+      this.velocity.x += wish.x * accel;
+      this.velocity.z += wish.z * accel;
+    }
+
+    // Cap growth against |v_h|, not v·wish. Projected accel alone settles a
+    // wall-hug at maxSpeed/cos(θ) — measured +32% over run at 45° with no
+    // sprint key. Never strip overspeed carried in from a slide-jump; only
+    // refuse to *grow* past max(maxSpeed, speed-before-accel).
+    const hs = this.horizontalSpeed();
+    const cap = Math.max(maxSpeed, prevHs);
+    if (hs > cap + 1e-6) {
+      const k = cap / hs;
+      this.velocity.x *= k;
+      this.velocity.z *= k;
+    }
   }
 
   /**
@@ -693,6 +795,11 @@ export class Movement {
     const speed = this.horizontalSpeed();
 
     // --- 1. projected acceleration with a capped wish speed ------------------
+    // Above the slide-jump plateau, fade air-accel so the chain asymptotes
+    // instead of ratcheting forever on pure air-strafe.
+    const plateau = TUNING.slideJumpCap;
+    const airFade = speed <= plateau ? 1
+      : Math.max(0, 1 - (speed - plateau) / Math.max(1e-3, plateau * 0.35));
     const cap = Math.min(
       TUNING.airCapBaseSpeed,
       Math.max(TUNING.airWishCap, TUNING.airCapBaseSpeed - speed * TUNING.airCapFalloff),
@@ -700,8 +807,8 @@ export class Movement {
     const capped = Math.min(maxSpeed, cap);
     const current = this.velocity.x * wish.x + this.velocity.z * wish.z;
     const add = capped - current;
-    if (add > 0) {
-      const accel = Math.min(TUNING.airAccel * dt, add);
+    if (add > 0 && airFade > 0) {
+      const accel = Math.min(TUNING.airAccel * airFade * dt, add);
       this.velocity.x += wish.x * accel;
       this.velocity.z += wish.z * accel;
     }
@@ -802,10 +909,14 @@ export class Movement {
       return;
     }
 
-    // --- otherwise just remove the component pushing into the wall, so we do
-    // not build up pressure and pop out when the wall ends. Horizontal only.
-    this.velocity.x += this._tmp.x * into;
-    this.velocity.z += this._tmp.z * into;
+    // --- otherwise remove the into-wall component. Airborne high-speed contacts
+    // only cancel half — full cancel turned corridor air-strafe into a
+    // handbrake that dropped landings below slideEntrySpeed and killed the chain.
+    const cancel = (!wasGrounded && !this.out.grounded && speed >= TUNING.slideEntrySpeed)
+      ? into * 0.45
+      : into;
+    this.velocity.x += this._tmp.x * cancel;
+    this.velocity.z += this._tmp.z * cancel;
   }
 
   /**
@@ -832,13 +943,22 @@ export class Movement {
     this._dir.multiplyScalar(1 / l);
     const reach = 0.34 + 0.12;                 // capsule radius + margin
     const feet = this.position.y - this.currentHeight * 0.5;
+    const skin = 0.34 + 0.02;
 
-    this._origin.set(this.position.x, feet + 0.52, this.position.z);
-    this.physics.raycast(this._origin, this._dir, reach, MASK_MOVE, this.hit);
+    this._origin.set(
+      this.position.x + this._dir.x * skin,
+      feet + 0.52,
+      this.position.z + this._dir.z * skin,
+    );
+    this.physics.raycast(this._origin, this._dir, reach, MASK_MOVE, this.hit, this.entityId);
     if (this.hit.hit) return true;
 
-    this._origin.set(this.position.x, this.position.y, this.position.z);
-    this.physics.raycast(this._origin, this._dir, reach, MASK_MOVE, this.hit);
+    this._origin.set(
+      this.position.x + this._dir.x * skin,
+      this.position.y,
+      this.position.z + this._dir.z * skin,
+    );
+    this.physics.raycast(this._origin, this._dir, reach, MASK_MOVE, this.hit, this.entityId);
     return this.hit.hit;
   }
 
@@ -880,9 +1000,18 @@ export class Movement {
     if (!this.physics) return true;
     const need = target - this.currentHeight;
     if (need <= 0) return true;
-    this._origin.copy(this.position);
+    // Start above the current capsule top. A centre-origin ray begins inside our
+    // own CLIP proxy (after setHitboxes); solid lab raycasts return toi=0 and
+    // permanently deny slide-jumps. ignoreEntity covers the shipping world.
+    this._origin.set(
+      this.position.x,
+      this.position.y + this.currentHeight * 0.5 + 0.02,
+      this.position.z,
+    );
     this._dir.set(0, 1, 0);
-    this.physics.raycast(this._origin, this._dir, this.currentHeight * 0.5 + need + 0.06, MASK_MOVE, this.hit);
+    this.physics.raycast(
+      this._origin, this._dir, need + 0.06, MASK_MOVE, this.hit, this.entityId,
+    );
     return !this.hit.hit;
   }
 
@@ -980,15 +1109,12 @@ export class Movement {
     this.velocity.x *= scale;
     this.velocity.z *= scale;
 
-    // --- airborne grace: a small drop mid-slide does not break the chain.
-    if (this.out.grounded) this.slideAirTime = 0;
-    else this.slideAirTime += dt;
-
+    // Airborne grace is handled in `stepCommand` (air-strafe, no friction tax).
+    // This path only runs while grounded.
     if (this.slideTime > TUNING.slideMaxTime
       || this.horizontalSpeed() < TUNING.slideMinSpeed
-      || this.slideAirTime > TUNING.slideAirGrace
       || (!this.crouchHeld && this.canStand())) {
-      this.exitSlide();
+      this.exitSlide(TUNING.slideCooldown);
     }
   }
 
@@ -1010,23 +1136,42 @@ export class Movement {
 
     this._forward.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
     // 1. Is there a wall in front at chest height?
-    this._origin.set(this.position.x, feet + 0.9, this.position.z);
-    this.physics.raycast(this._origin, this._forward, TUNING.mantleReach, MASK_MOVE, this.hit);
+    // Origin sits just outside the capsule so solid self-hits never qualify.
+    const skin = 0.34 + 0.02;
+    this._origin.set(
+      this.position.x + this._forward.x * skin,
+      feet + 0.9,
+      this.position.z + this._forward.z * skin,
+    );
+    this.physics.raycast(
+      this._origin, this._forward, TUNING.mantleReach, MASK_MOVE, this.hit, this.entityId,
+    );
     if (!this.hit.hit) {
       // Low obstacles have nothing at chest height — look at shin height too, so
       // a 0.5 m crate is a vault rather than a wall you bump into.
-      this._origin.set(this.position.x, feet + 0.35, this.position.z);
-      this.physics.raycast(this._origin, this._forward, TUNING.mantleReach, MASK_MOVE, this.hit);
+      this._origin.set(
+        this.position.x + this._forward.x * skin,
+        feet + 0.35,
+        this.position.z + this._forward.z * skin,
+      );
+      this.physics.raycast(
+        this._origin, this._forward, TUNING.mantleReach, MASK_MOVE, this.hit, this.entityId,
+      );
       if (!this.hit.hit) return false;
     }
     // Only mantle roughly-vertical faces.
     if (Math.abs(this.hit.normal.y) > 0.45) return false;
+    // Must be closing on the wall, not skating past it on an air-strafe.
+    const intoWall = -(this.velocity.x * this.hit.normal.x + this.velocity.z * this.hit.normal.z);
+    if (intoWall < 0.85) return false;
 
     // 2. Probe downward just past the wall to find the ledge top.
     this._tmp.copy(this.hit.point).addScaledVector(this._forward, 0.42);
     this._tmp.y = feet + TUNING.mantleMaxHeight + 0.3;
     this._dir.set(0, -1, 0);
-    this.physics.raycast(this._tmp, this._dir, TUNING.mantleMaxHeight + 0.5, MASK_MOVE, this.hit2);
+    this.physics.raycast(
+      this._tmp, this._dir, TUNING.mantleMaxHeight + 0.5, MASK_MOVE, this.hit2, this.entityId,
+    );
     if (!this.hit2.hit) return false;
 
     const ledgeHeight = this.hit2.point.y - feet;
@@ -1042,7 +1187,9 @@ export class Movement {
     this._origin.copy(this.hit2.point).addScaledVector(this._forward, 0.05);
     this._origin.y += 0.08;
     this._dir.set(0, 1, 0);
-    this.physics.raycast(this._origin, this._dir, TUNING.standHeight * 0.9, MASK_MOVE, this.hit);
+    this.physics.raycast(
+      this._origin, this._dir, TUNING.standHeight * 0.9, MASK_MOVE, this.hit, this.entityId,
+    );
     if (this.hit.hit) return false;
 
     const kind: MantleKind = ledgeHeight <= TUNING.mantleVaultHeight ? 'vault'
@@ -1068,7 +1215,10 @@ export class Movement {
     this.mantleT = 0;
     this.mantleHeight = ledgeHeight;
     this.mantleKind = kind;
+    this.mantleEntrySpeed = this.horizontalSpeed();
     this.state = 'mantle';
+    // Integration is a Bezier teleport for the climb; velocity is restored on
+    // exit from `mantleEntrySpeed` so the chain is not deleted mid-route.
     this.velocity.set(0, 0, 0);
 
     this.out.mantleStarted = true;
@@ -1110,10 +1260,17 @@ export class Movement {
       this.out.mantleKind = this.mantleKind = 'none';
       this.out.mantleProgress = 1;
       this.mantleCooldown = TUNING.mantleCooldown;
-      // Carry forward momentum out of the climb.
+      // Preserve usable chain speed: at least the authored floor (slide-entry
+      // class), and most of whatever horizontal speed entered the mantle.
+      const exitSpeed = Math.max(
+        TUNING.mantleExitSpeed,
+        this.mantleEntrySpeed * TUNING.mantleExitRetain,
+      );
       this._forward.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw))
-        .multiplyScalar(TUNING.mantleExitSpeed);
+        .multiplyScalar(exitSpeed);
       this.velocity.set(this._forward.x, 0, this._forward.z);
+      this.out.speed = exitSpeed;
+      this.out.speed01 = Math.min(1, exitSpeed / TUNING.tacSprintSpeed);
     }
   }
 
@@ -1179,19 +1336,17 @@ export class Movement {
     out.groundSurface = this.out.groundSurface;
     out.prevButtons = this.prevButtons;
 
-    // Apex additions. `MovementState` is a shared contract owned elsewhere, so
-    // these ride along as extra own properties — see `ApexMovementState`.
-    const ax = out as ApexMovementState;
-    ax.axPrevMoveY = this.prevMoveY;
-    ax.axTapWindow = this.tapWindow;
-    ax.axWallCooldown = this.wallCooldown;
-    ax.axMantleCooldown = this.mantleCooldown;
-    ax.axMantleHeight = this.mantleHeight;
-    ax.axMantleKind = MANTLE_KINDS.indexOf(this.mantleKind);
-    ax.axGroundY = this.lastGroundY;
-    // `slideAirTime` is folded into the slide timer rather than given a field of
-    // its own: it is only ever non-zero inside a slide that is already about to
-    // end, and the extra field would cost a wire slot for nothing.
+    // Apex skill timers — first-class MovementState fields so copyMovementState
+    // (HostBridge / Predictor / Reconciler) preserves them across corrections.
+    out.axPrevMoveY = this.prevMoveY;
+    out.axTapWindow = this.tapWindow;
+    out.axWallCooldown = this.wallCooldown;
+    out.axMantleCooldown = this.mantleCooldown;
+    out.axMantleHeight = this.mantleHeight;
+    out.axMantleKind = MANTLE_KINDS.indexOf(this.mantleKind);
+    out.axGroundY = this.lastGroundY;
+    out.axSlideAirTime = this.slideAirTime;
+    out.axMantleEntrySpeed = this.mantleEntrySpeed;
     return out;
   }
 
@@ -1222,15 +1377,15 @@ export class Movement {
     this.mantleEnd.set(s.mex, s.mey, s.mez);
     this.prevButtons = s.prevButtons;
 
-    const ax = s as ApexMovementState;
-    this.prevMoveY = ax.axPrevMoveY ?? 0;
-    this.tapWindow = ax.axTapWindow ?? 0;
-    this.wallCooldown = ax.axWallCooldown ?? 0;
-    this.mantleCooldown = ax.axMantleCooldown ?? 0;
-    this.mantleHeight = ax.axMantleHeight ?? 0;
-    this.mantleKind = MANTLE_KINDS[ax.axMantleKind ?? 0] ?? 'none';
-    this.lastGroundY = ax.axGroundY ?? (s.py - s.currentHeight * 0.5);
-    this.slideAirTime = 0;
+    this.prevMoveY = s.axPrevMoveY ?? 0;
+    this.tapWindow = s.axTapWindow ?? 0;
+    this.wallCooldown = s.axWallCooldown ?? 0;
+    this.mantleCooldown = s.axMantleCooldown ?? 0;
+    this.mantleHeight = s.axMantleHeight ?? 0;
+    this.mantleKind = MANTLE_KINDS[s.axMantleKind ?? 0] ?? 'none';
+    this.lastGroundY = s.axGroundY ?? (s.py - s.currentHeight * 0.5);
+    this.slideAirTime = s.axSlideAirTime ?? 0;
+    this.mantleEntrySpeed = s.axMantleEntrySpeed ?? 0;
 
     // Derived outputs, so a caller that reads `out` before the next step sees
     // something coherent rather than the state we just threw away.
@@ -1267,28 +1422,11 @@ export class Movement {
 
   /**
    * Copies a state without touching the simulation.
-   *
-   * Note for whoever owns `src/player/MovementState.ts`: the six `ax*` fields
-   * this class writes in `capture` are not declared there, so
-   * `copyMovementState` does not carry them and a state that arrives over the
-   * wire has none. Local prediction and replay are exact (they always go through
-   * `capture`/`restore`), but a *host correction* will reset a tap-strafe window
-   * or a wall-bounce cooldown. Declaring `axPrevMoveY`, `axTapWindow`,
-   * `axWallCooldown`, `axMantleCooldown`, `axMantleHeight`, `axMantleKind` and
-   * `axGroundY` as numbers in `MovementState` + `copyMovementState` closes that
-   * gap; nothing else needs to change.
+   * `ax*` skill timers are first-class `MovementState` fields, so a plain
+   * `copyMovementState` is sufficient; this wrapper remains for call sites.
    */
   static copyState(dst: MovementState, src: MovementState): MovementState {
-    copyMovementState(dst, src);
-    const a = src as ApexMovementState, b = dst as ApexMovementState;
-    b.axPrevMoveY = a.axPrevMoveY ?? 0;
-    b.axTapWindow = a.axTapWindow ?? 0;
-    b.axWallCooldown = a.axWallCooldown ?? 0;
-    b.axMantleCooldown = a.axMantleCooldown ?? 0;
-    b.axMantleHeight = a.axMantleHeight ?? 0;
-    b.axMantleKind = a.axMantleKind ?? 0;
-    b.axGroundY = a.axGroundY ?? 0;
-    return dst;
+    return copyMovementState(dst, src);
   }
 
   /** Reads the surface under the feet for footstep audio when the controller
@@ -1297,7 +1435,9 @@ export class Movement {
     if (!this.physics) return 'concrete';
     this._origin.copy(this.position);
     this._dir.set(0, -1, 0);
-    this.physics.raycast(this._origin, this._dir, this.currentHeight * 0.5 + 0.35, MASK_MOVE, this.hit);
+    this.physics.raycast(
+      this._origin, this._dir, this.currentHeight * 0.5 + 0.35, MASK_MOVE, this.hit, this.entityId,
+    );
     return this.hit.hit ? (readSurface(this.hit.object) ?? this.hit.surface) : 'concrete';
   }
 

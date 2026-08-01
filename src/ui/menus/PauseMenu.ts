@@ -23,6 +23,9 @@ export interface PauseActions {
 export class PauseMenu extends Screen {
   private statLine: HTMLElement | null = null;
   private clockLine: HTMLElement | null = null;
+  private modeChip: HTMLElement | null = null;
+  private objectiveTitle: HTMLElement | null = null;
+  private objectiveBody: HTMLElement | null = null;
 
   constructor(host: ScreenHost, private actions: PauseActions, private model: () => HudModel) {
     super('pause', host);
@@ -42,25 +45,31 @@ export class PauseMenu extends Screen {
     });
     this.clockLine = clock;
 
+    const modeChip = el('span', { text: '—' });
+    this.modeChip = modeChip;
+    const objTitle = el('div', {
+      style: {
+        fontFamily: 'var(--ob-cond)', fontSize: 'calc(var(--ob-u)*30)', fontWeight: '700',
+        letterSpacing: '.16em', color: 'var(--ob-accent)',
+      }, text: '—',
+    });
+    this.objectiveTitle = objTitle;
+    const objBody = el('div', {
+      style: {
+        fontFamily: 'var(--ob-sans)', fontSize: 'calc(var(--ob-u)*13)', color: 'var(--ob-dim)',
+        lineHeight: '1.5', marginTop: 'calc(var(--ob-u)*6)', maxWidth: '48ch',
+      },
+      text: '',
+    });
+    this.objectiveBody = objBody;
+
     const left = el('div', { class: 'ob-panel ob-stagger' },
       el('div', { class: 'ob-panel-title' },
         el('span', { text: 'Current Objective' }),
-        el('span', { text: 'DOMINATION' }),
+        modeChip,
       ),
-      el('div', {
-        style: {
-          fontFamily: 'var(--ob-cond)', fontSize: 'calc(var(--ob-u)*30)', fontWeight: '700',
-          letterSpacing: '.16em', color: 'var(--ob-accent)',
-        }, text: 'SECURE THE UPLINK',
-      }),
-      el('div', {
-        style: {
-          fontFamily: 'var(--ob-sans)', fontSize: 'calc(var(--ob-u)*13)', color: 'var(--ob-dim)',
-          lineHeight: '1.5', marginTop: 'calc(var(--ob-u)*6)', maxWidth: '48ch',
-        },
-        text: 'Hold objective B until the transfer completes. Reinforcements arrive '
-          + 'from the north-east once the counter-attack begins.',
-      }),
+      objTitle,
+      objBody,
       el('div', { style: { marginTop: 'calc(var(--ob-u)*20)' } },
         el('div', { class: 'ob-brand-sub', text: 'Time Remaining' }),
         clock,
@@ -106,6 +115,26 @@ export class PauseMenu extends Screen {
       this.statLine.textContent =
         `SCORE ${Math.round(m.score)}  ·  HEALTH ${Math.round(m.health)}  ·  `
         + `${m.weapon.name} ${m.weapon.ammo}/${m.weapon.reserve}`;
+    }
+    const mode = (m.match.mode || 'tdm').toLowerCase();
+    const label = mode === 'operation' ? 'OPERATION'
+      : mode === 'firefight' ? 'FIREFIGHT'
+      : mode === 'tdm' || mode === 'domination' ? 'TEAM DEATHMATCH'
+      : mode.toUpperCase();
+    if (this.modeChip) this.modeChip.textContent = label;
+    if (this.objectiveTitle) {
+      this.objectiveTitle.textContent =
+        mode === 'operation' ? 'SURVIVE THE WAVES'
+        : mode === 'firefight' ? 'CLEAR THE GRID'
+        : 'LEAD THE SCOREBOARD';
+    }
+    if (this.objectiveBody) {
+      this.objectiveBody.textContent =
+        mode === 'operation'
+          ? 'Clear each wave, buy between pushes, and hold the extract. Three lives.'
+          : mode === 'firefight'
+            ? 'Push objectives under pressure. Respawn fast and keep the tempo high.'
+            : 'Eliminate hostile operators. Fast respawns — re-engage in under eight seconds.';
     }
     bus.emit('game:pause', { paused: true });
   }

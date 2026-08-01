@@ -42,7 +42,10 @@ import type { Character, CharacterFactory } from '../characters/types';
 import type { ActorAPI, Archetype, DamageOpts, SpawnRequest, Team } from './types';
 
 const MAX_BOTS_BY_PRESET: Record<string, number> = {
-  low: 10, medium: 16, high: 22, ultra: 26, cinematic: 30,
+  // Cap live bodies to what the frame budget can absorb. Each skinned bot is
+  // animation + hitboxes + LOS rays on the fixed step; the wall-path p99 failure
+  // was CPU-bound with ~2k draws and a handful of combatants, not fillrate.
+  low: 8, medium: 12, high: 14, ultra: 20, cinematic: 24,
 };
 
 const TRACERS = 48;
@@ -209,9 +212,15 @@ export class BotFallback implements ActorAPI {
       const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.88, metalness: 0.03 });
       const mesh = new THREE.InstancedMesh(geo, mat, this.capacity);
       mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-      mesh.castShadow = true;
+      // Stand-in bodies do not cast: the atlas already re-submits the whole
+      // casting scene once per cascade, and an InstancedMesh with
+      // frustumCulled=false is drawn into every cascade whenever count>0 —
+      // free extra atlas draws on the pass that is ~70% of frame draw calls.
+      // Skinned characters (when the factory is present) cast via their own
+      // meshes; the fallback silhouette is silhouette enough without a shadow.
+      mesh.castShadow = false;
       mesh.receiveShadow = true;
-      mesh.frustumCulled = false;
+      mesh.frustumCulled = true;
       mesh.count = 0;
       mesh.userData.noCollide = true;
       this.group.add(mesh);
@@ -435,7 +444,10 @@ export class BotFallback implements ActorAPI {
       /* --- line of sight, re-tested on a stagger so cost stays flat --- */
       b.losTimer -= dt;
       if (b.losTimer <= 0) {
-        b.losTimer = 0.22 + (b.phase * 0.03);
+        // Stagger harder past mid-range: LOS is a raycast every bot and is pure
+        // CPU. Close fights stay responsive; far ones refresh ~3 Hz.
+        const losBase = dist > 28 ? 0.38 : dist > 16 ? 0.28 : 0.20;
+        b.losTimer = losBase + (b.phase * 0.04);
         this._a.copy(b.position); this._a.y += b.muzzleHeight;
         // Chest height on whatever we are looking at. The player's `position`
         // is the capsule *centre*, not the feet, so this used to aim a third of
@@ -474,8 +486,11 @@ export class BotFallback implements ActorAPI {
         this._c.copy(toTarget).multiplyScalar(-b.speed * 0.35);
       }
 
-      // Cheap obstacle deflection: if the path forward is blocked, slide along.
-      if (physics?.ready && this._c.lengthSq() > 0.01) {
+      // Cheap obstacle deflection, only while advancing/repositioning and only
+      // on staggered ticks — engage strafes are short and do not need a ray.
+      if (physics?.ready && this._c.lengthSq() > 0.01
+          && (b.state === 'advance' || b.state === 'reposition')
+          && ((tick + b.phase) & 1) === 0) {
         this._a.copy(b.position); this._a.y += 0.9;
         this._b.copy(this._c).normalize();
         const hit = physics.raycast(this._a, this._b, 1.6, MASK_MOVE, this.ray);

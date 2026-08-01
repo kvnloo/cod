@@ -306,12 +306,9 @@ export class CombatController {
    * squadmate's capsule, a ragdoll. There is no probability anywhere in this
    * function; whether you are hit is decided by where the barrel was pointing.
    *
-   * The analytic capsule solve is kept alongside it for two reasons: it is the
-   * only path available when physics is not up (headless tests, the AI debug
-   * scene's synthetic target), and while a live character still owns a single
-   * `chest` proxy collider it is the only thing that can tell a head shot from
-   * a leg shot. The moment the character grows real per-zone colliders the
-   * collider's own zone wins — see `zoneFor`.
+   * The analytic capsule solve remains for headless tests and unzoned proxies.
+   * Living multi-zone colliders (CharacterController.setHitboxes) win whenever
+   * MASK_BULLET resolves them — see `zoneFor`.
    */
   private resolveShot(
     now: number, muzzle: THREE.Vector3, target: TargetLike, distance: number,
@@ -392,8 +389,13 @@ export class CombatController {
       }
     }
 
-    const hitTarget = colliderIsTarget || (!worldHit && capsuleHit)
-      || (capsuleHit && capsuleT < worldDist);
+    // Prefer the MASK_BULLET hit when it is the target. Analytic capsule is
+    // only a fallback for unzoned bodies / missing physics — not a second
+    // damage path that overrides a real multi-zone collider.
+    const hitTarget = colliderIsTarget
+      || (!worldHit && capsuleHit)
+      || (capsuleHit && !colliderIsTarget && capsuleT + 0.05 < worldDist
+        && !(worldHit && _hit.entityId >= 0 && _hit.entityId !== target.entityId));
 
     if (hitTarget) {
       const t = colliderIsTarget ? _hit.distance : capsuleT;
@@ -460,7 +462,10 @@ export class CombatController {
     muzzle: THREE.Vector3, dir: THREE.Vector3, t: number,
     base: number, height: number, colliderZone: HitZone,
   ): HitZone {
-    if (colliderZone !== 'none' && colliderZone !== 'chest') return colliderZone;
+    // Multi-zone living colliders own the answer — including an honest chest.
+    // Only fall back to vertical capsule bands when physics reported no zone
+    // (single proxy / headless / player capsule without setHitboxes).
+    if (colliderZone !== 'none') return colliderZone;
     const y = muzzle.y + dir.y * t;
     const frac = clamp01((y - base) / Math.max(0.4, height));
     if (frac > 0.88) return 'head';

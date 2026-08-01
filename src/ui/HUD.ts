@@ -190,7 +190,12 @@ export class HUDSystem implements System {
       this.menus.replace('main');
     });
     this.menus.register(new MainMenu(this.menus, {
-      deploy: () => { this.menus.closeAll(); bus.emit('game:start', { mode: 'domination' }); },
+      // Session remaps domination→tdm; deploy the mode the brief actually runs.
+      deploy: () => {
+        this.menus.closeAll();
+        bus.emit('game:start', { mode: 'tdm' });
+        this.showFirstMatchControls();
+      },
       loadout: () => this.menus.push('loadout'),
       settings: () => this.menus.push('settings'),
       quit: () => bus.emit('notify', { text: 'Quit is disabled in the browser build', kind: 'warn' }),
@@ -417,6 +422,29 @@ export class HUDSystem implements System {
   }
 
   /* ------------------------------------------------------- public API -- */
+
+  /**
+   * First-match control card — legible controls for 3–8 s so a naive player
+   * can act in the opening thirty seconds without a manual (category G).
+   * Once per browser profile via localStorage.
+   */
+  private showFirstMatchControls(): void {
+    const key = 'ob-seen-controls-v1';
+    try {
+      if (localStorage.getItem(key) === '1') return;
+      localStorage.setItem(key, '1');
+    } catch { /* private mode — still show once this session */ }
+    // Stagger slightly so it does not collide with the mode open banner.
+    window.setTimeout(() => {
+      // 5.5 s sits in the 3–8 s first-match card window (category G).
+      this.banners.banner(
+        'CONTROLS',
+        'WASD MOVE · MOUSE LOOK · LMB FIRE · RMB ADS · SPACE JUMP · C CROUCH · SHIFT SPRINT · R RELOAD',
+        'objective',
+        5.5,
+      );
+    }, 900);
+  }
 
   /** Full-width objective banner. */
   banner(title: string, sub = '', kind: 'objective' | 'warn' | 'reward' = 'objective'): void {

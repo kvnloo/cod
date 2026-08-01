@@ -19,6 +19,7 @@ import { QUAD_BLEND, QUAD_MODE } from './Quads';
 import { clamp } from './Common';
 import type { CasingKind } from './Casings';
 import type { FxWorld } from './Context';
+import { hasWeapon, weaponDef } from '../weapons/Catalog';
 
 export interface MuzzleProfile {
   scale: number;
@@ -80,12 +81,23 @@ interface BarrelHeat {
 
 export class MuzzleFX {
   /** Offset from the reported fire origin to the physical muzzle, in the
-   *  weapon's own frame (right, up, forward). Weapons can override it. */
-  muzzleOffset = new THREE.Vector3(0.13, -0.11, 0.58);
-  ejectOffset = new THREE.Vector3(0.09, -0.06, 0.20);
+   *  weapon's own frame (right, up, forward).
+   *
+   *  Zero by default: `weapon:fire.origin` is already `viewModel.muzzleWorld()`,
+   *  so a non-zero offset floated the flash and brass off the barrel. Callers
+   *  that only have a camera origin can still set these. */
+  muzzleOffset = new THREE.Vector3(0, 0, 0);
+  ejectOffset = new THREE.Vector3(0, 0, 0);
+
+  /** Last resolved muzzle / eject-port world positions (probe + debug). */
+  readonly lastMuzzle = new THREE.Vector3();
+  readonly lastPort = new THREE.Vector3();
+  /** Metres between muzzle crown and eject port on the last shot. */
+  lastBrassSeparation = 0;
 
   private heat = new Map<string, BarrelHeat>();
   private hazeTimer = 0;
+  private readonly _ejectScratch = new THREE.Vector3();
 
   clear(): void {
     this.heat.clear();
@@ -120,7 +132,20 @@ export class MuzzleFX {
     firstPerson: boolean,
   ): void {
     const prof = profileFor(weaponId);
+    // Derive eject-port offset from the authored model points whenever the
+    // caller left ejectOffset at zero (the historical default). weapon:fire
+    // origin is the muzzle crown, so a zero port offset spawned brass at the
+    // tip — the classic "casings flying out the muzzle" failure.
+    const savedEject = this._ejectScratch.copy(this.ejectOffset);
+    if (this.ejectOffset.lengthSq() < 1e-10) {
+      this.applyCatalogEject(weaponId);
+    }
     this.frame(origin, direction);
+    this.ejectOffset.copy(savedEject);
+
+    this.lastMuzzle.copy(muzzle);
+    this.lastPort.copy(port);
+    this.lastBrassSeparation = port.distanceTo(muzzle);
 
     const heat = this.heat.get(weaponId)
       ?? { heat: 0, lastShot: 0, mx: 0, my: 0, mz: 0, fx: 0, fy: 0, fz: -1 };
@@ -147,14 +172,33 @@ export class MuzzleFX {
       w.floorUnder(port.x, port.y, port.z), prof.ejectSpeed,
     );
 
-    if (firstPerson) {
-      // "First person" only means the shot came through the player's own weapon
-      // event, not that the muzzle is at the player's eye. A rifle staged fifteen
-      // metres away must not kick the camera: the shake shows up as a per-frame
-      // camera delta, and the motion-blur pass then smears the entire frame.
+    // First-person kick is owned by CameraRig.addShake in Weapons.shoot — a
+    // second Renderer.addCameraShake here stacked two independent envelopes
+    // and fought aim recovery. Third-person / near AI shots still shake.
+    if (!firstPerson) {
       const near = clamp(1 - w.distanceToCamera(muzzle.x, muzzle.y, muzzle.z) / 2.5, 0, 1);
       if (near > 0.01) w.shake(prof.shake * near * (suppressed ? 0.5 : 1), 34, 0.12);
     }
+  }
+
+  /**
+   * Port − muzzle in weapon frame (right, up, forward). Model space is
+   * −Z down the bore, so the forward component is `muzzle.z − eject.z`.
+   */
+  private applyCatalogEject(weaponId: string): void {
+    if (!hasWeapon(weaponId)) {
+      // Sensible rifle default: ~2.5 cm right, slightly up, half-metre back.
+      this.ejectOffset.set(0.026, 0.01, -0.45);
+      return;
+    }
+    const m = weaponDef(weaponId).model;
+    const mz = m.muzzle;
+    const ej = m.ejectPort;
+    this.ejectOffset.set(
+      ej[0] - mz[0],
+      ej[1] - mz[1],
+      mz[2] - ej[2],
+    );
   }
 
   /* ---------------------------------------------------------------- layers */

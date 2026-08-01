@@ -73,7 +73,8 @@ export class ScorePopups implements Widget {
       if (this.live[i] !== p) this.live[i].slot.to(i);
     }
     this.tallyPunch.kick(18);
-    bus.emit('ui:sound', { cue: 'xp' });
+    // Score tick audio is owned by Audio on `score:add` (pickup). Emitting `xp`
+    // here double-fired the kill-confirm sandwich with hitKill from HitMarkers.
   }
 
   clear(): void {

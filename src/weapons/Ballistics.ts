@@ -34,7 +34,7 @@ import * as THREE from 'three';
 import { bus } from '../core/EventBus';
 import { Rand } from '../core/Rand';
 import { surface as surfaceProps } from '../core/Surfaces';
-import type { PhysicsAPI, RayHit } from '../physics/types';
+import type { HitZone, PhysicsAPI, RayHit } from '../physics/types';
 import { MASK_BULLET } from '../physics/types';
 import type { RenderAPI } from '../render/types';
 import { damageAt } from './Catalog';
@@ -52,6 +52,8 @@ export interface DamageResult {
 export type DamageResolver = (
   entityId: number, amount: number, headshot: boolean, point: THREE.Vector3,
   direction: THREE.Vector3, fromPlayer: boolean,
+  /** Physics-resolved hit zone when the ray hit a multi-zone collider. */
+  zone?: HitZone,
 ) => DamageResult;
 
 export interface ShotSpec {
@@ -140,13 +142,32 @@ export class Ballistics {
     const b = spec.def.ballistics;
     const hitscanRange = b.hitscanRange * spec.rangeScale;
     if (hitscanRange > 0) {
-      this.fireHitscan(spec, hitscanRange);
+      // Hitscan resolves the near segment; anything still flying past that
+      // distance is handed to the projectile solver (gravity + drag).
+      const stopped = this.fireHitscan(spec, hitscanRange);
+      if (!stopped) {
+        const dir = this._dir.copy(spec.direction).normalize();
+        this._p.copy(spec.origin).addScaledVector(dir, hitscanRange);
+        this.fireProjectile({
+          ...spec,
+          origin: this._p.clone(),
+          direction: dir.clone(),
+          startDistance: (spec.startDistance ?? 0) + hitscanRange,
+          // Tracer already drawn for the hitscan segment when it missed clean.
+          tracer: false,
+        });
+      }
     } else {
       this.fireProjectile(spec);
     }
   }
 
-  private fireHitscan(spec: ShotSpec, range: number): void {
+  /**
+   * Resolve the first `range` metres as an instant ray. Returns true when the
+   * round stopped inside that window (impact, or fully spent), false when it is
+   * still in flight and the projectile solver should take over beyond.
+   */
+  private fireHitscan(spec: ShotSpec, range: number): boolean {
     const from = this._p.copy(spec.origin);
     const dir = this._dir.copy(spec.direction).normalize();
     let power = spec.penetration;
@@ -154,6 +175,7 @@ export class Ballistics {
     let travelled = spec.startDistance ?? 0;
     let remaining = range;
     let tracerStart: THREE.Vector3 | null = spec.tracer ? from.clone() : null;
+    let hitAnything = false;
 
     for (let seg = 0; seg < MAX_SEGMENTS && remaining > 0.01; seg++) {
       const phys = this.physics;
@@ -161,6 +183,7 @@ export class Ballistics {
       const n = phys.raycastAll(from, dir, remaining, MASK_BULLET, this.hits, 8, spec.ownerEntity);
       if (n === 0) break;
       const hit = this.hits[0];
+      hitAnything = true;
       travelled += hit.distance;
       remaining -= hit.distance;
 
@@ -169,7 +192,7 @@ export class Ballistics {
         this.tracers.streak(tracerStart, hit.point, spec.def.cls === 'lmg' ? 1.25 : 1);
         tracerStart = null;
       }
-      if (outcome.stop) return;
+      if (outcome.stop) return true;
 
       power = outcome.power;
       damageScale = outcome.damageScale;
@@ -179,9 +202,13 @@ export class Ballistics {
     }
 
     if (spec.tracer && tracerStart && this.tracers) {
+      // Draw the near-range streak; the projectile carries the rest of the path.
       this._p2.copy(from).addScaledVector(dir, Math.min(range, 120));
       this.tracers.streak(tracerStart, this._p2, 1);
     }
+    // Empty air (or only soft penetrations that left the budget intact) → still flying.
+    void hitAnything;
+    return false;
   }
 
   private fireProjectile(spec: ShotSpec): void {
@@ -328,10 +355,14 @@ export class Ballistics {
     /* --- characters ------------------------------------------------------ */
     if (hit.entityId >= 0 && hit.entityId !== spec.ownerEntity) {
       const zone = hit.zone;
-      const headshot = zone === 'head';
-      const raw = damageAt(def, travelled) * def.zones[zone] * damageScale;
-      const res = this.damageResolver?.(hit.entityId, raw, headshot, hit.point, dir, spec.fromPlayer)
-        ?? { killed: false, applied: raw };
+      const headshot = zone === 'head' || zone === 'neck';
+      const zKey = zone in def.zones ? zone : 'chest';
+      const raw = damageAt(def, travelled) * def.zones[zKey] * damageScale;
+      // Pass the collider zone through so pricing / flinch / hitmarker can use
+      // arm/leg/stomach rather than collapsing everything to headshot|chest.
+      const res = this.damageResolver?.(
+        hit.entityId, raw, headshot, hit.point, dir, spec.fromPlayer, zone,
+      ) ?? { killed: false, applied: raw };
 
       bus.emit('damage:dealt', {
         targetId: hit.entityId, amount: res.applied, headshot,

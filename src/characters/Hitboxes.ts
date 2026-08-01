@@ -15,6 +15,8 @@ import * as THREE from 'three';
 import type { HitBox } from './types';
 import type { Appearance } from './Appearance';
 import { BONE_INDEX, type RigInstance } from './Rig';
+import type { CharacterHitboxDesc, HitZone } from '../physics/types';
+import type { SurfaceType } from '../core/Surfaces';
 
 interface BoxDef {
   zone: HitBox['zone'];
@@ -112,3 +114,98 @@ export function hitboxDebug(rig: RigInstance, boxes: readonly HitBox[]): THREE.G
 
 const _scale = new THREE.Vector3();
 const _off = new THREE.Vector3();
+
+
+/**
+ * Capsule-local multi-zone volumes for a living soldier.
+ *
+ * Bone-driven hitboxes exist for skinned presentation and ragdolls; the live
+ * combat path registers these on the kinematic proxy so a bullet ray at head /
+ * chest / limb height resolves a real zone without waiting on a posed rig.
+ * Offsets are from the capsule centre (y-up, facing +Z). Height scales the
+ * whole set so crouch re-layout is a free multiply.
+ */
+export function livingHitboxLayout(height: number, radius: number): CharacterHitboxDesc[] {
+  const h = Math.max(0.9, height);
+  const r = Math.max(0.2, radius);
+  // Reference is a 1.80 m soldier; scale linear dimensions with height.
+  const s = h / 1.80;
+  // Prior solid capsule was diameter ~2r (0.72 m). Keep torso nearly that wide so
+  // bloomed rounds still land; leave a thin outer ring for arm grazes.
+  const torsoW = Math.min(r * 0.88, 0.32 * s);
+  const torsoD = Math.min(r * 0.80, 0.28 * s);
+  const limbR = Math.min(r * 0.42, 0.11 * s);
+
+  const box = (
+    zone: HitZone,
+    half: [number, number, number],
+    offset: [number, number, number],
+    surface?: SurfaceType,
+  ): CharacterHitboxDesc => ({
+    zone,
+    half,
+    offset,
+    surface: surface ?? (zone === 'head' ? 'helmet' : 'flesh'),
+  });
+
+  /**
+   * Continuous vertical bands as fractions of height from the feet. Adjacent
+   * bands overlap slightly so a centre-mass ray never slips through a seam
+   * (the previous layout left chest↔neck, stomach↔chest and leg↔stomach gaps).
+   * Capsule centre is at 0.5 h from the feet; local offset.y = (mid − 0.5) · h.
+   */
+  const band = (
+    zone: HitZone,
+    y0: number,
+    y1: number,
+    halfX: number,
+    halfZ: number,
+    ox = 0,
+    surface?: SurfaceType,
+  ): CharacterHitboxDesc => {
+    const mid = (y0 + y1) * 0.5;
+    const halfY = (y1 - y0) * 0.5 * h;
+    return box(zone, [halfX, halfY, halfZ], [ox, (mid - 0.5) * h, 0], surface);
+  };
+
+  return [
+    // Playtest head band sits at 0.94 h; cover chin → crown.
+    band('head', 0.870, 1.015, 0.11 * s, 0.11 * s, 0, 'helmet'),
+    band('neck', 0.810, 0.885, 0.07 * s, 0.07 * s),
+    // Chest covers playtest 0.72; overlaps neck above and stomach below.
+    band('chest', 0.555, 0.825, torsoW, torsoD),
+    // Stomach covers playtest 0.52; overlaps legs.
+    band('stomach', 0.395, 0.575, torsoW * 0.95, torsoD * 0.92),
+    // Arms: outer capsule ring at torso height (side grazes, not centre-mass).
+    band('arm', 0.480, 0.820, limbR, limbR, r * 0.92),
+    band('arm', 0.480, 0.820, limbR, limbR, -r * 0.92),
+    // Legs cover playtest 0.22 and reach into the lower stomach band.
+    band('leg', 0.000, 0.430, limbR * 1.25, limbR * 1.15, r * 0.24),
+    band('leg', 0.000, 0.430, limbR * 1.25, limbR * 1.15, -r * 0.24),
+  ];
+}
+
+/** Convert authored per-bone hitboxes into capsule-local descs using live bones. */
+export function hitboxesToProxyDesc(
+  rig: RigInstance,
+  boxes: readonly HitBox[],
+  capsuleCentre: THREE.Vector3,
+  bodyYaw = 0,
+): CharacterHitboxDesc[] {
+  const out: CharacterHitboxDesc[] = [];
+  const invYaw = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -bodyYaw);
+  for (const box of boxes) {
+    hitboxTransform(rig, box, _pos, _quat);
+    _pos.sub(capsuleCentre).applyQuaternion(invYaw);
+    out.push({
+      zone: box.zone,
+      half: [box.half[0], box.half[1], box.half[2]],
+      offset: [_pos.x, _pos.y, _pos.z],
+      surface: box.zone === 'head' ? 'helmet' : 'flesh',
+    });
+  }
+  return out;
+}
+
+const _pos = new THREE.Vector3();
+const _quat = new THREE.Quaternion();

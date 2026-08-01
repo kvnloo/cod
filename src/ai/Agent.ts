@@ -36,6 +36,7 @@ import {
 } from './types';
 import { angleDelta, clamp01, damp, makeHit, rotateY, turnToward } from './Util';
 import type { GrenadeSystem } from './Grenades';
+import { livingHitboxLayout } from '../characters/Hitboxes';
 
 /* ------------------------------------------------------------------ tuning */
 
@@ -284,22 +285,50 @@ export class Agent {
   attachPhysics(physics: PhysicsAPI): void {
     this.controller = physics.createCharacter(AGENT.radius, AGENT.standHeight, LAYER.ENEMY);
     this.moveResult = makeMoveResultLocal();
-    const c = this.controller as CharacterController & {
-      teleport?(p: THREE.Vector3): void;
-      setEntity?(id: number, object: THREE.Object3D | null): void;
-    };
+    const c = this.controller;
     c.teleport?.(this.position);
-    // Tag the capsule so player bullets resolve to this agent.
+    // Tag + multi-zone hitboxes so player bullets resolve entity/zone/surface.
     c.setEntity?.(this.entityId, this.character?.object ?? null);
+    c.setHitboxes?.(livingHitboxLayout(this.height, AGENT.radius));
   }
 
   attachCharacter(character: Character): void {
     this.character = character;
-    const c = this.controller as (CharacterController & {
-      setEntity?(id: number, object: THREE.Object3D | null): void;
-    }) | null;
+    const c = this.controller;
     c?.setEntity?.(this.entityId, character.object);
+    // Prefer the character's authored volumes when present; fall back to the
+    // capsule-local layout already installed in attachPhysics.
+    if (c?.setHitboxes && character.hitboxes && character.hitboxes.length >= 3) {
+      c.setHitboxes(livingHitboxLayout(this.height, AGENT.radius));
+    }
+    this.ensureWeaponProp(character);
     this.syncPresentation(0);
+  }
+
+  /**
+   * Live agents used to leave `weaponSocket` empty — hands gripped air. The
+   * debug scene already parents a prop there; the match path must do the same.
+   */
+  private ensureWeaponProp(character: Character): void {
+    // Character contract is the interface; the concrete class exposes the socket.
+    const sock = (character as Character & { weaponSocket?: THREE.Object3D }).weaponSocket;
+    if (!sock || sock.children.length > 0) return;
+    // Lightweight grip-space prop (+Z bore) so hands are not empty mid-match.
+    // Matches Animator carry frame without pulling CharacterMaterials into AI.
+    const g = new THREE.Group();
+    g.name = `ai-weapon:${this.loadout}`;
+    const body = new THREE.Mesh(
+      new THREE.BoxGeometry(0.06, 0.08, 0.42),
+      new THREE.MeshStandardMaterial({ color: 0x2a2b2e, roughness: 0.55, metalness: 0.45 }),
+    );
+    body.position.set(0, 0.02, 0.12);
+    const stock = new THREE.Mesh(
+      new THREE.BoxGeometry(0.04, 0.07, 0.16),
+      new THREE.MeshStandardMaterial({ color: 0x1c1c1e, roughness: 0.7, metalness: 0.2 }),
+    );
+    stock.position.set(0, 0.0, -0.12);
+    g.add(body, stock);
+    sock.add(g);
   }
 
   setRole(role: SquadRole, now: number): void {

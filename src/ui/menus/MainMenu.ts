@@ -44,7 +44,7 @@ export class MainMenu extends Screen {
 
     /* --------------------------------------------------------- nav --- */
     const items: NavSpec[] = [
-      { label: 'Deploy', note: 'Blackout · Uplink', run: () => this.actions.deploy() },
+      { label: 'Deploy', note: 'Blackout · TDM', run: () => this.actions.deploy() },
       { label: 'Loadout', note: '3 Classes', run: () => this.actions.loadout() },
       { label: 'Barracks', note: 'Locked', run: () => { }, disabled: true },
       { label: 'Settings', note: '', run: () => this.actions.settings() },
@@ -102,7 +102,7 @@ export class MainMenu extends Screen {
           fontFamily: 'var(--ob-cond)', fontSize: 'calc(var(--ob-u)*34)',
           fontWeight: '700', letterSpacing: '.16em', color: 'var(--ob-ink)',
         },
-        text: 'BLACKOUT · UPLINK',
+        text: 'BLACKOUT · TEAM DEATHMATCH',
       }),
       el('div', {
         style: {
@@ -110,14 +110,14 @@ export class MainMenu extends Screen {
           color: 'var(--ob-dim)', lineHeight: '1.55',
           marginTop: 'calc(var(--ob-u)*8)', maxWidth: '62ch',
         },
-        text: 'Hostile signals intelligence has seized the district relay. Secure the '
-          + 'uplink, hold it through the counter-attack and extract before the grid '
-          + 'comes back online. Expect entrenched infantry and rooftop overwatch.',
+        text: 'Grid 41-North is contested. Deploy with your fireteam, eliminate '
+          + 'hostile operators, and hold the score lead until the clock expires. '
+          + 'Fast respawns, open sightlines, and vertical movement decide the round.',
       }),
       el('div', {
         style: { display: 'flex', gap: 'calc(var(--ob-u)*10)', marginTop: 'calc(var(--ob-u)*14)' },
       },
-        el('div', { class: 'ob-medal', text: 'Domination' }),
+        el('div', { class: 'ob-medal', text: 'Team Deathmatch' }),
         el('div', { class: 'ob-medal', text: '6 v 6' }),
         el('div', { class: 'ob-medal', text: 'Dusk · Light Rain' }),
       ),

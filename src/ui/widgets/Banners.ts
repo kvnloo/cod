@@ -53,8 +53,18 @@ export class Banners implements Widget {
   private readonly off: Array<() => void> = [];
 
   constructor(private pal: () => Palette) {
+    // Gameplay emits `hud:banner` (BannerView); UI also accepts `ui:banner`.
+    // Without the gameplay bridge, centre banners never appear in a real match.
+    const mapKind = (k?: string): BannerKind => {
+      if (k === 'reward') return 'reward';
+      if (k === 'alert' || k === 'result' || k === 'warn') return 'warn';
+      return 'objective';
+    };
     this.off.push(bus.on('ui:banner', (e) => {
       this.banner(e.title, e.sub ?? '', e.kind ?? 'objective');
+    }));
+    this.off.push(bus.on('hud:banner', (e) => {
+      this.banner(e.title, e.subtitle ?? '', mapKind(e.kind), e.ttl);
     }));
     this.off.push(bus.on('killstreak:earned', (e) => {
       this.banner(e.name.toUpperCase(), 'KILLSTREAK READY', 'reward');
@@ -74,8 +84,9 @@ export class Banners implements Widget {
     }));
   }
 
-  banner(title: string, sub = '', kind: BannerKind = 'objective'): void {
-    this.queue.push({ title, sub, kind, age: 0, life: motionTime(3.4) });
+  banner(title: string, sub = '', kind: BannerKind = 'objective', ttl?: number): void {
+    const life = motionTime(ttl && ttl > 0 ? ttl : 3.4);
+    this.queue.push({ title, sub, kind, age: 0, life });
     bus.emit('ui:sound', { cue: 'objective' });
   }
 

@@ -113,6 +113,12 @@ export class Director {
   private publishTimer = 0;
   private readonly intensityMsg = { value: 0, target: 0, active: 0, budget: 0 };
 
+  /** Time-to-first-contact samples after respawn (seconds). Category F instrument. */
+  readonly ttfcSamples: number[] = [];
+  private wasAlive = true;
+  private respawnedAt = -1;
+  private pendingTtfc = false;
+
   constructor(private services: GameServices, private rng: Rand) { }
 
   /** Re-seeds the director's decision stream when a match (re)starts. */
@@ -132,6 +138,10 @@ export class Director {
     this.liveCounts = emptyLiveCounts();
     this.spawnedTotal = 0;
     this.now = 0;
+    this.ttfcSamples.length = 0;
+    this.wasAlive = true;
+    this.respawnedAt = -1;
+    this.pendingTtfc = false;
   }
 
   buildGraph(): void {
@@ -181,13 +191,34 @@ export class Director {
       this.targetIntensity = this.config.flat;
     }
 
-    /* --- throttles --- */
+    /* --- throttles + TTFC instrument --- */
     const player = this.services.player;
     let throttle = 1;
     if (player) {
+      const alive = !!player.alive;
+      if (!this.wasAlive && alive) {
+        // Fresh respawn: design wants contact in 3–8 s — kick intensity up and
+        // arm the TTFC stopwatch so we can measure death→re-engage.
+        this.respawnedAt = this.now;
+        this.pendingTtfc = true;
+        this.intensity = Math.max(this.intensity, 0.55);
+        this.targetIntensity = Math.max(this.targetIntensity, 0.62);
+        this.spawnTimer = Math.min(this.spawnTimer, 0.35);
+      }
+      if (this.pendingTtfc && alive && this.live.length > 0) {
+        // First living enemy after respawn counts as contact for the cadence.
+        this.ttfcSamples.push(this.now - this.respawnedAt);
+        if (this.ttfcSamples.length > 64) this.ttfcSamples.shift();
+        this.pendingTtfc = false;
+      }
+      this.wasAlive = alive;
       const frac = player.maxHealth > 0 ? player.health / player.maxHealth : 1;
-      if (!player.alive) throttle = 0.15;
+      if (!alive) throttle = 0.15;
       else if (frac < 0.5) throttle = THREE.MathUtils.lerp(0.42, 1, frac / 0.5);
+      // Soft re-engage boost for ~6 s so spawns do not wait out a lull.
+      if (this.respawnedAt >= 0 && this.now - this.respawnedAt < 6) {
+        throttle = Math.max(throttle, 0.85);
+      }
     }
     const wanted = this.targetIntensity * throttle;
 

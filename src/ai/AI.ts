@@ -179,11 +179,10 @@ export class AISystem implements System, AgentHost {
     }));
 
     off.push(bus.on('bullet:impact', (e) => {
-      // Impacts near an agent are the primary suppression signal.
-      for (const a of this.agents) {
-        if (!a.alive) continue;
-        a.suppressFrom(e.point, 0.5);
-      }
+      // Suppression for player rounds is handled by `suppressAlongRay` on
+      // `weapon:fire`. Applying `suppressFrom` here on *every* impact had no
+      // shooter filter, so AI deliberate-miss / peek-cover impacts suppressed
+      // the shooter's own squad. Keep hearing only.
       // Hearing every single impact would cost an occlusion ray per agent per
       // round; a few a second carries the same information.
       if (this.simTime - this.lastImpactSound > 0.18) {
@@ -201,10 +200,10 @@ export class AISystem implements System, AgentHost {
       if (_v0.lengthSq() < 1e-6) _v0.copy(agent.forward).negate();
       _v0.normalize();
       const zone = e.headshot ? 'head' : 'chest';
-      const killed = agent.applyDamage(e.amount, _v0, zone, e.fromPlayer, e.point);
-      if (killed && e.fromPlayer) {
-        bus.emit('hud:hitmarker', { headshot: e.headshot, killed: true, armor: false });
-      }
+      // Ballistics already published `hud:hitmarker` with the resolver's
+      // killed/armor flags. Re-emitting a kill marker here stacked a second
+      // confirm visual (and a third audio blip via the old Audio listener).
+      agent.applyDamage(e.amount, _v0, zone, e.fromPlayer, e.point);
     }));
 
     // A grenade in the air is worth shouting about, whoever threw it.

@@ -110,7 +110,7 @@ export const TUNING: Record<string, number> & {
    * direction you are allowed to already be moving in. Everything interesting
    * about strafe-jumping is a consequence of this one number.
    */
-  airWishCap: 0.762,
+  airWishCap: 0.85,
   /**
    * Below this speed the cap is relaxed so a standing jump still has usable air
    * control; it falls back to `airWishCap` by ~2.5 m/s, well under any speed a
@@ -120,7 +120,7 @@ export const TUNING: Record<string, number> & {
   airCapFalloff: 1.0,
   /** Acceleration coefficient, m/s². Near the theoretical optimum for a 120 Hz
    *  tick with the cap above: gain per tick peaks at k·(cap − k·dt)/v. */
-  airAccel: 50,
+  airAccel: 52,
   /** CPMA-style air control, rad/s of *velocity rotation*. Never adds speed. */
   airControlTurn: 2.6,
   /** Air control is forward-only, as in Quake3 — strafe input disables it,
@@ -129,9 +129,9 @@ export const TUNING: Record<string, number> & {
 
   /* ---- tap-strafe --------------------------------------------------------- */
   /** Seconds of amplified air control opened by a forward re-press. */
-  tapStrafeTime: 0.20,
+  tapStrafeTime: 0.22,
   /** Amplified rotation rate, rad/s (≈ 630 °/s at full weight). */
-  tapStrafeTurn: 11.0,
+  tapStrafeTurn: 12.0,
   /** Forward axis must fall below this, then rise above `tapStrafeOn`. */
   tapStrafeOff: 0.25,
   tapStrafeOn: 0.55,
@@ -142,10 +142,10 @@ export const TUNING: Record<string, number> & {
 
   /* ---- slide -------------------------------------------------------------- */
   slideEntrySpeed: 4.6,
-  slideBoost: 2.55,
+  slideBoost: 2.60,
   /** Entry boost fades linearly to zero at this speed, so chaining converges. */
   slideBoostFalloff: 20.0,
-  slideFriction: 0.52,
+  slideFriction: 0.48,
   /**
    * Quadratic drag above `slideDragSpeed`, 1/m. Gives a long descent a real
    * terminal speed (~19-20 m/s on a 30-40° ramp) instead of running into
@@ -157,7 +157,7 @@ export const TUNING: Record<string, number> & {
   slideDragSpeed: 10.0,
   slideMinSpeed: 3.0,
   slideMaxTime: 1.6,
-  slideSteer: 2.4,
+  slideSteer: 2.6,
   slideCooldown: 0.18,
   /**
    * Cooldown used when a slide ends only because airtime exceeded the grace
@@ -174,7 +174,7 @@ export const TUNING: Record<string, number> & {
    *  ~0.4 s covers a kerb / stair lip without eating a full slide-jump window. */
   slideAirGrace: 0.48,
   /** Horizontal mult on a slide-jump. Chains must clear ~1.25× tacSprint mean. */
-  slideJumpBoost: 1.12,
+  slideJumpBoost: 1.14,
   /** Above this the slide-jump boost is not applied; the chain plateaus. */
   slideJumpCap: 16.0,
 
@@ -197,8 +197,8 @@ export const TUNING: Record<string, number> & {
    *  design cap and no legitimate chain reaches it. */
   speedHardCap: 26,
 
-  gravity: 20.5,
-  jumpVelocity: 5.55,
+  gravity: 18.5,
+  jumpVelocity: 5.70,
   /** Grace window after leaving a ledge during which a jump still registers. */
   coyoteTime: 0.11,
   jumpBufferTime: 0.13,
@@ -308,6 +308,12 @@ function rayHit(): RayHit {
 }
 
 export class Movement {
+  /**
+   * Live tuning table. Probes (`g1-ingame`, labs) read this so their air-strafe
+   * optimum cannot hardcode a stale `airAccel` and drift from production.
+   */
+  static readonly TUNING = TUNING;
+
   readonly position = new THREE.Vector3(0, TUNING.standHeight * 0.5, 0);
   readonly velocity = new THREE.Vector3();
   state: MoveState = 'idle';
@@ -337,6 +343,8 @@ export class Movement {
   private prevButtons = 0;
   /** Forward axis of the previous command — the tap-strafe edge comes off this. */
   private prevMoveY = 0;
+  /** |Δyaw|/dt of the previous step — ground turn tax. */
+  private yawRate = 0;
   private legacyCommands: CommandBuilder | null = null;
 
   /* stance */
@@ -360,6 +368,12 @@ export class Movement {
   private tapWindow = 0;
   private wallCooldown = 0;
   private mantleCooldown = 0;
+  /**
+   * Post-jump mantle intent window. A jump *commit* (press edge) opens this so
+   * a player can grab a ledge after releasing space mid-flight; plain hold-W
+   * never opens it.
+   */
+  private mantleJumpGrace = 0;
   /** Seconds a slide has been airborne; a slide survives `slideAirGrace`. */
   private slideAirTime = 0;
   /** Foot height of the last ground contact — the datum a climb is measured from. */
@@ -419,6 +433,7 @@ export class Movement {
     this.mantleEntrySpeed = 0;
     this.prevButtons = 0;
     this.prevMoveY = 0;
+    this.yawRate = 0;
     this.jumpBuffer = 0;
     this.slideTime = 0;
     this.slideCooldown = 0;
@@ -427,6 +442,7 @@ export class Movement {
     this.tapWindow = 0;
     this.wallCooldown = 0;
     this.mantleCooldown = 0;
+    this.mantleJumpGrace = 0;
     // Reset contact timers so goHome/respawn never inherits coyote air or a
     // stale grounded flag from the pre-teleport pose.
     this.groundedTime = 0;
@@ -466,6 +482,12 @@ export class Movement {
     this.prevButtons = buttons;
     this.prevMoveY = cmd.moveY;
 
+    {
+      let dy = yaw - this.yaw;
+      while (dy > Math.PI) dy -= Math.PI * 2;
+      while (dy < -Math.PI) dy += Math.PI * 2;
+      this.yawRate = dt > 1e-8 ? Math.abs(dy) / dt : 0;
+    }
     this.yaw = yaw;
     this.out.landImpact = 0;
     this.out.mantleStarted = false;
@@ -479,7 +501,12 @@ export class Movement {
     this.tapWindow = Math.max(0, this.tapWindow - dt);
     this.wallCooldown = Math.max(0, this.wallCooldown - dt);
     this.mantleCooldown = Math.max(0, this.mantleCooldown - dt);
-    if (jumpPressed) this.jumpBuffer = TUNING.jumpBufferTime;
+    this.mantleJumpGrace = Math.max(0, this.mantleJumpGrace - dt);
+    if (jumpPressed) {
+      this.jumpBuffer = TUNING.jumpBufferTime;
+      // Long enough to reach a 1.2 m crate from a short hop approach.
+      this.mantleJumpGrace = 0.55;
+    }
 
     if (this.state === 'mantle') { this.stepMantle(dt); return this.out; }
 
@@ -609,17 +636,15 @@ export class Movement {
     if (this.velocity.y < -55) this.velocity.y = -55;
 
     // ---- mantle detection -------------------------------------------------
-    // Climb is a deliberate commit. Air-strafe aims the view into corridor
-    // walls; auto-mantling freezes velocity for 0.3–1.15 s and turns skilled
-    // flight into free freezes. Require jump intent (or a rising vault) and a
-    // dominant forward wish — pure A/D air-strafe never mantles.
+    // Climb is a deliberate commit. Free hold-W near a ledge used to auto-mantle
+    // and freeze velocity 0.3–1.15 s, which punished W+air-strafe corridor chains
+    // while floor hold-W never paid the tax. Require a jump commit (held, buffer,
+    // or post-jump grace). Pure A/D is still exempt via strafeOnly.
     if (this.mantleCooldown <= 0 && (!grounded || this.velocity.y > 0.5)) {
       const jumpHeld = (buttons & BTN.JUMP) !== 0;
-      const rising = this.velocity.y > 1.5;
-      // Strafe-dominant wish (air-strafe) never auto-mantles — view points at walls.
       const strafeOnly = Math.abs(moveX) > 0.4 && moveY < TUNING.sprintMinForward;
-      const climbIntent = !strafeOnly && (jumpHeld || this.jumpBuffer > 0 || rising
-        || (moveY >= TUNING.sprintMinForward && this.horizontalSpeed() > 2.0));
+      const jumpIntent = jumpHeld || this.jumpBuffer > 0 || this.mantleJumpGrace > 0;
+      const climbIntent = !strafeOnly && jumpIntent;
       if (climbIntent && this.tryMantle()) return this.out;
     }
 
@@ -724,11 +749,14 @@ export class Movement {
     // to jump skips it entirely — see `hopping` at the call site.
     const speed = this.horizontalSpeed();
     if (speed > 0.0001 && !hopping) {
-      // Overspeed from a slide-jump chain bleeds only a whisper — Apex keeps
-      // almost everything through a landing. Full groundFriction is reserved
-      // for speeds at or under the stance target so hold-W still settles.
+      // Overspeed from a slide-jump chain: chained landings skip this block
+      // entirely (`hopping`). Plain hold-W pays a real excess pull so a gift
+      // cannot coast a corridor (Category F). Was groundFrictionFast*dt*0.35
+      // (~0.30/s) which left naive near-full speed after any gift.
       if (speed > maxSpeed * 1.02) {
-        const drop = speed * TUNING.groundFrictionFast * dt * 0.35;
+        const excess = speed - maxSpeed;
+        const drop = speed * TUNING.groundFrictionFast * dt
+          + excess * 2.5 * dt;
         const scale = Math.max(0, speed - drop) / speed;
         this.velocity.x *= scale;
         this.velocity.z *= scale;
@@ -751,12 +779,19 @@ export class Movement {
     // speed reaches ~90% of `maxSpeed` in that many seconds (exponential rate
     // −ln(0.1)/T). Without it, groundAccel·maxSpeed·dt filled the bar in two
     // fixed ticks and hold-W equalled any ground technique immediately.
+    //
+    // Quake-style projected acceleration continues below. Yaw-rate softens the
+    // accel *target* so hold-W mouse-steering cannot keep full tacSprint through
+    // a sharp corner; slides never enter this function.
     const prevHs = this.horizontalSpeed();
+    const yr = this.yawRate;
+    const turnScale = yr <= 1.0 ? 1 : Math.max(0.55, 1 - (yr - 1.0) * 0.10);
+    const target = maxSpeed * turnScale;
     const current = this.velocity.x * wish.x + this.velocity.z * wish.z;
-    const add = maxSpeed - current;
+    const add = target - current;
     if (add > 0) {
       const ramp = Math.max(1e-3, TUNING.sprintRampTime);
-      const gainPerSec = maxSpeed * 2.302585 / ramp; // ln(10) → 90% in ramp seconds
+      const gainPerSec = target * 2.302585 / ramp; // ln(10) → 90% in ramp seconds
       const accel = Math.min(gainPerSec * dt, add);
       this.velocity.x += wish.x * accel;
       this.velocity.z += wish.z * accel;
@@ -773,7 +808,7 @@ export class Movement {
       this.velocity.x *= k;
       this.velocity.z *= k;
     }
-  }
+    }
 
   /**
    * Air movement, in two parts that must not be confused with each other.
@@ -915,7 +950,7 @@ export class Movement {
     // only cancel half — full cancel turned corridor air-strafe into a
     // handbrake that dropped landings below slideEntrySpeed and killed the chain.
     const cancel = (!wasGrounded && !this.out.grounded && speed >= TUNING.slideEntrySpeed)
-      ? into * 0.45
+      ? into * 0.15
       : into;
     this.velocity.x += this._tmp.x * cancel;
     this.velocity.z += this._tmp.z * cancel;
@@ -1164,8 +1199,10 @@ export class Movement {
     // Only mantle roughly-vertical faces.
     if (Math.abs(this.hit.normal.y) > 0.45) return false;
     // Must be closing on the wall, not skating past it on an air-strafe.
+    // 2.0 m/s into-wall rejects glancing S-curve scrapes that used to free-climb
+    // corridor wall-tops mid hop and freeze the chain.
     const intoWall = -(this.velocity.x * this.hit.normal.x + this.velocity.z * this.hit.normal.z);
-    if (intoWall < 0.85) return false;
+    if (intoWall < 2.0) return false;
 
     // 2. Probe downward just past the wall to find the ledge top.
     this._tmp.copy(this.hit.point).addScaledVector(this._forward, 0.42);

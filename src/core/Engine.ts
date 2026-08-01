@@ -172,7 +172,9 @@ export class Engine {
     const { ctx, time } = this;
     input.beginFrame();
 
-    const fdt = time.fixedDelta * time.scale;
+    // fixedDelta is constant; scale only changes *how many* steps run via
+    // Time.tick's scaled accumulator. Multiplying here would sim at scale².
+    const fdt = time.fixedDelta;
     for (let i = 0; i < steps; i++) {
       for (const s of this.systems) {
         if (s.enabled === false || !s.fixedUpdate) continue;
@@ -194,7 +196,9 @@ export class Engine {
       s.render(ctx);
     }
 
-    input.endFrame();
+    // Latch discrete edges across 0-step frames (display > sim rate) so
+    // reload/melee/inspect/switch pressed between fixed steps are not dropped.
+    input.endFrame(steps > 0);
   }
 
   resize(): void {

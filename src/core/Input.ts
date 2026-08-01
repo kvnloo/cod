@@ -246,10 +246,17 @@ export class Input {
     }
   }
 
-  /** Called at the very end of every frame by Engine. */
-  endFrame(): void {
-    this.downEdges.clear();
-    this.upEdges.clear();
+  /**
+   * Called at the very end of every frame by Engine.
+   * @param clearEdges When false (0 fixed steps this frame), keep down/up edges
+   * so edge-triggered actions survive frames that run only presentation.
+   * Mouse deltas always clear — look is variable-rate.
+   */
+  endFrame(clearEdges = true): void {
+    if (clearEdges) {
+      this.downEdges.clear();
+      this.upEdges.clear();
+    }
     this.state.mouseDX = 0;
     this.state.mouseDY = 0;
     this.state.wheel = 0;

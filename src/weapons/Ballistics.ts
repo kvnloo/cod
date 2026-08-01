@@ -85,6 +85,8 @@ interface Bullet {
   fromPlayer: boolean;
   tracer: boolean;
   tracerId: number;
+  /** Entity ids this round has already wounded — overpen must not re-hit the same multi-zone body. */
+  hitEntities: Set<number>;
 }
 
 const MAX_BULLETS = 192;
@@ -128,6 +130,7 @@ export class Ballistics {
         pos: new THREE.Vector3(), vel: new THREE.Vector3(),
         travelled: 0, life: 0, power: 0, damageScale: 1,
         ownerEntity: -1, fromPlayer: false, tracer: false, tracerId: -1,
+        hitEntities: new Set(),
       });
       this.freeList.push(i);
     }
@@ -176,6 +179,9 @@ export class Ballistics {
     let remaining = range;
     let tracerStart: THREE.Vector3 | null = spec.tracer ? from.clone() : null;
     let hitAnything = false;
+    // Same body may own many zone colliders; one round damages each entity once
+    // (explosion path already Set-dedupes — body overpen must match).
+    const hitEntities = new Set<number>();
 
     for (let seg = 0; seg < MAX_SEGMENTS && remaining > 0.01; seg++) {
       const phys = this.physics;
@@ -187,7 +193,7 @@ export class Ballistics {
       travelled += hit.distance;
       remaining -= hit.distance;
 
-      const outcome = this.resolveImpact(spec, hit, dir, travelled, damageScale, power, n);
+      const outcome = this.resolveImpact(spec, hit, dir, travelled, damageScale, power, n, undefined, hitEntities);
       if (spec.tracer && tracerStart && this.tracers) {
         this.tracers.streak(tracerStart, hit.point, spec.def.cls === 'lmg' ? 1.25 : 1);
         tracerStart = null;
@@ -227,6 +233,7 @@ export class Ballistics {
     b.fromPlayer = spec.fromPlayer;
     b.tracer = spec.tracer;
     b.tracerId = spec.tracer && this.tracers ? this.tracers.spawn(b.pos, b.vel) : -1;
+    b.hitEntities.clear();
   }
 
   /* --------------------------------------------------------------- update */
@@ -269,7 +276,7 @@ export class Ballistics {
             tracer: b.tracer, shotIndex: 0,
           };
           const outcome = this.resolveImpact(spec, hit, this._dir, b.travelled + consumed + hit.distance,
-            b.damageScale, b.power, n, speed);
+            b.damageScale, b.power, n, speed, b.hitEntities);
           if (outcome.stop) { stopped = true; break; }
           b.power = outcome.power;
           b.damageScale = outcome.damageScale;
@@ -323,6 +330,7 @@ export class Ballistics {
   private resolveImpact(
     spec: ShotSpec, hit: RayHit, dir: THREE.Vector3, travelled: number,
     damageScale: number, power: number, hitCount: number, speed?: number,
+    hitEntities?: Set<number>,
   ): typeof this.outcome {
     const o = this.outcome;
     o.stop = true;
@@ -356,27 +364,39 @@ export class Ballistics {
     if (hit.entityId >= 0 && hit.entityId !== spec.ownerEntity) {
       const zone = hit.zone;
       const headshot = zone === 'head' || zone === 'neck';
+      const alreadyHit = hitEntities?.has(hit.entityId) === true;
+      // Base chest damage only. Zone multi is game-layer authority
+      // (CombatModel.ZONE_MULTIPLIERS via the resolver wrap). Catalog
+      // WeaponDef.zones is the fallback when no resolver is installed —
+      // never both, or a late wrap silently flips TTK (e.g. sniper chest
+      // 1.5 vs 2.10).
+      const base = damageAt(def, travelled) * damageScale;
       const zKey = zone in def.zones ? zone : 'chest';
-      const raw = damageAt(def, travelled) * def.zones[zKey] * damageScale;
-      // Pass the collider zone through so pricing / flinch / hitmarker can use
-      // arm/leg/stomach rather than collapsing everything to headshot|chest.
-      const res = this.damageResolver?.(
-        hit.entityId, raw, headshot, hit.point, dir, spec.fromPlayer, zone,
-      ) ?? { killed: false, applied: raw };
+      const raw = this.damageResolver ? base : base * def.zones[zKey];
 
-      bus.emit('damage:dealt', {
-        targetId: hit.entityId, amount: res.applied, headshot,
-        killed: res.killed, point: hit.point.clone(), fromPlayer: spec.fromPlayer,
-      });
-      bus.emit('bullet:impact', {
-        point: hit.point.clone(), normal: this._n.clone(), surface: hit.surface,
-        incoming: this._incoming.clone(), energy, penetrated: false,
-      });
-      if (spec.fromPlayer) {
-        bus.emit('hud:hitmarker', { headshot, killed: res.killed, armor: !!res.armor });
+      if (!alreadyHit) {
+        hitEntities?.add(hit.entityId);
+        // Pass the collider zone through so pricing / flinch / hitmarker can use
+        // arm/leg/stomach rather than collapsing everything to headshot|chest.
+        const res = this.damageResolver?.(
+          hit.entityId, raw, headshot, hit.point, dir, spec.fromPlayer, zone,
+        ) ?? { killed: false, applied: raw };
+
+        bus.emit('damage:dealt', {
+          targetId: hit.entityId, amount: res.applied, headshot,
+          killed: res.killed, point: hit.point.clone(), fromPlayer: spec.fromPlayer,
+        });
+        bus.emit('bullet:impact', {
+          point: hit.point.clone(), normal: this._n.clone(), surface: hit.surface,
+          incoming: this._incoming.clone(), energy, penetrated: false,
+        });
+        if (spec.fromPlayer) {
+          bus.emit('hud:hitmarker', { headshot, killed: res.killed, armor: !!res.armor });
+        }
       }
 
-      // High-power rounds keep going through soft targets.
+      // High-power rounds keep going through soft targets — but the same
+      // multi-zone body is never damaged twice (deduped above).
       const cost = props.penetrationDepth > 0 ? 0.35 / props.penetrationDepth : 99;
       if (power > cost && bal.penetration >= 1.5) {
         o.stop = false;
@@ -506,7 +526,7 @@ export class Ballistics {
         targetId: o.entityId, amount: res.applied, headshot: false,
         killed: res.killed, point: point.clone(), fromPlayer: spec.fromPlayer,
       });
-      if (spec.fromPlayer) bus.emit('hud:hitmarker', { headshot: false, killed: res.killed, armor: false });
+      if (spec.fromPlayer) bus.emit('hud:hitmarker', { headshot: false, killed: res.killed, armor: !!res.armor });
     }
   }
 

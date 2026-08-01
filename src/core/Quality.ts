@@ -242,45 +242,55 @@ export const PRESETS: Record<QualityPreset, GfxSettings> = {
    * Authored to hold p99 ≤ 16.7 ms on the reference machine (RTX 3080 Ti /
    * 1080p / live firefight). The shadow atlas is ~70% of draw calls and the
    * single largest CPU cost: high therefore does **not** inherit ultra's 4
-   * cascades, 140 m range, contact shadows or depth prepass. It keeps a 40 Hz
-   * atlas cadence so the adaptive ladder can still step further (12/10/8 Hz)
-   * without a no-op first rung, and leaves free post cuts for the governor
-   * when a machine still cannot hold the tier.
+   * cascades, 140 m range, contact shadows or depth prepass. It authors a
+   * single cascade @ 1024 @ 12 Hz so a rebuild cannot own a 50 ms wall frame
+   * alone, and the adaptive ladder steps further (10/8/6 Hz, then free
+   * shadows-off) without reallocating targets.
    *
    * Wave-1 live firefight on the previous high (4×1536 @ 40 Hz, contact on)
    * measured frame-p99 25–29 ms with shadowMs max 15–16 ms alone. That is why
    * these knobs moved.
    */
   high: derive(ULTRA, {
-    // Atlas cost dominates the frame. Wave-1 live firefight on 4×1536 @ 40 Hz
-    // with contact+prepass measured p99 25–29 ms and shadowMs max 15–16 ms —
-    // alone a full 60 fps budget. high must author a rebuild that fits inside
-    // the claim, not hope the adaptive dial will clean it up mid-fight.
+    // Atlas cost dominates the frame. Wave-3 still saw over50 clusters on a
+    // 2-cascade rebuild (dc≈1000 / tri≈1.49M on the rebuild frame) even after
+    // wave-1 cut 4×1536→2×1024. high authors a single 1024 cascade at 10 Hz
+    // with SSR/volumetrics off so a rebuild frame cannot own a hitch, and the
+    // free dial (hz / distance / shadows-off) can close residual over50 without
+    // any REALLOC mid-fight. Honesty over showcase: p99 ≤ 16.7 is the claim.
     shadowMapSize: 1024,
-    shadowCascades: 2,
-    shadowDistance: 80,
-    // Contact shadows force a second full opaque submission (depth prepass)
-    // and a per-pixel ray march. Neither fits a hard 16.7 ms p99 claim.
+    shadowCascades: 1,
+    shadowDistance: 60,
     contactShadows: false,
     depthPrepass: false,
-    ssrSteps: 20, volumetricSteps: 24, taaSamples: 8,
-    ssaoQuality: 0.55, maxParticles: 16000, lensDirt: 0.25, dofQuality: 0.5,
-    pcssSoftness: 0.6,
-    // 16 Hz: rebuilds fit the 60 fps claim; ladder steps further to 12/10/8 Hz.
-    // Motion blur off: a post pass that does not define the gunfight feel.
-    shadowUpdateHz: 16, exposureUpdateHz: 20, motionBlur: false,
+    // SSR + volumetrics are post costs the adaptive dial used to spend free
+    // rungs on; authoring them off leaves those rungs for real emergencies.
+    ssr: false, volumetrics: false,
+    ssrSteps: 12, volumetricSteps: 12, taaSamples: 8,
+    ssaoQuality: 0.45, maxParticles: 10000, lensDirt: 0.15, dofQuality: 0.4,
+    pcssSoftness: 0.45,
+    shadowUpdateHz: 10, exposureUpdateHz: 15, motionBlur: false, dof: false,
+    drawDistance: 600,
     adaptive: true, targetFrameMs: 16.7,
   }),
 
-  /** Console-parity 120 Hz tier. */
+  /**
+   * Console-parity 120 Hz tier.
+   *
+   * Shadow cost is capped at or below `high` (1×1024 @ 12 Hz). Earlier medium
+   * authored 3×1024 @ 30 Hz — 7× the atlas rebuild work while claiming twice
+   * the frame rate. Honesty requires the cheaper tier to rebuild less.
+   */
   medium: derive(ULTRA, {
-    renderScale: 0.85, maxPixelRatio: 1, shadowCascades: 3, shadowMapSize: 1024,
-    pcssSoftness: 0.5, ssr: false, volumetricSteps: 24, ssaoQuality: 0.5,
-    motionBlur: false, maxParticles: 12000, contactShadows: false, dof: false,
+    renderScale: 0.85, maxPixelRatio: 1, shadowCascades: 1, shadowMapSize: 1024,
+    shadowDistance: 55, pcssSoftness: 0.4, ssr: false, volumetricSteps: 24,
+    ssaoQuality: 0.5, motionBlur: false, maxParticles: 12000,
+    contactShadows: false, dof: false,
     // No contact shadows and a modest particle budget: the prepass is pure cost.
     depthPrepass: false,
     anisotropy: 8, drawDistance: 500, taaSamples: 8,
-    shadowUpdateHz: 30, exposureUpdateHz: 20,
+    // ≤ high's 12 Hz so autoDetect/perf-session lower presets are not a trap.
+    shadowUpdateHz: 10, exposureUpdateHz: 20,
     adaptive: true, targetFrameMs: 8.3,
   }),
 
@@ -292,13 +302,14 @@ export const PRESETS: Record<QualityPreset, GfxSettings> = {
    * opaque submission buys nothing.
    */
   low: derive(ULTRA, {
-    renderScale: 0.7, maxPixelRatio: 1, shadows: true, shadowCascades: 2,
-    shadowMapSize: 1024, pcssSoftness: 0, ssao: false, ssr: false,
-    volumetrics: false, bloom: true, bloomIntensity: 0.4, motionBlur: false,
-    dof: false, taa: false, fxaaFallback: true, lensDirt: 0, filmGrain: 0.15,
-    maxParticles: 6000, maxDecals: 128, anisotropy: 4, contactShadows: false,
-    drawDistance: 350, foliageDensity: 0.5,
-    shadowUpdateHz: 24, exposureUpdateHz: 15, depthPrepass: false,
+    renderScale: 0.7, maxPixelRatio: 1, shadows: true, shadowCascades: 1,
+    // 512 atlas @ 8 Hz: well under high's 1×1024 @ 12 Hz while claiming 144 fps.
+    shadowMapSize: 512, shadowDistance: 40, pcssSoftness: 0, ssao: false,
+    ssr: false, volumetrics: false, bloom: true, bloomIntensity: 0.4,
+    motionBlur: false, dof: false, taa: false, fxaaFallback: true, lensDirt: 0,
+    filmGrain: 0.15, maxParticles: 6000, maxDecals: 128, anisotropy: 4,
+    contactShadows: false, drawDistance: 350, foliageDensity: 0.5,
+    shadowUpdateHz: 8, exposureUpdateHz: 15, depthPrepass: false,
     adaptive: true, targetFrameMs: 6.9,
   }),
 };

@@ -63,7 +63,21 @@ export class CharacterSystem implements System, CharacterFactory {
         });
         void foot;
       },
-      onDeath: () => { /* the owner decides when to ragdoll */ },
+      onDeath: (character) => {
+        // Death clip finished — hand off to physics ragdoll. Impulse/zone may
+        // have been stashed by the owner (BotFallback / AI) on userData.
+        if (character.isRagdoll) return;
+        const ud = character.object.userData as {
+          pendingDeathImpulse?: THREE.Vector3;
+          pendingDeathZone?: import('../physics/types').HitZone;
+        };
+        const impulse = ud.pendingDeathImpulse?.clone() ?? new THREE.Vector3(0, 2.2, 1.5);
+        const zone = ud.pendingDeathZone ?? 'chest';
+        delete ud.pendingDeathImpulse;
+        delete ud.pendingDeathZone;
+        try { character.ragdoll(impulse, zone); }
+        catch { /* no physics ragdoll available — hold death pose */ }
+      },
     };
   }
 

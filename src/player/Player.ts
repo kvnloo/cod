@@ -129,9 +129,11 @@ export class PlayerSystem implements System {
     const s = input.state;
     const adsHeld = input.held('ads');
 
-    // ADS blend is presentation-rate so it stays smooth above the sim rate.
-    const adsSpeed = adsHeld ? 9.5 : 12;
-    this.adsBlend += ((adsHeld ? 1 : 0) - this.adsBlend) * (1 - Math.exp(-adsSpeed * dt));
+    // Camera ADS must follow Weapons.adsBlend (gated by adsTime, sprint, etc.).
+    // An independent exponential here desynced FOV from the view-model on ADS+sprint.
+    const weapons = ctx.engine.tryGet<System & { adsBlend?: number }>('weapons');
+    const wBlend = weapons?.adsBlend;
+    this.adsBlend = typeof wBlend === 'number' ? wBlend : 0;
     if (this.adsBlend < 0.001) this.adsBlend = 0;
     this.camera.setAds(this.adsBlend);
 

@@ -33,10 +33,15 @@ export class Time {
    * Hard ceiling on fixed steps per display frame.
    *
    * Must be large enough that a single hitch does not permanently drop input
-   * edges and weapon clocks. Eight steps is ~67 ms of sim; a 100 ms hitch still
-   * leaves residual debt that the next frames repay instead of erasing.
+   * edges and weapon clocks, but small enough that death-window catch-up does
+   * not itself manufacture a second >50 ms frame. Three steps is ~25 ms of sim
+   * at 120 Hz fixed (matches Physics maxSteps); residual debt carries into the
+   * next display frames. Wave-2 death hitch: maxSteps=8 (~67 ms) stacked with
+   * multi-ragdoll create into a 3-frame >50 ms cluster at hp=0.
    */
-  private maxSteps = 8;
+  private maxSteps = 3;
+  /** Previous unscaled frame dt — used to shrink catch-up after a hitch. */
+  private prevDt = 0;
 
   /** In deterministic mode delta comes from the caller, not the wall clock. */
   deterministic = false;
@@ -47,6 +52,7 @@ export class Time {
     this.elapsed = 0;
     this.elapsedReal = 0;
     this.frame = 0;
+    this.prevDt = 0;
   }
 
   /**
@@ -71,9 +77,17 @@ export class Time {
     this.elapsed += this.delta;
     this.frame++;
 
+    // After a hitch frame, take fewer sim steps so catch-up itself cannot own
+    // the next wall frame (death-window / jump clusters were 50–60 ms of
+    // stacked sim+render). Residual debt carries and is repaid on quiet frames.
+    let stepCap = this.maxSteps;
+    if (this.prevDt > 0.033 || dt > 0.033) stepCap = 2;
+    if (this.prevDt > 0.045 || dt > 0.045) stepCap = 1;
+    this.prevDt = dt;
+
     this.accumulator += this.delta;
     let steps = 0;
-    while (this.accumulator >= this.fixedDelta && steps < this.maxSteps) {
+    while (this.accumulator >= this.fixedDelta && steps < stepCap) {
       this.accumulator -= this.fixedDelta;
       steps++;
     }
@@ -81,7 +95,7 @@ export class Time {
     // accumulator. Zeroing used to drop the remainder of a hitch — and with it
     // any input edge that landed in the discarded window — so a single 50 ms
     // frame could swallow a jump/fire that the player still felt they pressed.
-    if (steps >= this.maxSteps) {
+    if (steps >= stepCap) {
       this.accumulator = Math.min(this.accumulator, this.fixedDelta);
     }
     this.alpha = this.accumulator / this.fixedDelta;

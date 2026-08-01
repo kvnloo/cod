@@ -347,10 +347,12 @@ export class MuzzleFX {
         d.spin = rand.signed() * 5;
       });
 
-      // Unburnt powder: bright specks thrown forward that die almost at once.
+      // Unburnt powder: spawn slightly *ahead* of the crown so ADD+HOT streaks
+      // do not stretch across the near field from the muzzle pixel (that path
+      // washed ~7% of burst frames red/white). Cap speed and drop STRETCH.
       g.begin({
         cell: CELL.SPARK_DOT, frames: 1, model: MODEL.HOT,
-        flags: FLAG.ADD | FLAG.STRETCH | FLAG.HOTRAMP | FLAG.FLICKER | FLAG.NOSOFT,
+        flags: FLAG.ADD | FLAG.HOTRAMP | FLAG.FLICKER | FLAG.NOSOFT,
         r: 1.0, g: 0.80, b: 0.42, opacity: 1, emissive: 1.2,
         drag: 2.4, gravity: 0.9,
       });
@@ -358,11 +360,15 @@ export class MuzzleFX {
         tmp.copy(fwd).multiplyScalar(0.75 + rand.next() * 0.5)
           .addScaledVector(right, rand.signed() * 0.5)
           .addScaledVector(up, rand.signed() * 0.5).normalize();
-        d.px = muzzle.x; d.py = muzzle.y; d.pz = muzzle.z;
-        const s = speed * (0.6 + rand.next() * 1.1);
+        // 6–14 cm past the crown along bore + a little scatter.
+        const along = 0.06 + rand.next() * 0.08;
+        d.px = muzzle.x + fwd.x * along + tmp.x * 0.02;
+        d.py = muzzle.y + fwd.y * along + tmp.y * 0.02;
+        d.pz = muzzle.z + fwd.z * along + tmp.z * 0.02;
+        const s = Math.min(speed, 8) * (0.35 + rand.next() * 0.55);
         d.vx = tmp.x * s; d.vy = tmp.y * s; d.vz = tmp.z * s;
         d.sizeBegin = 0.012; d.sizeEnd = 0.004;
-        d.lifetime = 0.16 + rand.next() * 0.22;
+        d.lifetime = 0.12 + rand.next() * 0.14;
       });
     } else {
       // A suppressor turns the flash into a soft, gassy exhale.

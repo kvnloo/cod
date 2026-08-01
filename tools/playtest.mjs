@@ -82,10 +82,12 @@ const CFG = {
   liveMs: Number(flag('live-ms', 14000)),
   warmupMs: Number(flag('warmup-ms', 2000)),
   ttdEnemies: Number(flag('ttd-enemies', 3)),
-  ttdRange: Number(flag('ttd-range', 12)),
+  ttdRange: Number(flag('ttd-range', 20)),
   ttdCapS: Number(flag('ttd-cap', 60)),
   ttdTrials: Number(flag('ttd-trials', 3)),
   ttdAccuracy: Number(flag('ttd-accuracy', 0)),   // 0 = leave the director's own scalar alone
+  // Secondary cert range (prompt E is 20 m; ledger also keeps a 12 m reference).
+  ttdRangeAlt: Number(flag('ttd-range-alt', 12)),
   p99Budget: Number(flag('p99', 16.7)),
   ranges: String(flag('ranges', '10,25,50')).split(',').map(Number),
   weapons: String(flag('weapons', 'ar_vkr7,smg_hornet,lmg_vulcan,pi_sidewinder')).split(','),
@@ -160,19 +162,19 @@ const GATES = [
     target: '> 0',
     read: (r) => r.enemies.spawned,
     ok: (v) => v > 0,
-    why: 'src/game/GameDirector.ts:63 — asActorAPI() returns null, so the whole '
-      + 'src/ai/ stack is bypassed and BotFallback is installed instead. If even '
-      + 'the fallback stops spawning there is literally no game to play.',
+    why: 'Invariant: a session with zero combatants is not a playable match. '
+      + 'Historically GameDirector.asActorAPI() returned null and only BotFallback '
+      + 'spawned; if even that path fails there is no game to measure.',
   },
   {
     id: 'time-to-die', hard: true,
-    what: `time to actually DIE standing still in front of ${CFG.ttdEnemies} engaging enemies (ms)`,
+    what: `time to actually DIE standing still in front of ${CFG.ttdEnemies} engaging enemies @ ${CFG.ttdRange} m (ms)`,
     target: '<= 8000',
     read: (r) => r.combat.ttd.toDeathMs,
     ok: (v) => Number.isFinite(v) && v <= 8000,
-    why: 'The reported bug, verbatim: "after getting downed i would just get shot '
-      + 'at for 60s without dying." A player who can stand in the open in front of '
-      + 'three rifles has no reason to respect the enemy, and the game stops being one.',
+    why: 'Invariant (prompt E / reported bug): standing still in front of three rifles '
+      + 'must be lethal within 8 s. Default cert range is 20 m; use --ttd-range to override. '
+      + 'Past failure mode was sparse last-stand fire looping indefinitely.',
   },
   {
     id: 'down-loop', hard: true,
@@ -180,9 +182,9 @@ const GATES = [
     target: '<= 1',
     read: (r) => r.combat.ttd.downCycles,
     ok: (v) => v <= 1,
-    why: 'src/game/Lifecycle.ts:201 self-revives after reviveAfter=7 s without damage '
-      + 'while bleedout only ever counts down. Sparse incoming fire therefore loops '
-      + 'down → revive → down indefinitely. This is the mechanism behind the 60 seconds.',
+    why: 'Invariant: more than one last-stand cycle before death means the old '
+      + 'down→revive→down loop is live (Lifecycle self-revive after reviveAfter without '
+      + 'bleedout pressure). Was the mechanism behind 60 s "immortal" downs.',
   },
   {
     id: 'frame-p99', hard: true,
@@ -194,9 +196,8 @@ const GATES = [
       if (path === 'software') return false;
       return Number.isFinite(v) && v <= CFG.p99Budget;
     },
-    why: '16.7 ms is the 60 fps budget. p99 rather than mean, because the framerate '
-      + 'a player complains about is the bad frames, not the average. Software GL '
-      + 'cannot pass frame gates — that grades the rasteriser, not the game.',
+    why: 'Invariant: 16.7 ms is the 60 fps budget at 1080p/high. p99, not mean, because '
+      + 'players feel the bad frames. Software GL cannot pass — that grades the rasteriser.',
   },
   {
     id: 'frame-spikes', hard: true,
@@ -208,8 +209,8 @@ const GATES = [
       if (path === 'software') return false;
       return v === 0;
     },
-    why: 'A 50 ms frame is a visible hitch. After warm-up there is no excuse for one. '
-      + 'Software GL cannot pass frame gates.',
+    why: 'Invariant: a 50 ms frame is a visible hitch after warm-up. Sole open hard gate '
+      + 'on hardware until the performance package (p1) lands. Software GL cannot pass.',
   },
   {
     id: 'display-path-hardware', hard: true,
@@ -217,9 +218,8 @@ const GATES = [
     target: "gpuPath === 'hardware'",
     read: (r) => r.meta.gpuPath || r.meta.displayPath,
     ok: (v) => v === 'hardware',
-    why: 'A software rasteriser (llvmpipe/SwiftShader) is not evidence about shipping '
-      + 'frame times or visuals. meta.contamination lists why. presentationPath is '
-      + 'separate (headless rAF has no vblank) and does not pass this gate.',
+    why: 'Invariant: a software rasteriser is not evidence about shipping frame times. '
+      + 'meta.contamination lists why; presentationPath (headless rAF) is separate.',
   },
   {
     id: 'frame-capture-sync', hard: true,
@@ -227,8 +227,8 @@ const GATES = [
     target: 'captureSync === false',
     read: (r) => r.frame.captureSync,
     ok: (v) => v === false,
-    why: 'capture=1 forces Exposure readRenderTargetPixels (~7 ms/frame) and freezes '
-      + 'FrameBudget. Frame gates measured under that regime grade the instrument.',
+    why: 'Invariant: capture=1 forces Exposure readRenderTargetPixels (~7 ms/frame) and '
+      + 'freezes FrameBudget — frame gates under that regime grade the instrument.',
   },
   {
     id: 'ttk-lethal', hard: true,
@@ -236,8 +236,8 @@ const GATES = [
     target: '== 0',
     read: (r) => r.combat.ttkFailures,
     ok: (v) => v === 0,
-    why: 'A weapon that cannot kill a stationary target with perfect tracking inside '
-      + 'twelve seconds is broken, not balanced.',
+    why: 'Invariant: a weapon that cannot kill a stationary target with perfect tracking '
+      + 'inside twelve seconds is broken. Sightline-blocked pairs are skipped, not failed.',
   },
   {
     id: 'damage-model', hard: true,
@@ -245,10 +245,9 @@ const GATES = [
     target: '>= 3',
     read: (r) => r.combat.distinctHitDamage,
     ok: (v) => v >= 3,
-    why: 'src/game/BotFallback.ts:571 resolves EVERY player round as a flat 42 body / '
-      + '145 head, ignoring the weapon and the range entirely. The whole src/weapons/ '
-      + 'damage-falloff model is dead code in the shipping game: an LMG at 50 m hits '
-      + 'exactly as hard as a pistol at 10 m, which is why gunfights do not read as CoD.',
+    why: 'Invariant: weapon×range falloff must produce multiple distinct per-hit values. '
+      + 'Past bug: BotFallback resolved every player round as flat body/head damage, '
+      + 'making the catalog damage model dead code.',
   },
   {
     id: 'hitbox-zones', hard: true,
@@ -256,11 +255,9 @@ const GATES = [
     target: '>= 3 (head + torso + a limb)',
     read: (r) => r.combat.zones.livingEnemyDistinct,
     ok: (v) => v >= 3,
-    why: 'src/physics/CharacterController.ts:166 — a living enemy owns exactly one '
-      + "collider, registered as zone 'chest'. Headshots and limb damage do not exist "
-      + 'at the collider level. This gate scans a live combatant band by band rather '
-      + 'than counting a histogram, because a histogram happily counts corpse ragdolls '
-      + "and the player's own capsule and looks healthy while living enemies have none.",
+    why: 'Invariant: living enemies must own multi-zone hitboxes (head/chest/limb). '
+      + 'Past bug: a single chest collider made every band report the same zone. '
+      + 'Scans a live combatant, never corpse histograms.',
   },
   {
     id: 'death-anim', hard: true,
@@ -268,10 +265,8 @@ const GATES = [
     target: '>= 0.90',
     read: (r) => r.deaths.animatedFraction,
     ok: (v) => Number.isFinite(v) && v >= 0.9,
-    why: 'src/characters/anim/clips.ts:420 writes `root` in only ONE key of each death '
-      + 'clip, so deaths compile to a single key and the body snaps to a pose instead '
-      + 'of falling. src/characters/anim/Clip.ts:92 does the same to every one-shot '
-      + 'performance that opens or closes on an empty pose.',
+    why: 'Invariant: death clips must move the skeleton (multi-key poses). Past bug: '
+      + 'death clips compiled to a single key so bodies snapped instead of falling.',
   },
   {
     id: 'motion-continuity', hard: true,
@@ -279,8 +274,8 @@ const GATES = [
     target: '== 0',
     read: (r) => r.movement.teleports,
     ok: (v) => v === 0,
-    why: 'A discontinuous player is a physics bug or a desync. Neither is visible in '
-      + 'a screenshot and both are instantly obvious in the hands.',
+    why: 'Invariant: a discontinuous player is a physics bug or desync — invisible in '
+      + 'screenshots, obvious in the hands. stepSnaps are reported separately.',
   },
   {
     id: 'no-free-launch', hard: true,
@@ -288,8 +283,47 @@ const GATES = [
     target: '== 0',
     read: (r) => r.movement.unexplainedLaunches,
     ok: (v) => v === 0,
-    why: 'src/player/Movement.ts:332 — every successful step-up converts horizontal '
-      + 'speed into VERTICAL speed, so kerbs and stairs fling the player skyward.',
+    why: 'Invariant: flat-ground steps must not invent upward velocity. Past bug: step-up '
+      + 'converted horizontal speed into vertical launch. Slope ramp gains are ignored.',
+  },
+  {
+    id: 'slide-jump-skill', hard: true,
+    what: 'slide-jump beat leaves the ground and beats sprint mean horizontal speed',
+    target: 'airFrames>0 && mean >= sprint mean',
+    read: (r) => {
+      const beats = (r.movement && r.movement.beats) || [];
+      const sj = beats.find((b) => b.label === 'slide-jump');
+      const sp = beats.find((b) => b.label === 'sprint');
+      if (!sj || !sp) return null;
+      return { airFrames: sj.airFrames, mean: sj.meanHorizontalMs, sprintMean: sp.meanHorizontalMs };
+    },
+    ok: (v) => !!v && v.airFrames > 0 && Number.isFinite(v.mean) && v.mean >= v.sprintMean,
+    why: 'Category F: Apex slide-jump chain must be measurable in the shipping playtest. '
+      + 'Past bug: jump:true only called markJump() so the chain never jumped; mean fell below sprint.',
+  },
+  {
+    id: 'bhop-skill', hard: true,
+    what: 'bhop-1 beat leaves the ground and beats sprint mean horizontal speed',
+    target: 'airFrames>0 && mean >= sprint mean',
+    read: (r) => {
+      const beats = (r.movement && r.movement.beats) || [];
+      const bh = beats.find((b) => b.label === 'bhop-1');
+      const sp = beats.find((b) => b.label === 'sprint');
+      if (!bh || !sp) return null;
+      return { airFrames: bh.airFrames, mean: bh.meanHorizontalMs, sprintMean: sp.meanHorizontalMs };
+    },
+    ok: (v) => !!v && v.airFrames > 0 && Number.isFinite(v.mean) && v.mean >= v.sprintMean,
+    why: 'Category F: bunny-hop retention must show airtime and not lose to hold-W sprint. '
+      + 'Past bug: jump never entered the input hold list.',
+  },
+  {
+    id: 'skill-race-straight', hard: true,
+    what: 'optimal vs naive time ratio on the 26 m straight skill race',
+    target: '<= 0.80',
+    read: (r) => r.race && r.race.straightTimeRatio,
+    ok: (v) => Number.isFinite(v) && v <= 0.80,
+    why: 'Category F doctrine: tools/_w8w1-race.mjs measures Apex skill expression. '
+      + 'Past bug: playtest never invoked the race so skill regressions shipped green.',
   },
   {
     id: 'recoil-bounded', hard: true,
@@ -297,9 +331,8 @@ const GATES = [
     target: '<= 0.50',
     read: (r) => r.recoil.residualDeg,
     ok: (v) => Number.isFinite(v) && v <= 0.5,
-    why: 'src/player/CameraRig.ts:154 — addRecoil parks the impulse in recoilPitch / '
-      + 'recoilYaw, only recoverFraction ever returns, and the remainder accumulates '
-      + 'without bound and is never folded back into the look angles.',
+    why: 'Invariant: residual camera recoil must recover within 0.5° two seconds after a '
+      + 'full magazine. Past bug: recoilPitch/Yaw accumulated without folding back.',
   },
   {
     id: 'no-console-errors', hard: true,
@@ -307,7 +340,7 @@ const GATES = [
     target: '== 0',
     read: (r) => r.meta.errors.length,
     ok: (v) => v === 0,
-    why: 'An exception thrown mid-session invalidates every other number in this report.',
+    why: 'Invariant: an exception mid-session invalidates every other number in this report.',
   },
   /* --- advisory: numbers this wave is still choosing ---------------------- */
   {
@@ -316,10 +349,9 @@ const GATES = [
     target: '400..900',
     read: (r) => r.combat.autoTtk10m,
     ok: (v) => Number.isFinite(v) && v >= 400 && v <= 900,
-    why: 'Reference points: CoD MW2019 AR core TTK is ~250-400 ms; Apex Legends '
-      + 'R-301 on a 200 HP target is ~750-1000 ms. The brief asks for CoD gunplay '
-      + 'with a raised TTK because movement now carries the skill expression, so '
-      + 'the band sits between the two. Advisory — this is a design choice in flight.',
+    why: 'Design band between CoD MW2019 AR core (~250-400 ms) and Apex R-301 on 200 HP '
+      + '(~750-1000 ms). Raised TTK is intentional because movement carries skill expression. '
+      + 'Advisory while the band is still being tuned.',
   },
   {
     id: 'sprint-to-fire', hard: false,
@@ -327,10 +359,8 @@ const GATES = [
     target: '80..200',
     read: (r) => r.combat.sprintToFireMs,
     ok: (v) => Number.isFinite(v) && v >= 80 && v <= 200,
-    why: 'CoD MW2019 sprint-to-fire runs 80-250 ms by weapon class and is the single '
-      + 'biggest reason its gunfights feel committed. src/weapons/Weapons.ts:516 gates '
-      + 'firing on stanceSprinting, which drops on the same fixed step sprint ends, so '
-      + 'the delay today is zero. Advisory until package tuning lands.',
+    why: 'CoD MW2019 sprint-to-fire runs ~80-250 ms by weapon class and commits gunfights. '
+      + 'Advisory design band 80–200 ms; measured values belong in the report, not in this why.',
   },
   {
     id: 'ai-agents', hard: false,
@@ -338,9 +368,53 @@ const GATES = [
     target: '> 0',
     read: (r) => r.enemies.aiAgents,
     ok: (v) => v > 0,
-    why: 'Advisory until the ActorAPI package lands. Today src/ai/ builds its cover '
-      + 'graph and nav grid on every level load for zero agents, and the enemy the '
-      + 'player fights is BotFallback.',
+    why: 'Advisory: prefers the real src/ai/ agent stack over BotFallback-only combat. '
+      + 'When measured > 0 the Actor path is live; when 0 the session is on fallbacks.',
+  },
+  {
+    id: 'ttfc-band', hard: false,
+    what: 'median time-to-first-contact after spawn/respawn (seconds)',
+    target: '3..8',
+    read: (r) => r.combat.ttfc && r.combat.ttfc.medianSec,
+    ok: (v) => Number.isFinite(v) && v >= 3 && v <= 8,
+    why: 'Category F: longer than 8 s is boring; shorter than 3 s is spawn-trapping. '
+      + 'Samples are death→re-engage / cold-spawn contact (proximity ≤32 m or damage), '
+      + 'not merely "an enemy exists on the map". Advisory until the distribution is settled.',
+  },
+  {
+    id: 'npe-control-strip', hard: false,
+    what: 'first-match control strip shown on cold match start (HUD ≤1 s)',
+    target: 'shown && stripHudSec <= 1',
+    read: (r) => r.npe && r.npe.controlStripShown && (r.npe.stripHudSec == null || r.npe.stripHudSec <= 1),
+    ok: (v) => v === true,
+    why: 'Category G: cold boot / game:start must surface controls within 1 s, independent '
+      + 'of the mode banner queue. Advisory until NPE is promoted hard.',
+  },
+  {
+    id: 'npe-look-hint', hard: false,
+    what: 'CLICK TO LOOK armed until pointer lock on first match',
+    target: 'lookHint armed (or already locked)',
+    read: (r) => r.npe && (r.npe.lookHint === true || r.npe.pointerLocked === true || r.npe.controlStripShown === true),
+    ok: (v) => v === true,
+    why: 'Category G: pointer-lock acquisition must be prompted until the player locks. '
+      + 'Advisory NPE surface for playtest; headless sessions may not lock the pointer.',
+  },
+  {
+    id: 'ttk-zone-spread', hard: false,
+    what: 'zone TTK ordering at 10 m (AR): chest faster than leg; head band scores headshots',
+    target: 'chestMs < legMs && head band records headshots',
+    read: (r) => r.combat.ttkZones,
+    ok: (v) => {
+      if (!v) return false;
+      const chestOk = Number.isFinite(v.chestMs) && Number.isFinite(v.legMs) && v.chestMs < v.legMs;
+      const headShots = v.detail && v.detail.head && v.detail.head.headshots;
+      // Full-auto head TTK is miss-dominated (tiny hitbox + recoil); require the
+      // head band to actually land headshots and torso to beat legs on TTK.
+      return chestOk && headShots > 0;
+    },
+    why: 'Prompt E: zones must produce distinct lethality — torso faster than legs, and the '
+      + 'head band must land real headshots. Full-auto head TTK under recoil is miss-dominated '
+      + 'so the gate keys on ordering + headshot counts, not raw head clock time. Advisory.',
   },
 ];
 
@@ -742,6 +816,8 @@ function INSTALL_PROBE() {
         const h = physics.raycast(from, dir, dist + 1, 1 | 2 | 4 | 8 | 16 | 128, hitA, 1);
         out.push({
           band,
+          frac,
+          aimY: target.y,
           zone: h && h.hit ? h.zone : 'nothing-hit',
           entityId: h && h.hit ? h.entityId : -1,
           onTarget: !!(h && h.hit && h.distance <= dist + 0.5),
@@ -996,27 +1072,29 @@ const MOVE_BEATS = [
   },
   { label: 'strafe-left', hold: ['forward', 'left'], frames: 120 },
   { label: 'strafe-right', hold: ['forward', 'right'], frames: 120 },
-  // Bunny-hop with lateral wish so air-accel has something to project onto.
+  // Bunny-hop: wind up to tacSprint, then hop with W+strafe so air-accel and
+  // hop-friction-skip keep mean ≥ sprint mean. Pure A/D (no W) was leaving the
+  // body below slideEntrySpeed on land and losing to hold-W sprint.
   {
     label: 'bhop-1',
     phases: [
-      { hold: ['forward', 'sprint'], frames: 100 },
-      { hold: ['forward', 'sprint'], frames: 3, jump: true },
-      { hold: ['left', 'sprint'], frames: 40 },
-      { hold: ['forward', 'sprint'], frames: 3, jump: true },
-      { hold: ['right', 'sprint'], frames: 40 },
+      { hold: ['forward', 'sprint'], frames: 160 },
+      { hold: ['forward', 'sprint'], frames: 2, jump: true },
+      { hold: ['forward', 'left', 'sprint'], frames: 55 },
+      { hold: ['forward', 'sprint'], frames: 2, jump: true },
+      { hold: ['forward', 'right', 'sprint'], frames: 55 },
     ],
   },
   {
     label: 'bhop-2',
     phases: [
-      { hold: ['forward', 'sprint'], frames: 80 },
-      { hold: ['forward', 'sprint'], frames: 3, jump: true },
-      { hold: ['left', 'sprint'], frames: 36 },
-      { hold: ['forward', 'sprint'], frames: 3, jump: true },
-      { hold: ['right', 'sprint'], frames: 36 },
-      { hold: ['forward', 'sprint'], frames: 3, jump: true },
-      { hold: ['left', 'sprint'], frames: 36 },
+      { hold: ['forward', 'sprint'], frames: 140 },
+      { hold: ['forward', 'sprint'], frames: 2, jump: true },
+      { hold: ['forward', 'left', 'sprint'], frames: 50 },
+      { hold: ['forward', 'sprint'], frames: 2, jump: true },
+      { hold: ['forward', 'right', 'sprint'], frames: 50 },
+      { hold: ['forward', 'sprint'], frames: 2, jump: true },
+      { hold: ['forward', 'left', 'sprint'], frames: 50 },
     ],
   },
   { label: 'backpedal', hold: ['back'], frames: 120 },
@@ -1028,6 +1106,45 @@ const MOVE_BEATS = [
 function beatPhases(beat) {
   if (beat.phases && beat.phases.length) return beat.phases;
   return [{ hold: beat.hold || [], frames: beat.frames || 0, jump: !!beat.jump }];
+}
+
+/** Run the offline skill-expression race and fold summary fields into the report. */
+function runSkillRace() {
+  const r = spawnSync('node', ['tools/_w8w1-race.mjs', '--json'], {
+    cwd: ROOT, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024,
+  });
+  if (r.status !== 0 && !r.stdout) {
+    return {
+      ok: false, error: (r.stderr || r.stdout || `exit ${r.status}`).slice(0, 500),
+      straightTimeRatio: NaN, cornerTimeRatio: NaN, gatesPass: 0, gatesTotal: 0,
+    };
+  }
+  let data;
+  try { data = JSON.parse(r.stdout); } catch (e) {
+    return {
+      ok: false, error: `json parse: ${e.message}`,
+      straightTimeRatio: NaN, cornerTimeRatio: NaN, gatesPass: 0, gatesTotal: 0,
+    };
+  }
+  const by = (n) => (data.races || []).find((x) => x.route === n);
+  const straight = by('straight-26m');
+  const corner = by('corner-90deg');
+  const gates = data.gates || [];
+  const passN = gates.filter((g) => g.pass).length;
+  return {
+    ok: true,
+    straightTimeRatio: straight ? straight.timeRatio : NaN,
+    straightOptimalSec: straight && straight.optimal ? straight.optimal.seconds : NaN,
+    straightNaiveSec: straight && straight.naive ? straight.naive.seconds : NaN,
+    straightOptimalTech: straight && straight.optimal ? straight.optimal.tech : null,
+    cornerTimeRatio: corner ? corner.timeRatio : NaN,
+    gatesPass: passN,
+    gatesTotal: gates.length,
+    gates: gates.map((g) => ({ gate: g.gate, pass: g.pass, measured: g.measured })),
+    chainPeak: data.chain ? data.chain.peak : NaN,
+    chainPlateau: data.chain ? data.chain.plateau : NaN,
+    tuning: data.tuning || null,
+  };
 }
 
 async function runMovement(session) {
@@ -1063,8 +1180,11 @@ async function runMovement(session) {
         const n = phase.frames | 0;
         if ((phase.hold || []).length) anyHold = true;
         for (let i = 0; i < n; i++) {
+          // jump:true must press the real jump action. markJump only suppresses
+          // free-launch detection — without hold/press the chain never leaves
+          // the ground (report-wave2: bhop airFrames=0, slide-jump mean < sprint).
           if (phase.jump) a.markJump();
-          hold(phase.hold || [], []);
+          hold(phase.hold || [], phase.jump ? ['jump'] : []);
           e.stepFrame(1 / 120);
           frames++;
           const v = player.velocity;
@@ -1214,6 +1334,108 @@ async function runTtk(session) {
  * centre mass, which is also the cleanest probe for whether zone-specific
  * hitboxes exist at all.
  */
+
+/** Head vs leg TTK at 10 m for one AR — prompt E zone integrity (advisory). */
+async function runTtkZones(session) {
+  const weapon = 'ar_vkr7';
+  const metres = 10;
+  const lane = await session.exec((v) => globalThis.__PT__.api.sightLane(v), metres);
+  // One spawn → zoneScan gives the true band hit heights for a living enemy.
+  const scan = await session.exec(([m, yaw]) => {
+    const a = globalThis.__PT__.api;
+    a.setRender(false); a.setSpawnLock(true); a.clearActors();
+    a.setCombat(false); a.setFrozen(true);
+    const spawn = a.spawnTarget(yaw, m, { archetype: 'rifleman', health: 1, seed: 11 });
+    if (spawn.id < 0) {
+      a.setCombat(true); a.setFrozen(false); a.setSpawnLock(false); a.setRender(true);
+      return null;
+    }
+    const bot = a.botState(spawn.id);
+    const z = a.zoneScan(spawn.id);
+    a.clearActors();
+    a.setCombat(true); a.setFrozen(false); a.setSpawnLock(false); a.setRender(true);
+    return { height: bot.height, baseY: spawn.pos[1], bands: z.bands };
+  }, [metres, lane.yaw]);
+  const rows = {};
+  const bandAim = (id, fallbackFrac) => {
+    if (scan && scan.bands) {
+      const b = scan.bands.find((x) => x.band === id);
+      if (b && Number.isFinite(b.aimY)) return b.aimY;
+    }
+    return (scan ? scan.baseY : 0) + (scan ? scan.height : 1.8) * fallbackFrac;
+  };
+  for (const band of [
+    { id: 'head', frac: 0.9 },
+    { id: 'chest', frac: 0.62 },
+    { id: 'leg', frac: 0.22 },
+  ]) {
+    const aimY = bandAim(band.id, band.frac);
+    const row = await session.exec(([weaponId, m, yaw, aimY0, capS, bandId]) => {
+      const P = globalThis.__PT__;
+      const a = P.api;
+      const e = globalThis.engine;
+      const hold = globalThis.__PT_HOLD__;
+      a.setRender(false);
+      a.setSpawnLock(true);
+      a.clearActors();
+      a.setCombat(false);
+      a.setFrozen(true);
+      a.giveWeapon(weaponId);
+      a.refill();
+      const spawn = a.spawnTarget(yaw, m, { archetype: 'rifleman', health: 1, seed: 11 });
+      if (spawn.id < 0) {
+        a.setCombat(true); a.setFrozen(false); a.setSpawnLock(false); a.setRender(true);
+        return { ttkMs: null, hits: 0, lineOfSight: false };
+      }
+      const aimY = aimY0;
+      const los = a.losTo(spawn.pos[0], aimY, spawn.pos[2]);
+      for (let i = 0; i < 90; i++) {
+        a.aimAt(spawn.pos[0], aimY, spawn.pos[2]);
+        hold(['ads'], []);
+        e.stepFrame(1 / 120);
+      }
+      const hurts0 = P.hurts.length;
+      let tFirstShot = -1, tKill = -1, shots = 0;
+      let lastAmmo = e.get('weapons').current.ammo;
+      const maxSteps = Math.ceil(capS * 120);
+      for (let i = 0; i < maxSteps; i++) {
+        a.aimAt(spawn.pos[0], aimY, spawn.pos[2]);
+        hold(['ads', 'fire'], []);
+        e.stepFrame(1 / 120);
+        const w = e.get('weapons').current;
+        if (w.ammo < lastAmmo) {
+          shots += lastAmmo - w.ammo;
+          if (tFirstShot < 0) tFirstShot = e.time.elapsed;
+        }
+        lastAmmo = w.ammo;
+        if (w.reloading || w.ammo === 0) { a.refill(); lastAmmo = w.def.magSize; }
+        const b = a.botState(spawn.id);
+        if (!b || !b.alive) { tKill = e.time.elapsed; break; }
+      }
+      hold([], []);
+      const hurts = P.hurts.slice(hurts0).filter((h) => h.fromPlayer);
+      a.setCombat(true); a.setFrozen(false); a.setSpawnLock(false); a.setRender(true);
+      return {
+        band: bandId,
+        aimY,
+        ttkMs: tKill > 0 && tFirstShot > 0 ? +((tKill - tFirstShot) * 1000).toFixed(1) : null,
+        shots, hits: hurts.length,
+        headshots: hurts.filter((h) => h.headshot).length,
+        lineOfSight: los,
+      };
+    }, [weapon, metres, lane.yaw, aimY, 8, band.id]);
+    rows[band.id] = row;
+  }
+  return {
+    weapon, rangeM: metres,
+    headMs: rows.head && rows.head.ttkMs,
+    chestMs: rows.chest && rows.chest.ttkMs,
+    legMs: rows.leg && rows.leg.ttkMs,
+    detail: rows,
+    stagedWithSightline: lane.ok,
+  };
+}
+
 async function runKills(session, count = 6) {
   return session.exec((n) => {
     const P = globalThis.__PT__;
@@ -1573,7 +1795,7 @@ async function main() {
       cpus: display.cpus,
       contamination: display.contamination.slice(),
     },
-    frame: {}, enemies: {}, combat: {}, deaths: {}, movement: {}, recoil: {},
+    frame: {}, enemies: {}, combat: {}, deaths: {}, movement: {}, race: {}, recoil: {},
   };
   if (display.softwareGL) {
     log(`${stamp()} WARNING: software GL — frame/visual gates will hard-fail (${session.renderer})`);
@@ -1609,6 +1831,10 @@ async function main() {
     });
     const snap = await session.exec(() => globalThis.__PT__.api.snapshot());
     log(`${stamp()}   phase=${snap.phase} live=${snap.live} hp=${snap.health.toFixed(0)} sim=${snap.simTime.toFixed(1)}s`);
+    {
+      const npe0 = await session.exec(() => globalThis.__BLACKOUT_NPE__ || null);
+      log(`${stamp()}   npe@warmup strip=${npe0 && npe0.controlStripShown} lookHint=${npe0 && npe0.lookHint}`);
+    }
 
     /* ------------------------------------------------ phase 2: movement -- */
     log(`${stamp()} phase 2/7 — movement traversal (${MOVE_BEATS.length} beats, fixed step)`);
@@ -1623,6 +1849,18 @@ async function main() {
       + `teleports ${report.movement.teleports}  step-snaps ${report.movement.stepSnaps}  `
       + `flat-ground launches ${report.movement.unexplainedLaunches} `
       + `(${report.movement.rampGainsIgnored} slope gains ignored)`);
+
+    /* ------------------------------------------ phase 2b: skill race -- */
+    log(`${stamp()} phase 2b/7 — skill-expression race (tools/_w8w1-race.mjs)`);
+    report.race = runSkillRace();
+    if (report.race.ok) {
+      log(`${stamp()}   straight timeRatio ${report.race.straightTimeRatio}x  `
+        + `(opt ${report.race.straightOptimalSec}s [${report.race.straightOptimalTech}] vs `
+        + `naive ${report.race.straightNaiveSec}s)  corner ${report.race.cornerTimeRatio}x  `
+        + `chain peak ${report.race.chainPeak} m/s  gates ${report.race.gatesPass}/${report.race.gatesTotal}`);
+    } else {
+      log(`${stamp()}   skill race FAILED to produce JSON: ${report.race.error}`);
+    }
 
     /* ----------------------------------------------------- phase 3: TTK -- */
     log(`${stamp()} phase 3/7 — time-to-kill sweep (${CFG.weapons.length} weapons × ${CFG.ranges.length} ranges)`);
@@ -1639,6 +1877,12 @@ async function main() {
         + `shots ${String(r.shotsFired).padStart(3)}  hits ${String(r.hits).padStart(3)}  `
         + `dmg/hit ${r.damagePerHit === null ? '   —' : r.damagePerHit.toFixed(1).padStart(6)}  `
         + `catalog says ${r.catalogDamage === null ? '—' : r.catalogDamage.toFixed(1)}`);
+    }
+    log(`${stamp()} phase 3b/7 — head/chest/leg TTK (AR @ 10 m)`);
+    report.combat.ttkZones = await runTtkZones(session);
+    {
+      const z = report.combat.ttkZones;
+      log(`${stamp()}   head ${fmtMs(z.headMs)}  chest ${fmtMs(z.chestMs)}  leg ${fmtMs(z.legMs)}`);
     }
 
     /* --------------------------------------------------- phase 4: kills -- */
@@ -1667,16 +1911,28 @@ async function main() {
     log(`${stamp()}   sprint-to-fire ${rec.sprintToFireMs === null ? 'never fired' : rec.sprintToFireMs.toFixed(1) + ' ms'}`);
 
     /* ----------------------------------------------------- phase 6: TTD -- */
-    log(`${stamp()} phase 6/7 — time-to-DIE standing in front of ${CFG.ttdEnemies} enemies at ${CFG.ttdRange} m`);
+    log(`${stamp()} phase 6/7 — time-to-DIE standing in front of ${CFG.ttdEnemies} enemies at ${CFG.ttdRange} m (cert)`);
     const ttd = await runTtd(session);
     report.combat.ttd = ttd;
-    log(`${stamp()}   median of ${ttd.trials} trials — first damage ${fmtMs(ttd.firstDamageMs)}   `
+    report.combat.ttd.rangeM = CFG.ttdRange;
+    log(`${stamp()}   median of ${ttd.trials} trials @ ${CFG.ttdRange} m — first damage ${fmtMs(ttd.firstDamageMs)}   `
       + `health hits 0 ${fmtMs(ttd.toZeroHealthMs)}   downed ${fmtMs(ttd.toDownedMs)}   DEAD ${fmtMs(ttd.toDeathMs)}`);
     log(`${stamp()}   all trials: ${ttd.toDeathMsAll.map(fmtMs).join('  ')}   `
       + `(min ${fmtMs(ttd.toDeathMsMin)}, max ${fmtMs(ttd.toDeathMsMax)})`);
     log(`${stamp()}   last-stand cycles ${ttd.downCycles}   ${ttd.damageEventsPerSec.toFixed(2)} hits/s   `
       + `${ttd.totalDamageTaken} total damage over ${(ttd.toDeathMs === Infinity ? ttd.capMs : ttd.toDeathMs) / 1000}s   `
       + `(director accuracy scale ${ttd.accuracyScale}, sightline ${ttd.stagedWithSightline ? 'clear' : 'BLOCKED'})`);
+    // Dual-range reference (ledger 12 m) when cert range differs.
+    if (Number.isFinite(CFG.ttdRangeAlt) && CFG.ttdRangeAlt > 0 && CFG.ttdRangeAlt !== CFG.ttdRange) {
+      const saved = CFG.ttdRange;
+      CFG.ttdRange = CFG.ttdRangeAlt;
+      log(`${stamp()} phase 6b/7 — TTD reference @ ${CFG.ttdRangeAlt} m (not the hard-gate range)`);
+      const ttdAlt = await runTtd(session);
+      CFG.ttdRange = saved;
+      report.combat.ttdAlt = { ...ttdAlt, rangeM: CFG.ttdRangeAlt };
+      log(`${stamp()}   alt @ ${CFG.ttdRangeAlt} m DEAD median ${fmtMs(ttdAlt.toDeathMs)}  `
+        + `trials ${ttdAlt.toDeathMsAll.map(fmtMs).join('  ')}`);
+    }
 
     /* ---------------------------------------------------- phase 7: live -- */
     log(`${stamp()} phase 7/7 — live free-running play for ${CFG.liveMs} ms (real rAF, vsync off)`);
@@ -1724,6 +1980,42 @@ async function main() {
       duringExecutions: kills.colliderZones,
     };
     report.combat.damageEventsOnPlayerTotal = dump.playerDamageCount;
+
+    // TTFC instrument (category F) — director samples after spawn/respawn contact.
+    const ttfcRaw = await session.exec(() => {
+      const g = globalThis.__BLACKOUT_GAME__;
+      const d = g && g.match && g.match.director;
+      const samples = d && Array.isArray(d.ttfcSamples) ? d.ttfcSamples.slice() : [];
+      return samples;
+    });
+    const ttfcSorted = ttfcRaw.slice().filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
+    const ttfcMed = ttfcSorted.length
+      ? ttfcSorted[Math.floor(ttfcSorted.length / 2)]
+      : NaN;
+    report.combat.ttfc = {
+      samples: ttfcSorted,
+      count: ttfcSorted.length,
+      medianSec: Number.isFinite(ttfcMed) ? +ttfcMed.toFixed(3) : NaN,
+      minSec: ttfcSorted.length ? +ttfcSorted[0].toFixed(3) : NaN,
+      maxSec: ttfcSorted.length ? +ttfcSorted[ttfcSorted.length - 1].toFixed(3) : NaN,
+      band: '3..8',
+    };
+    log(`${stamp()} ttfc samples=${ttfcSorted.length} median=${Number.isFinite(ttfcMed) ? ttfcMed.toFixed(2) + 's' : 'n/a'} `
+      + (ttfcSorted.length ? `[${ttfcSorted.map((x) => x.toFixed(2)).join(', ')}]` : '(none yet — need contact after spawn)'));
+
+    // NPE surface (category G)
+    const npe = await session.exec(() => {
+      const n = globalThis.__BLACKOUT_NPE__ || null;
+      return n ? {
+        controlStripShown: !!n.controlStripShown,
+        stripHudSec: n.stripHudSec == null ? null : +Number(n.stripHudSec).toFixed(3),
+        stripWallMs: n.stripWallMs == null ? null : +Number(n.stripWallMs).toFixed(1),
+        lookHint: !!n.lookHint,
+        pointerLocked: !!n.pointerLocked,
+      } : { controlStripShown: false, stripHudSec: null, stripWallMs: null, lookHint: false, pointerLocked: false };
+    });
+    report.npe = npe;
+    log(`${stamp()} npe strip=${npe.controlStripShown} hudSec=${npe.stripHudSec} lookHint=${npe.lookHint} locked=${npe.pointerLocked}`);
 
     // Deaths are graded on the execution phase, where kills are guaranteed and
     // every body is watched for the full 0.5 s after it drops. Deaths from the

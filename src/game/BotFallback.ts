@@ -38,8 +38,9 @@ import { LAYERS } from '../render/types';
 import { MASK_BULLET, MASK_MOVE, MASK_SIGHT } from '../physics/types';
 import { makeRayHit, type GameServices } from './Services';
 import { ARCHETYPES } from './Archetypes';
+import { resolveHit } from './Combat';
 import type { Character, CharacterFactory } from '../characters/types';
-import type { ActorAPI, Archetype, DamageOpts, SpawnRequest, Team } from './types';
+import type { ActorAPI, Archetype, DamageOpts, HitZone, SpawnRequest, Team } from './types';
 
 const MAX_BOTS_BY_PRESET: Record<string, number> = {
   // Cap live bodies to what the frame budget can absorb. Each skinned bot is
@@ -80,6 +81,47 @@ const FIRE = {
 
 /** The player capsule, as the fallback sim models it. Matches `TUNING` in Movement. */
 const PLAYER_BODY = { height: 1.8, radius: 0.4 } as const;
+
+/** Anti-repeat: never play the same death clip on two consecutive kills. */
+let lastDeathClip: 'deathFront' | 'deathBack' | 'deathHead' | null = null;
+
+function zoneHasArmor(archetype: Archetype, zone: keyof typeof FIRE.zone | string | undefined): boolean {
+  const p = ARCHETYPES[archetype];
+  if (!p) return false;
+  const z = (zone && zone !== 'none' ? zone : 'chest') as keyof typeof p.armor;
+  return (p.armor[z] ?? 1) < 1 - 1e-6;
+}
+
+/**
+ * Directional death clip from shot direction relative to body yaw, with
+ * headshots forced to deathHead and consecutive repeats broken.
+ */
+function pickDeathClip(
+  yaw: number,
+  direction: THREE.Vector3 | undefined,
+  headshot: boolean,
+): 'deathFront' | 'deathBack' | 'deathHead' {
+  let pick: 'deathFront' | 'deathBack' | 'deathHead';
+  if (headshot) {
+    pick = 'deathHead';
+  } else if (direction && direction.lengthSq() > 1e-8) {
+    // Bullet direction aligned with facing → struck from behind.
+    const fx = Math.sin(yaw);
+    const fz = Math.cos(yaw);
+    const d = direction.clone().normalize();
+    pick = d.x * fx + d.z * fz > 0.15 ? 'deathBack' : 'deathFront';
+  } else {
+    pick = 'deathFront';
+  }
+  if (pick === lastDeathClip) {
+    if (pick === 'deathHead') pick = 'deathFront';
+    else if (pick === 'deathFront') pick = 'deathBack';
+    else pick = 'deathFront';
+  }
+  lastDeathClip = pick;
+  return pick;
+}
+
 
 /** Colour groups for the stand-in bodies. */
 type BodyGroup = 'hostile' | 'elite' | 'friendly' | 'dead';
@@ -196,7 +238,7 @@ export class BotFallback implements ActorAPI {
     if (services.scene) this.buildVisuals(services.scene);
     // The weapon system publishes shots; with no ballistics backend present we
     // resolve them ourselves so the player's rounds actually kill things.
-    this.unsub.push(bus.on('weapon:fire', (e) => this.resolvePlayerShot(e.origin, e.direction)));
+    this.unsub.push(bus.on('weapon:fire', (e) => this.resolvePlayerShot(e.origin, e.direction, e.weaponId)));
     this.unsub.push(bus.on('explosion', (e) => this.applyExplosion(e.point, e.radius, e.power)));
   }
 
@@ -715,30 +757,52 @@ export class BotFallback implements ActorAPI {
   /* ------------------------------------------------------------- damage -- */
 
   private hurt(b: Bot, amount: number, opts: DamageOpts): boolean {
-    b.health -= amount;
+    const zone = (opts.zone && opts.zone !== 'none')
+      ? opts.zone
+      : (opts.headshot ? 'head' : 'chest');
+    // Per-zone armour multi from the archetype table (plate/breacher/jug suit).
+    const armorTable = ARCHETYPES[b.archetype]?.armor;
+    const armorMul = armorTable ? (armorTable[zone as keyof typeof armorTable] ?? 1) : 1;
+    const applied = amount * armorMul;
+    b.health -= applied;
     const killed = b.health <= 0;
     const point = opts.point ?? this._a.copy(b.position).setY(b.position.y + 1.2);
+    const armored = zoneHasArmor(b.archetype, zone);
     bus.emit('damage:dealt', {
-      targetId: b.id, amount, headshot: !!opts.headshot, killed,
+      targetId: b.id, amount: applied, headshot: !!opts.headshot || zone === 'head' || zone === 'neck', killed,
       point: point.clone(), fromPlayer: opts.fromPlayer !== false,
     });
     if (!killed && b.char && opts.direction) {
-      b.char.react(opts.direction, opts.headshot ? 'head' : 'chest', Math.min(1, amount / 60));
+      b.char.react(opts.direction, zone as 'head' | 'chest', Math.min(1, applied / 60));
     }
     if (opts.fromPlayer !== false) {
-      bus.emit('hud:hitmarker', { headshot: !!opts.headshot, killed, armor: b.archetype === 'juggernaut' });
+      bus.emit('hud:hitmarker', {
+        headshot: !!opts.headshot || zone === 'head' || zone === 'neck',
+        killed,
+        armor: armored,
+      });
     }
     if (killed) {
       b.alive = false;
       b.state = 'dead';
       b.deathTime = 0;
       if (b.char) {
-        this._b.copy(opts.direction ?? this._up).multiplyScalar(amount * 0.06);
-        try { b.char.ragdoll(this._b, opts.headshot ? 'head' : 'chest'); }
-        catch { b.char.play(opts.headshot ? 'deathHead' : 'deathFront'); }
+        // Clip-then-ragdoll: play a directional death, stash impulse for host.onDeath.
+        this._b.copy(opts.direction ?? this._up).normalize().multiplyScalar(Math.min(48, 8 + applied * 0.55));
+        this._b.y += 1.5;
+        const clip = pickDeathClip(b.yaw, opts.direction, !!opts.headshot || zone === 'head');
+        const hitZone = (zone === 'head' || zone === 'neck') ? 'head' : 'chest';
+        b.char.object.userData.pendingDeathImpulse = this._b.clone();
+        b.char.object.userData.pendingDeathZone = hitZone;
+        try {
+          b.char.play(clip, { fade: 0.05 });
+        } catch {
+          try { b.char.ragdoll(this._b, hitZone); }
+          catch { /* no presentation path available */ }
+        }
       }
       bus.emit('entity:death', {
-        id: b.id, byPlayer: opts.fromPlayer !== false, headshot: !!opts.headshot,
+        id: b.id, byPlayer: opts.fromPlayer !== false, headshot: !!opts.headshot || zone === 'head',
         name: b.archetype, point: b.position.clone(),
       });
     }
@@ -748,11 +812,14 @@ export class BotFallback implements ActorAPI {
   /**
    * Resolves one of the player's rounds against the bot capsules. Analytic
    * ray/capsule rather than physics colliders — the fallback owns no bodies.
+   *
+   * Prices through the same combat model the AI path uses (`resolveHit`):
+   * weapon catalogue base damage, range falloff, and multi-zone multipliers.
+   * The previous flat 42 body / 145 head made every weapon a three-shot kill.
    */
-  private resolvePlayerShot(origin: THREE.Vector3, direction: THREE.Vector3): void {
+  private resolvePlayerShot(origin: THREE.Vector3, direction: THREE.Vector3, weaponId?: string): void {
     let bestBot: Bot | null = null;
     let bestT = Infinity;
-    let bestHead = false;
 
     for (const b of this.bots) {
       if (!b.alive || b.team !== 'hostile') continue;
@@ -768,19 +835,40 @@ export class BotFallback implements ActorAPI {
       }
       bestT = t;
       bestBot = b;
-      this._c.copy(direction).multiplyScalar(t).add(origin);
-      bestHead = this._c.y > b.position.y + b.height - 0.3;
     }
 
     if (!bestBot) return;
     this._c.copy(direction).multiplyScalar(bestT).add(origin);
-    const armor = bestBot.archetype === 'juggernaut' ? 0.42 : 1;
-    const dmg = (bestHead ? 145 : 42) * armor;
+    // Multi-zone from impact height / lateral offset (HITBOX_RIG bands).
+    const frac = THREE.MathUtils.clamp(
+      (this._c.y - bestBot.position.y) / Math.max(0.4, bestBot.height), 0, 1,
+    );
+    const lateral = Math.hypot(this._c.x - bestBot.position.x, this._c.z - bestBot.position.z);
+    let zoneFinal: HitZone;
+    if (frac > 0.87) zoneFinal = 'head';
+    else if (frac > 0.81) zoneFinal = 'neck';
+    else if (frac >= 0.48 && frac <= 0.82 && lateral > bestBot.radius * 0.55) zoneFinal = 'arm';
+    else if (frac > 0.555) zoneFinal = 'chest';
+    else if (frac > 0.40) zoneFinal = 'stomach';
+    else zoneFinal = 'leg';
+    const metres = bestT;
+    const wid = weaponId && weaponId.length > 0 ? weaponId : 'ar_vkr7';
+    // resolveHit already folds zone multi; hurt() multiplies armour again, so
+    // strip armour here (pass null) and let hurt apply ARCHETYPES plating.
+    const priced = resolveHit(wid, metres, zoneFinal, null);
+    const dmg = priced.damage;
+    const armored = zoneHasArmor(bestBot.archetype, zoneFinal);
     bus.emit('bullet:impact', {
       point: this._c.clone(), normal: this._d.copy(direction).negate().clone(),
-      surface: 'flesh', incoming: direction.clone(), energy: 1400, penetrated: false,
+      surface: armored
+        ? (zoneFinal === 'head' || zoneFinal === 'neck' ? 'helmet' : 'armor')
+        : 'flesh',
+      incoming: direction.clone(), energy: dmg * 40, penetrated: false,
     });
-    this.hurt(bestBot, dmg, { headshot: bestHead, point: this._c, direction, fromPlayer: true, source: 'player' });
+    this.hurt(bestBot, dmg, {
+      headshot: priced.headshot, point: this._c, direction, fromPlayer: true,
+      source: 'player', zone: zoneFinal, weaponId: wid, distance: metres,
+    });
   }
 
   private applyExplosion(point: THREE.Vector3, radius: number, power: number): void {

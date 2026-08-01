@@ -352,7 +352,14 @@ export class CapsuleCharacterController implements CharacterController {
     }
   }
 
-  /** Re-scale hitbox local transforms when the capsule crouches / stands. */
+  /**
+   * Re-scale hitbox local transforms when the capsule crouches / stands.
+   *
+   * Both offsets *and* cuboid half-extents are scaled from the authored
+   * standing descs. Leaving half-extents at stand size while compressing
+   * offsets (the previous behaviour) left oversized head/chest boxes on a
+   * crouched agent — crouch headshots and low shots mis-zoned.
+   */
   private relayoutHitboxes(): void {
     if (this.hitColliders.length === 0 || this.hitboxRefHeight <= 1e-5) return;
     const scale = this.height / this.hitboxRefHeight;
@@ -364,10 +371,11 @@ export class CapsuleCharacterController implements CharacterController {
         y: b.offset[1] * scale,
         z: b.offset[2] * scale,
       });
-      // Cuboid half-extents are not freely resizable on every Rapier build; the
-      // offset scale alone is enough for the playtest height bands. Full size
-      // rebuild happens on the next setHitboxes() call.
-      void col;
+      col.setHalfExtents({
+        x: b.half[0] * scale,
+        y: b.half[1] * scale,
+        z: b.half[2] * scale,
+      });
     }
   }
 

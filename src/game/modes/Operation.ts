@@ -3,8 +3,9 @@
  *
  * The loop is: a wave of escalating composition spawns and must be cleared;
  * every third wave layers a timed objective on top of the fighting; between
- * waves a short buy phase lets the player convert cash into staying power. Three
- * lives, twelve waves, and a final extraction that has to be held.
+ * waves a short buy phase lets the player convert cash into staying power. Five
+ * lives (room for the death→respawn→re-engage loop), twelve waves, and a final
+ * extraction that has to be held.
  *
  * The mode itself is a script — the pressure curve, the spawn hiding and the
  * archetype escalation all come from the shared director.
@@ -25,7 +26,7 @@ import type { KillContext } from '../Scoring';
 const TOTAL_WAVES = 12;
 const WARMUP = 8;
 const INTERMISSION = 6;
-const LIVES = 3;
+const LIVES = 5;
 
 type Stage = 'warmup' | 'wave' | 'cleared' | 'intermission' | 'extract' | 'over';
 

@@ -68,6 +68,18 @@ export interface ShadowConfig {
   distance: number;
   softness: number;
   lambda: number;
+  /**
+   * Cap how many cascade tiles are re-submitted this call. `0` / omitted =
+   * all cascades (showcase / ultra). Adaptive high uses `1` so a multi-
+   * cascade atlas never owns a single wall frame.
+   */
+  maxCascadesThisFrame?: number;
+  /**
+   * Soft CPU budget in ms for this rebuild. When > 0, stop after finishing
+   * the cascade that crossed the budget and resume from the next tile on a
+   * later call. `0` / omitted = no budget.
+   */
+  maxMs?: number;
 }
 
 /* --------------------------------------------------------- alpha casters -- */
@@ -233,6 +245,8 @@ export class ShadowSystem {
   /** Draw calls and triangles attributed to each cascade of the last build. */
   private readonly cascadeCalls: number[] = [0, 0, 0, 0];
   private readonly cascadeTris: number[] = [0, 0, 0, 0];
+  /** Next cascade tile to refresh when the caller time-slices the atlas. */
+  private nextCascade = 0;
   private readonly auditFrustum = new THREE.Frustum();
   private readonly auditSphere = new THREE.Sphere();
   private rescanMs = 0;
@@ -306,6 +320,7 @@ export class ShadowSystem {
     this.atlasHeight = h;
     this.cascadeCount = count;
     this.mapSize = size;
+    this.nextCascade = 0;
 
     for (let i = 0; i < count; i++) {
       const cx = i % cols;
@@ -378,7 +393,13 @@ export class ShadowSystem {
     renderer.setScissorTest(false);
     renderer.setViewport(0, 0, this.atlasWidth, this.atlasHeight);
     renderer.autoClear = false;
-    renderer.clear(true, true, false);
+    // Full-atlas clear only when every cascade will be rewritten this call.
+    // Time-sliced updates clear per-tile so sibling cascades keep last frame.
+    const willSlice = (cfg.maxCascadesThisFrame && cfg.maxCascadesThisFrame > 0
+      && cfg.maxCascadesThisFrame < count) || (cfg.maxMs && cfg.maxMs > 0 && count > 1);
+    if (!willSlice) {
+      renderer.clear(true, true, false);
+    }
 
     scene.overrideMaterial = this.depthMaterial;
     scene.background = null;
@@ -388,6 +409,9 @@ export class ShadowSystem {
     const callsBefore = renderer.info.render.calls;
     const trisBefore = renderer.info.render.triangles;
 
+    // Always refit + publish every cascade's matrices so a time-sliced tile
+    // still samples against an up-to-date light frustum for the other bands
+    // (their depth remains last frame's, which is the whole point of slicing).
     let prevSplit = near;
     for (let i = 0; i < count; i++) {
       const c = this.cascades[i];
@@ -396,20 +420,37 @@ export class ShadowSystem {
       c.far = splits[i] * 1.04;
       this.fitCascade(c, camera, sunDir);
       prevSplit = splits[i];
+      this.publish(i, c, splits[i]);
+    }
 
+    const maxN = cfg.maxCascadesThisFrame && cfg.maxCascadesThisFrame > 0
+      ? Math.min(count, Math.round(cfg.maxCascadesThisFrame))
+      : count;
+    const budgetMs = cfg.maxMs && cfg.maxMs > 0 ? cfg.maxMs : 0;
+    const tBuild = budgetMs > 0 ? performance.now() : 0;
+    let drawn = 0;
+    let start = count <= 1 ? 0 : (this.nextCascade % count);
+
+    for (let n = 0; n < maxN; n++) {
+      const i = (start + n) % count;
+      const c = this.cascades[i];
       const px = Math.round(c.tile.x * this.atlasWidth);
       const py = Math.round(c.tile.y * this.atlasHeight);
       renderer.setViewport(px, py, this.mapSize, this.mapSize);
       renderer.setScissor(px, py, this.mapSize, this.mapSize);
       renderer.setScissorTest(true);
+      // Per-tile clear only when the full atlas was not cleared above (slice).
+      if (willSlice) renderer.clear(true, true, false);
       const cc = renderer.info.render.calls;
       const ct = renderer.info.render.triangles;
       renderer.render(scene, c.camera);
       this.cascadeCalls[i] = renderer.info.render.calls - cc;
       this.cascadeTris[i] = renderer.info.render.triangles - ct;
-
-      this.publish(i, c, splits[i]);
+      drawn++;
+      this.nextCascade = (i + 1) % count;
+      if (budgetMs > 0 && (performance.now() - tBuild) >= budgetMs) break;
     }
+    void drawn;
 
     this.lastCalls = renderer.info.render.calls - callsBefore;
     this.lastTriangles = renderer.info.render.triangles - trisBefore;

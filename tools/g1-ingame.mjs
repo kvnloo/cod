@@ -96,6 +96,14 @@ await page.evaluate(() => {
   /** One fixed step of movement only — no engine systems, no render. */
   const step = (o) => mv.stepCommand(cmd(o));
 
+  // Stamp live TUNING so solvers below cannot hardcode stale airAccel/wishCap.
+  const Tlive = (mv.constructor && mv.constructor.TUNING) || {};
+  w.__G1_TUNING__ = {
+    airAccel: Tlive.airAccel ?? 50,
+    airWishCap: Tlive.airWishCap ?? 0.762,
+    slideJumpBoost: Tlive.slideJumpBoost ?? 1.2,
+  };
+
   w.__G1__ = {
     setRender,
     info: () => ({
@@ -304,7 +312,8 @@ const YAW = lane.yaw;
 {
   const strafe = (mode) => page.evaluate(([yaw0, m]) => {
     const mv = globalThis.engine.get('player').movement;
-    const CAP = 0.762, KDT = 45 / 120;         // TUNING.airWishCap, airAccel·dt
+    const T = globalThis.__G1_TUNING__ || { airAccel: 50, airWishCap: 0.762 };
+    const CAP = T.airWishCap, KDT = T.airAccel / 120;  // live TUNING.airAccel·dt
     const hs = () => Math.hypot(mv.velocity.x, mv.velocity.z);
     const st = (moveX, moveY, buttons, y) => mv.stepCommand({
       seq: 0, tick: 0, dt: 1 / 120, moveX, moveY, yaw: y, pitch: 0, buttons,

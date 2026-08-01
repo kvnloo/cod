@@ -108,7 +108,8 @@ export class Lifecycle {
   private static readonly HITSTOP_SCALE = 0.12;
 
   constructor(private services: GameServices, private emit: Emitter) {
-    // Own the juice bus edges so hitstop does not require Match wiring.
+    // Sole hitstop writer for gunfeel Category B: kill / headshot / heavy ≥45.
+    // Weapons must not pulse present-scale freezes on body taps (RPM fight).
     this.off.push(bus.on('hud:hitmarker', (e) => {
       if (e.killed) this.pulseHitstop('kill');
       else if (e.headshot) this.pulseHitstop('headshot');
@@ -142,6 +143,7 @@ export class Lifecycle {
     this.lastHealth = -1;
     this.lastStandUsed = false;
     this.hitstopRemaining = 0;
+    this.lastHitstopDuration = 0;
     this.presentScale = 1;
     presentClockScale = 1;
     this.services.setTimeScale(1);

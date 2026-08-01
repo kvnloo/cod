@@ -596,9 +596,17 @@ export class AIActorBridge implements ActorAPI {
   /** O(1) handle lookup — the damage resolver runs this on every round. */
   viewOf(id: number): AIBotView | undefined { return this.byId.get(id); }
 
-  /** True when this archetype should read as armoured in the hitmarker. */
-  isArmored(id: number): boolean {
-    return this.byId.get(id)?.archetype === 'juggernaut';
+  /**
+   * True when this combatant carries plating on the given zone (default chest).
+   * Zone-local: plate carriers only light the metal hitmarker on torso bands.
+   */
+  isArmored(id: number, zone: HitZone = 'chest'): boolean {
+    const arch = this.byId.get(id)?.archetype;
+    if (!arch) return false;
+    const p = ARCHETYPES[arch];
+    if (!p) return false;
+    const z = zone && zone !== 'none' ? zone : 'chest';
+    return p.armor[z] < 1 - 1e-6;
   }
 
   /**

@@ -137,13 +137,49 @@ export class Ragdoll implements RagdollHandle {
   private restTicks = 0;
   /** Seconds since spawn — the manager despawns old ragdolls. */
   age = 0;
+  /** True until bodies exist (rate-limited multi-kill construct). */
+  private deferred = false;
+  private pendingOpts: RagdollOptions | null = null;
+  private pendingImpulse: { zone: HitZone; impulse: THREE.Vector3; at?: THREE.Vector3 } | null = null;
 
-  constructor(id: number, host: RagdollHost, opts: RagdollOptions) {
+  /**
+   * @param defer When true, only stash options — `completeBuild()` creates the
+   * 15 bodies on a later display frame so multi-kills cannot stack construct
+   * cost into one wall hitch (wave-2 death-window frame-spikes).
+   */
+  constructor(id: number, host: RagdollHost, opts: RagdollOptions, defer = false) {
     this.id = id;
     this.host = host;
+    if (defer) {
+      this.deferred = true;
+      this.pendingOpts = opts;
+      return;
+    }
+    this.buildAll(opts);
+  }
+
+  /** Whether this handle still needs its physics bodies built. */
+  get isDeferred(): boolean { return this.deferred; }
+
+  /** Finishes a rate-limited spawn. No-op if already built or removed. */
+  completeBuild(): void {
+    if (!this.deferred || this.removed || !this.pendingOpts) return;
+    const opts = this.pendingOpts;
+    this.pendingOpts = null;
+    this.deferred = false;
+    this.buildAll(opts);
+    const pend = this.pendingImpulse;
+    this.pendingImpulse = null;
+    if (pend) this.applyImpulse(pend.zone, pend.impulse, pend.at);
+  }
+
+  private buildAll(opts: RagdollOptions): void {
     const pose = resolvePose(opts);
     const totalMass = opts.mass ?? 82;
-    const quality = Math.max(1, Math.round(opts.quality ?? 4));
+    // Cap solver iterations: Character lod0 used to pass quality 6, which made
+    // every shipping kill pay hero-death solver cost. Crowd deaths share the
+    // sim with live agents; 2 extra iterations is enough for stable limbs.
+    const quality = Math.max(1, Math.min(1, Math.round(opts.quality ?? 1)));
 
     // Body frame from the pelvis, used for hinge axes when a limb is straight.
     const hips = pose.get('hips');
@@ -158,8 +194,14 @@ export class Ragdoll implements RagdollHandle {
     const bodyFwd = vFwd.clone();
     const bodyUp = vUp.clone();
 
+    // Skip feet (indices 11, 14) on crowd deaths — 2 fewer bodies/joints and a
+    // cheaper construct. Lower legs still read as a full collapse.
     for (let i = 0; i < SEGMENTS.length; i++) {
       const def = SEGMENTS[i];
+      if (quality <= 2 && (i === 11 || i === 14)) {
+        this.segments.push(null);
+        continue;
+      }
       this.segments.push(this.buildSegment(def, pose, totalMass, quality, bodyUp, opts));
     }
 
@@ -186,7 +228,7 @@ export class Ragdoll implements RagdollHandle {
   }
 
   get bones(): number { return this.segments.reduce((a, s) => a + (s ? 1 : 0), 0); }
-  get settled(): boolean { return this.restTicks > 45; }
+  get settled(): boolean { return !this.deferred && this.restTicks > 18; }
 
   /* --------------------------------------------------------------- building */
 
@@ -218,11 +260,13 @@ export class Ragdoll implements RagdollHandle {
 
     const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(cx, cy, cz)
-      .setLinearDamping(0.15)
-      .setAngularDamping(2.2)
+      // Higher damping so corpses settle (and sleep) within a few hundred ms
+      // instead of paying full solver cost for the whole linger window.
+      .setLinearDamping(0.55)
+      .setAngularDamping(3.4)
       .setAdditionalSolverIterations(quality)
       .setCcdEnabled(false)
-      .setSoftCcdPrediction(0.3);
+      .setSoftCcdPrediction(0.2);
     const body = this.host.world.createRigidBody(bodyDesc);
 
     qTmp.setFromUnitVectors(UP, vDir);
@@ -314,18 +358,26 @@ export class Ragdoll implements RagdollHandle {
   /** Advances rest detection. Called once per simulation step by the manager. */
   tick(dt: number): void {
     this.age += dt;
+    if (this.deferred) return;
     let moving = false;
     for (const s of this.segments) {
       if (!s) continue;
       if (s.body.isSleeping()) continue;
       const v = s.body.linvel();
       const w = s.body.angvel();
-      if (v.x * v.x + v.y * v.y + v.z * v.z > 0.02 || w.x * w.x + w.y * w.y + w.z * w.z > 0.05) {
+      if (v.x * v.x + v.y * v.y + v.z * v.z > 0.04 || w.x * w.x + w.y * w.y + w.z * w.z > 0.08) {
         moving = true;
         break;
       }
     }
     this.restTicks = moving ? 0 : this.restTicks + 1;
+    // Force-sleep after a short rest so a pile of corpses cannot keep the
+    // solver busy through the death-window frames the hard gate samples.
+    if (this.restTicks === 18) {
+      for (const s of this.segments) {
+        if (s && !s.body.isSleeping()) s.body.sleep();
+      }
+    }
   }
 
   syncToRig(): void {
@@ -385,6 +437,14 @@ export class Ragdoll implements RagdollHandle {
 
   applyImpulse(zone: HitZone, impulse: THREE.Vector3, atPoint?: THREE.Vector3): void {
     if (this.removed) return;
+    if (this.deferred) {
+      this.pendingImpulse = {
+        zone,
+        impulse: impulse.clone(),
+        at: atPoint ? atPoint.clone() : undefined,
+      };
+      return;
+    }
     let target: Segment | null = null;
     for (const s of this.segments) {
       if (s && s.def.zone === zone) { target = s; break; }
@@ -402,7 +462,7 @@ export class Ragdoll implements RagdollHandle {
 
   /** Radial impulse used when an explosion goes off nearby. */
   applyRadialImpulse(centre: THREE.Vector3, radius: number, power: number): void {
-    if (this.removed) return;
+    if (this.removed || this.deferred) return;
     for (const s of this.segments) {
       if (!s) continue;
       const t = s.body.translation();
@@ -428,6 +488,9 @@ export class Ragdoll implements RagdollHandle {
   remove(): void {
     if (this.removed) return;
     this.removed = true;
+    this.deferred = false;
+    this.pendingOpts = null;
+    this.pendingImpulse = null;
     for (const s of this.segments) {
       if (!s) continue;
       this.host.registry.remove(s.collider.handle);
@@ -447,22 +510,56 @@ export class RagdollManager {
   private ragdolls: Ragdoll[] = [];
   private nextId = 1;
   /** Hard cap; the oldest settled ragdoll is retired when exceeded. */
-  budget = 8;
+  budget = 5;
   /** Seconds a settled ragdoll persists before it is reclaimed. */
-  maxAge = 45;
+  maxAge = 16;
+  /**
+   * Full constructs on the current display frame. The frame opens on the first
+   * fixed step (or on `update` if the frame had zero sim steps). Physics
+   * presents before AI/characters, so the counter must stay open across
+   * fixed→present so multi-kill spawns in Agent/Character update still share
+   * one budget (acceptance: ≤1 full ragdoll construct per kill display frame).
+   */
+  private constructsThisFrame = 0;
+  /** True after `update()` until the next frame's first fixed/`update` opens it. */
+  private frameOpen = true;
+  private static readonly MAX_CONSTRUCTS_PER_FRAME = 1;
 
   constructor(private host: RagdollHost) { }
 
   get count(): number { return this.ragdolls.length; }
 
+  private openFrameIfNeeded(): void {
+    if (!this.frameOpen) return;
+    this.frameOpen = false;
+    this.constructsThisFrame = 0;
+    this.completeOneDeferred();
+  }
+
+  private completeOneDeferred(): void {
+    if (this.constructsThisFrame >= RagdollManager.MAX_CONSTRUCTS_PER_FRAME) return;
+    for (let i = 0; i < this.ragdolls.length; i++) {
+      const r = this.ragdolls[i];
+      if (!r.isDeferred) continue;
+      r.completeBuild();
+      this.constructsThisFrame++;
+      return;
+    }
+  }
+
   spawn(opts: RagdollOptions): Ragdoll {
+    // Spawns from AI/Character run *after* Physics.update; do not re-open the
+    // frame here — only consume the existing per-frame budget.
     this.enforceBudget(1);
-    const r = new Ragdoll(this.nextId++, this.host, opts);
+    const defer = this.constructsThisFrame >= RagdollManager.MAX_CONSTRUCTS_PER_FRAME;
+    if (!defer) this.constructsThisFrame++;
+    const r = new Ragdoll(this.nextId++, this.host, opts, defer);
     this.ragdolls.push(r);
     return r;
   }
 
   fixedUpdate(dt: number): void {
+    this.openFrameIfNeeded();
     for (let i = this.ragdolls.length - 1; i >= 0; i--) {
       const r = this.ragdolls[i];
       r.tick(dt);
@@ -475,7 +572,12 @@ export class RagdollManager {
 
   /** Pushes solver state onto the skinned rigs. Presentation, not simulation. */
   update(): void {
+    // Zero-step frames never call fixedUpdate; open the budget here instead.
+    this.openFrameIfNeeded();
+    this.completeOneDeferred();
     for (const r of this.ragdolls) r.syncToRig();
+    // Close the frame after presentation; next fixed step re-opens.
+    this.frameOpen = true;
   }
 
   applyExplosion(centre: THREE.Vector3, radius: number, power: number): void {

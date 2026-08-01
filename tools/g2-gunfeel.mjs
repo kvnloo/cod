@@ -173,8 +173,9 @@ function INSTALL() {
     hitstop() {
       const g = globalThis.__BLACKOUT_GAME__;
       const life = g && g.match ? g.match.lifecycle : null;
+      // Lifecycle is the sole hitstop writer; do not fall back to Weapons freezes.
       return {
-        remain: life ? life.hitstopRemaining : (weapons.fireClock().hitstopRemain ?? 0),
+        remain: life ? life.hitstopRemaining : 0,
         lastDuration: life ? life.lastHitstopDuration : 0,
         presentScale: life ? life.presentScale : 1,
         timeScale: e.time ? e.time.scale : 1,
@@ -726,14 +727,23 @@ function PHASE_JUICE() {
 
   G.loud();
   void weapons; void tSim0; void tChain; void deathW;
+  /*
+   * Synthetic clocks: this harness steps with G.quiet() (renderer off) and
+   * synthesises damage→hitmarker→death→score on the same stack with no
+   * ballistics/target/render. Those stamp deltas are NOT Category B combat
+   * sandwich latencies and must not certify the hand-contract gates.
+   * input→present measures juiceLog stamp CPU around stepFrame, not first
+   * visible muzzle/kick on a presented frame (Category A/J).
+   */
   return {
     brassSeparationM: brass ? +brass.separation.toFixed(4) : null,
     brass: brass,
     flashLocal: flash,
     flashAtMuzzleXY: !!(flash && flash.xyMatch),
     inputToPresentMs: inputSamples,
+    inputToPresentSynthetic: true,
     inputToPresentP99Ms: (function () {
-      // Fire path only for the legacy ≤50 ms gate (juice present stamp).
+      // Fire path juice stamp (synthetic; not visible-frame contract).
       const arr = inputSamples.filter((s) => s.action === 'fire' || !s.action)
         .map((s) => s.wallMs).filter((v) => v != null).sort((a, b) => a - b);
       if (!arr.length) return null;
@@ -766,6 +776,7 @@ function PHASE_JUICE() {
     })(),
     hitstop,
     damageIndicatorMs: dmgMs,
+    chainSynthetic: true,
     hitmarkerAfterImpactMs,
     killConfirmMs,
     chainKinds: chain.map((c) => c.kind),
@@ -846,7 +857,9 @@ async function main() {
           console.log(`    ${k}: p99 ${v.p99} ms  n=${v.n}  (nulls ${v.nulls})`);
         }
       }
-      console.log(`  hitmarker after impact ${j.hitmarkerAfterImpactMs} ms  kill-confirm ${j.killConfirmMs} ms`);
+      console.log(`  hitmarker after impact ${j.hitmarkerAfterImpactMs} ms  kill-confirm ${j.killConfirmMs} ms`
+        + `  (chainSynthetic=${!!j.chainSynthetic})`);
+      console.log(`  input→present synthetic=${!!j.inputToPresentSynthetic}`);
       console.log(`  damage-indicator ${j.damageIndicatorMs} ms  hitstop ${JSON.stringify(j.hitstop)}`);
       console.log(`  chain ${JSON.stringify(j.chainKinds)}`);
     }
@@ -922,15 +935,26 @@ async function main() {
   gates.push(['presentation hitstop does not scale Time.scale',
     `scaleDuring=${j.hitstop?.timeScaleDuring} present=${j.hitstop?.presentScale}`,
     !j.hitstop?.pulsed || (j.hitstop.scaleUnchanged && j.hitstop.presentScale < 1)]);
-  if (j.hitmarkerAfterImpactMs != null) {
+  // Synthetic bus-stack / juice-stamp clocks: report structure, never claim
+  // Category A/B hand-contract latency passes (no combat sandwich, no visible frame).
+  if (j.chainSynthetic) {
+    const kinds = Array.isArray(j.chainKinds) ? j.chainKinds : [];
+    gates.push(['Category B juice chain stamps (synthetic:true — not combat sandwich)',
+      `kinds=${kinds.join(',') || 'none'} hitmarkerΔ=${j.hitmarkerAfterImpactMs}ms killΔ=${j.killConfirmMs}ms`,
+      kinds.includes('damage') && kinds.includes('hitmarker')]);
+  } else if (j.hitmarkerAfterImpactMs != null) {
     gates.push(['hitmarker appear ≤ 60 ms after impact (wall)',
       `${j.hitmarkerAfterImpactMs} ms`, j.hitmarkerAfterImpactMs <= 60]);
+    if (j.killConfirmMs != null) {
+      gates.push(['kill confirm (score) ≤ 150 ms after killing blow (wall)',
+        `${j.killConfirmMs} ms`, j.killConfirmMs <= 150]);
+    }
   }
-  if (j.killConfirmMs != null) {
-    gates.push(['kill confirm (score) ≤ 150 ms after killing blow (wall)',
-      `${j.killConfirmMs} ms`, j.killConfirmMs <= 150]);
-  }
-  if (j.inputToPresentP99Ms != null) {
+  if (j.inputToPresentSynthetic) {
+    gates.push(['input→present juice stamp recorded (synthetic:true — not visible-frame ≤50 ms contract)',
+      `p99 ${j.inputToPresentP99Ms} ms / max ${j.inputToPresentMaxMs} ms`,
+      j.inputToPresentP99Ms != null]);
+  } else if (j.inputToPresentP99Ms != null) {
     gates.push(['input→first present ≤ 50 ms p99 (wall, stepped harness)',
       `p99 ${j.inputToPresentP99Ms} ms / max ${j.inputToPresentMaxMs} ms`,
       j.inputToPresentP99Ms <= 50]);

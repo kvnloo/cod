@@ -72,6 +72,43 @@ export const AGENT = {
  */
 const MAX_SOLO_EXPOSURE = 4.0;
 
+/** Anti-repeat: never play the same death clip on two consecutive AI kills. */
+let lastDeathClip: 'deathFront' | 'deathBack' | 'deathHead' | null = null;
+
+/**
+ * Directional death clip from shot direction relative to body yaw, with
+ * headshots forced to deathHead and consecutive repeats broken.
+ * Ported from `BotFallback.pickDeathClip` so shipping AI matches the fallback.
+ */
+function pickDeathClip(
+  yaw: number,
+  direction: THREE.Vector3 | undefined,
+  headshot: boolean,
+): 'deathFront' | 'deathBack' | 'deathHead' {
+  let pick: 'deathFront' | 'deathBack' | 'deathHead';
+  if (headshot) {
+    pick = 'deathHead';
+  } else if (direction && direction.lengthSq() > 1e-8) {
+    // Bullet direction aligned with facing → struck from behind.
+    const fx = Math.sin(yaw);
+    const fz = Math.cos(yaw);
+    const dx = direction.x;
+    const dz = direction.z;
+    const len = Math.hypot(dx, dz) || 1;
+    pick = (dx / len) * fx + (dz / len) * fz > 0.15 ? 'deathBack' : 'deathFront';
+  } else {
+    pick = 'deathFront';
+  }
+  if (pick === lastDeathClip) {
+    if (pick === 'deathHead') pick = 'deathFront';
+    else if (pick === 'deathFront') pick = 'deathBack';
+    else pick = 'deathFront';
+  }
+  lastDeathClip = pick;
+  return pick;
+}
+
+
 export type MoveMode = 'walk' | 'combat' | 'sprint' | 'crouch';
 export type FireMode = 'hold' | 'aimed' | 'suppress';
 
@@ -146,6 +183,15 @@ export class Agent {
   combatEnabled = true;
   /** Staging helper: holds the agent exactly where it was placed. */
   frozen = false;
+  /**
+   * Clip-then-ragdoll handoff. Real Characters finish via Animator.onDeathComplete
+   * → CharacterSystem.onDeath; Proxy / missed handoffs fall through this timer
+   * so a corpse still becomes a ragdoll without snapping on the kill frame.
+   */
+  private deathRagdollPending = false;
+  private deathRagdollTimer = 0;
+  private readonly deathImpulse = new THREE.Vector3();
+  private deathZone: HitZone = 'chest';
   readonly position = new THREE.Vector3();
   readonly velocity = new THREE.Vector3();
   readonly eye = new THREE.Vector3();
@@ -444,6 +490,17 @@ export class Agent {
 
   /** Presentation-rate update: drives the character rig. */
   update(dt: number): void {
+    if (this.deathRagdollPending) {
+      this.deathRagdollTimer -= dt;
+      if (this.deathRagdollTimer <= 0) {
+        this.deathRagdollPending = false;
+        const ch = this.character;
+        if (ch && !ch.isRagdoll) {
+          try { ch.ragdoll(this.deathImpulse, this.deathZone); }
+          catch { /* no physics ragdoll available — hold death pose */ }
+        }
+      }
+    }
     this.syncPresentation(dt);
     this.character?.update(dt);
   }
@@ -1386,18 +1443,45 @@ export class Agent {
     this.action?.exit?.(this);
     this.action = null;
 
-    // Ragdoll with an impulse that matches the shot that did it.
+    // Clip-then-ragdoll (ported from BotFallback): play a directional death,
+    // stash the impulse for CharacterSystem.onDeath / our safety timer. Instant
+    // ragdoll on the kill frame was the structural death hitch — 15 capsules +
+    // joints built synchronously while the sim was already catching up.
     const proxy = this.character as unknown as { velocity?: THREE.Vector3 } | null;
     if (proxy && proxy.velocity) proxy.velocity.copy(this.velocity);
     _v0.copy(fromDirection).normalize().multiplyScalar(Math.min(48, 8 + power * 0.55));
     _v0.y += 1.5;
-    this.character?.ragdoll(_v0, zone);
+    this.deathImpulse.copy(_v0);
+    this.deathZone = (zone === 'head' || zone === 'neck') ? 'head' : zone;
+    const headshot = zone === 'head' || zone === 'neck';
+    const clip = pickDeathClip(this.bodyYaw, fromDirection, headshot);
+
+    if (this.character) {
+      const ud = this.character.object.userData as {
+        pendingDeathImpulse?: THREE.Vector3;
+        pendingDeathZone?: HitZone;
+      };
+      ud.pendingDeathImpulse = this.deathImpulse.clone();
+      ud.pendingDeathZone = this.deathZone;
+      try {
+        this.character.play(clip, { fade: 0.05 });
+        // Safety handoff: Proxy has no onDeathComplete; real Characters finish
+        // earlier via Animator → CharacterSystem.onDeath (isRagdoll guards double).
+        this.deathRagdollPending = true;
+        // Stagger handoff so multi-kills do not share one construct frame.
+        this.deathRagdollTimer = (headshot ? 0.2 : 0.32) + this.rand.next() * 0.18;
+      } catch {
+        try { this.character.ragdoll(this.deathImpulse, this.deathZone); }
+        catch { /* no presentation path available */ }
+        this.deathRagdollPending = false;
+      }
+    }
 
     if (this.host.emitDeath) {
       bus.emit('entity:death', {
         id: this.entityId,
         byPlayer,
-        headshot: zone === 'head',
+        headshot,
         name: this.name,
         point: (point ?? this.position).clone(),
       });

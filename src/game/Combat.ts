@@ -116,7 +116,7 @@ export interface CombatBridge {
  * Vertical bands follow standard segment proportions (Drillis & Contini):
  * chin at 0.870 H, acromion 0.818 H, hip 0.530 H, knee 0.285 H. They are
  * widened the way every shipping shooter widens them — the `chest` box runs
- * down to 0.585 H rather than stopping at the diaphragm, and the `leg` box
+ * down to 0.555 H rather than stopping at the diaphragm, and the `leg` box
  * starts at the crotch rather than the hip joint — because a hitbox that
  * matches anatomy exactly reads as "my bullets go through people".
  *
@@ -153,13 +153,20 @@ export interface ZoneBox {
 
 const DEPTH = 1.25;
 
+/**
+ * Geometric bands — kept in lockstep with `livingHitboxLayout` in
+ * `characters/Hitboxes.ts` so a zone-none / missing-collider fallback classifies
+ * the same way the physics cuboid that stopped the round would have.
+ */
 export const HITBOX_RIG: readonly ZoneBox[] = [
-  { zone: 'head', y0: 0.870, y1: 1.010, x0: 0, x1: 0.44, z: DEPTH, mirror: false },
-  { zone: 'neck', y0: 0.820, y1: 0.870, x0: 0, x1: 0.28, z: DEPTH, mirror: false },
-  { zone: 'chest', y0: 0.585, y1: 0.820, x0: 0, x1: 0.62, z: DEPTH, mirror: false },
-  { zone: 'stomach', y0: 0.430, y1: 0.585, x0: 0, x1: 0.58, z: DEPTH, mirror: false },
-  { zone: 'arm', y0: 0.460, y1: 0.820, x0: 0.62, x1: 1.15, z: DEPTH, mirror: true },
-  { zone: 'leg', y0: 0.000, y1: 0.430, x0: 0, x1: 0.62, z: DEPTH, mirror: false },
+  { zone: 'head', y0: 0.870, y1: 1.015, x0: 0, x1: 0.44, z: DEPTH, mirror: false },
+  { zone: 'neck', y0: 0.810, y1: 0.885, x0: 0, x1: 0.28, z: DEPTH, mirror: false },
+  { zone: 'chest', y0: 0.555, y1: 0.825, x0: 0, x1: 0.55, z: DEPTH, mirror: false },
+  { zone: 'stomach', y0: 0.395, y1: 0.575, x0: 0, x1: 0.52, z: DEPTH, mirror: false },
+  // Outer ring past torso edge — centre-mass at arm height is still chest;
+  // lateral aim (x ≥ ~0.55 R) resolves arm.
+  { zone: 'arm', y0: 0.480, y1: 0.820, x0: 0.55, x1: 1.15, z: DEPTH, mirror: true },
+  { zone: 'leg', y0: 0.000, y1: 0.430, x0: 0, x1: 0.55, z: DEPTH, mirror: false },
 ];
 
 /** Body metrics the rig needs. Structurally satisfied by an actor record. */
@@ -290,7 +297,12 @@ function slab(
  * ======================================================================= */
 
 /**
- * Zone multipliers per weapon class.
+ * Zone multipliers per weapon class — **the single game-layer authority**.
+ *
+ * `Ballistics` passes chest-base damage into the resolver wrap; this table is
+ * what multiplies it. `WeaponDef.zones` in the catalogue is only a fallback for
+ * builds with no combat model attached. Applying both would silently flip TTK
+ * whenever the wrap is late or missing (e.g. sniper chest 1.5 vs 2.10).
  *
  * Target health is roughly double a Call of Duty body (see `TTK_DESIGN`), so
  * head multipliers are pushed above the catalogue's 1.45-1.6 to keep the
@@ -511,7 +523,13 @@ export const TTK_TARGETS: Record<string, Record<number, number | null>> = {
   pi_sidewinder: { 10: 8, 25: 9, 50: 13 },
 };
 
-/** Shots to kill `health` with `weaponId` at `metres` into `zone`. */
+/**
+ * Shots to kill `health` with `weaponId` at `metres` into `zone`.
+ *
+ * One damage event per round: high-pen rounds may continue through soft tissue
+ * but Ballistics entity-dedupes so the same multi-zone body is never priced
+ * twice. Authored STK (e.g. lmg_vulcan 7) therefore matches measured STK.
+ */
 export function shotsToKill(
   weaponId: string, metres: number, health = TTK_DESIGN.referenceHealth,
   zone: HitZone = 'chest', armor: ZoneTable | null = null,

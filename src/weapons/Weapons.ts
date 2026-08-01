@@ -65,7 +65,10 @@ interface Slot {
   stats: ResolvedStats;
 }
 
-const MASK_MELEE = MASK_MOVE | LAYER.ENEMY | LAYER.RAGDOLL;
+/** Melee rays must NOT hit CLIP — after setHitboxes the solid capsule is
+ *  CLIP with zone 'none', which collapsed every melee to chest pricing before
+ *  ENEMY zone sensors. Match bullet-ish coverage without CLIP. */
+const MASK_MELEE = LAYER.STATIC | LAYER.DYNAMIC | LAYER.ENEMY | LAYER.PLAYER | LAYER.RAGDOLL;
 
 /**
  * Slack on every fire-clock comparison, seconds.
@@ -138,11 +141,10 @@ export class WeaponSystem implements System {
   private fireReadyAt = -999;
   /** Sim time of the most recent shot, for telemetry. */
   private lastShotAt = -1;
-  /** Presentation-only hitstop remaining (display seconds, never scales sim). */
-  private hitstopRemain = 0;
   /**
    * Display-path fire ack already published for this shotIndex (muzzle/audio/kick).
-   * Ballistics remain in fixedUpdate `shoot()`.
+   * Ballistics remain in fixedUpdate `shoot()`. Cleared on auth shoot, any fire
+   * block, spawn, and equip so a sticky present cannot suppress the next juice.
    */
   private presentLatched = false;
   private presentShotIndex = -1;
@@ -198,10 +200,8 @@ export class WeaponSystem implements System {
     this.renderApi = ctx.engine.tryGet<System & RenderExtras>('render') ?? null;
     this.camera = ctx.camera;
     this.baseAdsFovScale = settings.game.adsFovScale;
-    bus.on('damage:dealt', (e) => {
-      if (!e.fromPlayer || e.amount <= 0) return;
-      this.pulseHitstop(e.killed ? 0.065 : 0.035, e.killed);
-    });
+    // Hitstop is owned solely by Lifecycle (kill / headshot / heavy ≥45).
+    // Body-tap freezes here fought aim recovery at 720–900 RPM.
 
     this.ballistics.physics = this.physics;
     this.ballistics.render = this.renderApi;
@@ -241,11 +241,9 @@ export class WeaponSystem implements System {
       this.adsScripted = e.active;
     });
 
-    // Category B latency chain + presentation hitstop on gun hits.
+    // Category B latency chain stamps only — Lifecycle owns hitstop pulses.
     bus.on('hud:hitmarker', (e) => {
       this.stampJuice('hitmarker', { killed: e.killed, headshot: e.headshot, armor: e.armor });
-      if (e.killed) this.pulseHitstop(0.055, true);
-      else if (e.headshot) this.pulseHitstop(0.038, false);
     });
     bus.on('damage:dealt', (e) => {
       if (!e.fromPlayer) return;
@@ -352,6 +350,7 @@ export class WeaponSystem implements System {
     this.recoil.reset();
     this.spread.reset();
     this.burstLeft = 0;
+    this.clearPresentLatch();
     // A swap re-runs the whole ADS transition: carrying the previous weapon's
     // blend across would hand the new gun an instant sight picture.
     this.adsProgress = 0;
@@ -430,6 +429,7 @@ export class WeaponSystem implements System {
     this.adsBlendSim = 0;
     this.recoil.reset();
     this.spread.reset();
+    this.clearPresentLatch();
   }
 
   /* --------------------------------------------------------- fixed update */
@@ -785,7 +785,12 @@ export class WeaponSystem implements System {
     const blocked = w.reloading || this.state === 'drawing' || this.state === 'holstering'
       || this.state === 'melee' || this.stanceSprinting || input.held('sprint') || sprintBlocked
       || this.grenades.cooking;
-    if (blocked) { if (this.state === 'firing') this.state = 'idle'; return; }
+    if (blocked) {
+      if (this.state === 'firing') this.state = 'idle';
+      // Early present must not survive a fire-block — sticky latch → silent auth round.
+      this.clearPresentLatch();
+      return;
+    }
 
     // A burst finishes on its own once started.
     if (this.burstLeft > 0) {
@@ -807,6 +812,7 @@ export class WeaponSystem implements System {
     }
 
     if (w.ammo <= 0) {
+      this.clearPresentLatch();
       if (!this.triggerHeld) {
         bus.emit('weapon:dryfire', { weaponId: w.id });
         this.nextShotAt = this.timeNow + 0.22;
@@ -915,7 +921,7 @@ export class WeaponSystem implements System {
         suppressed: stats.suppressed,
       });
     }
-    this.presentLatched = false;
+    this.clearPresentLatch();
     this.stampJuice('fire', {
       weaponId: w.id, shotIndex: this.shotIndex, presented: alreadyPresented,
     });
@@ -929,8 +935,18 @@ export class WeaponSystem implements System {
    * Display-rate fire ack: muzzle flash, kick and report without waiting for
    * the next fixed step when a round is due. Ballistics stay in `shoot()`.
    */
+  private clearPresentLatch(): void {
+    this.presentLatched = false;
+    this.presentShotIndex = -1;
+  }
+
   private tryPresentFire(dt: number): void {
-    if (this.presentLatched) return;
+    if (this.presentLatched) {
+      // Auth may have become blocked after the early present — drop the latch so
+      // the next real shoot() cannot skip juice (ghost juice → silent round).
+      if (this.presentAuthBlocked()) this.clearPresentLatch();
+      return;
+    }
     const slot = this.slots[this.index];
     if (!slot || !this.camera) return;
     const w = slot.runtime;
@@ -939,11 +955,7 @@ export class WeaponSystem implements System {
     const pressed = input.pressed('fire');
     if (!held && !pressed) return;
 
-    const sprintBlocked = this.timeNow < this.fireReadyAt - FIRE_EPS;
-    const blocked = w.reloading || this.state === 'drawing' || this.state === 'holstering'
-      || this.state === 'melee' || this.stanceSprinting || sprintBlocked
-      || this.grenades.cooking || w.ammo <= 0 || this.burstLeft > 0;
-    if (blocked) return;
+    if (this.presentAuthBlocked()) return;
 
     const dueIn = this.nextShotAt - this.timeNow;
     if (dueIn > dt + FIRE_EPS && !(pressed && dueIn <= this.refireInterval(def))) return;
@@ -952,12 +964,14 @@ export class WeaponSystem implements System {
     const cam = this.camera;
     const stats = slot.stats;
     const camRig = this.player?.camera;
-    const pitch = def.recoil.viewKickUp ?? 0.5;
-    const yaw = 0;
     if (camRig) {
       camRig.addShake(def.recoil.shake * (1 - this.adsBlendSim * 0.45), 30, 0.18);
     }
-    this.viewModel.onFire(pitch, yaw);
+    // ViewModel.onFire already bakes viewKickUp into the kick spring; pattern
+    // pitch/yaw are additives only. Passing viewKickUp here double-scaled climb
+    // and zeroed pattern yaw. Present uses base kick (0,0); auth shoot applies
+    // pattern when it was not already presented.
+    this.viewModel.onFire(0, 0);
     if (stats.suppressed) this.viewModel.setFlashScale(0.16);
     input.rumble(Math.min(1, def.recoil.shake * 55), 0.25, 55);
     this.viewModel.muzzleWorld(cam, this._muzzle);
@@ -974,17 +988,15 @@ export class WeaponSystem implements System {
     this.stampJuice('present', { weaponId: w.id, shotIndex: this.shotIndex, dueIn });
   }
 
-  /**
-   * Brief presentation freeze on impactful hits. Counts down on the display
-   * clock inside `update` and never writes `Time.scale`, so fixed-step combat
-   * (TTD, fire rate, bleedout) stays unscaled.
-   */
-  private pulseHitstop(seconds: number, heavy: boolean): void {
-    this.hitstopRemain = Math.max(this.hitstopRemain, seconds);
-    if (heavy) {
-      this.player?.camera.addShake(0.035, 40, seconds * 1.2);
-      this.renderApi?.screenEffect({ flash: { intensity: 0.08, color: 0xffe0c0, decay: seconds } });
-    }
+  /** Same fire-block set as updateFiring, plus empty / mid-burst present guards. */
+  private presentAuthBlocked(): boolean {
+    const slot = this.slots[this.index];
+    if (!slot) return true;
+    const w = slot.runtime;
+    const sprintBlocked = this.timeNow < this.fireReadyAt - FIRE_EPS;
+    return w.reloading || this.state === 'drawing' || this.state === 'holstering'
+      || this.state === 'melee' || this.stanceSprinting || input.held('sprint') || sprintBlocked
+      || this.grenades.cooking || w.ammo <= 0 || this.burstLeft > 0;
   }
 
   private resolveMelee(range: number, damage: number): void {
@@ -1001,14 +1013,17 @@ export class WeaponSystem implements System {
       incoming: this._dir.clone(), energy: 40, penetrated: false,
     });
     if (hit.entityId >= 0) {
-      const res = this.ballistics.damageResolver?.(hit.entityId, damage, false, hit.point, this._dir, true)
-        ?? { killed: false, applied: damage };
+      const zone = hit.zone;
+      const headshot = zone === 'head' || zone === 'neck';
+      const res = this.ballistics.damageResolver?.(
+        hit.entityId, damage, headshot, hit.point, this._dir, true, zone,
+      ) ?? { killed: false, applied: damage };
       bus.emit('damage:dealt', {
-        targetId: hit.entityId, amount: res.applied, headshot: false,
+        targetId: hit.entityId, amount: res.applied, headshot,
         killed: res.killed, point: hit.point.clone(), fromPlayer: true,
       });
-      bus.emit('hud:hitmarker', { headshot: false, killed: res.killed, armor: !!res.armor });
-      this.pulseHitstop(res.killed ? 0.07 : 0.04, res.killed);
+      bus.emit('hud:hitmarker', { headshot, killed: res.killed, armor: !!res.armor });
+      // Lifecycle owns hitstop from these bus edges (kill / head / heavy).
     }
   }
 
@@ -1054,13 +1069,10 @@ export class WeaponSystem implements System {
     }
 
     const s = input.state;
-    // Presentation hitstop: freeze the view-model clock briefly without
-    // touching fixedUpdate / Time.scale. Lifecycle owns the shared present
-    // scale; local hitstopRemain covers melee pulses.
-    const realDt = ctx.time?.deltaReal ?? dt;
-    if (this.hitstopRemain > 0) this.hitstopRemain = Math.max(0, this.hitstopRemain - realDt);
+    // Presentation hitstop: Lifecycle is the sole writer of getPresentScale().
+    // Body-tap freezes no longer live on this system (fought recovery at high RPM).
     const lifeScale = getPresentScale();
-    const presentDt = (this.hitstopRemain > 0 || lifeScale < 0.99) ? dt * Math.min(lifeScale, 0.12) : dt;
+    const presentDt = lifeScale < 0.99 ? dt * lifeScale : dt;
     this.viewModel.update(presentDt, {
       ads: this.adsActive ? 1 : 0,
       sprint: this.stanceSprinting && this.state !== 'melee' ? 1 : 0,
@@ -1113,7 +1125,7 @@ export class WeaponSystem implements System {
     fireReadyAt: number; lastSprintAt: number; sprintOut: number;
     adsProgress: number; adsBlend: number; viewAdsBlend: number;
     bloom: number; coneDeg: number; patternIndex: number; shotIndex: number;
-    juiceCount: number; presentLatched: boolean; hitstopRemain: number;
+    juiceCount: number; presentLatched: boolean;
   } {
     const slot = this.slots[this.index];
     const def = slot.runtime.def;
@@ -1134,7 +1146,6 @@ export class WeaponSystem implements System {
       shotIndex: this.shotIndex,
       juiceCount: this.juiceLog.length,
       presentLatched: this.presentLatched,
-      hitstopRemain: this.hitstopRemain,
     };
   }
 
@@ -1149,6 +1160,7 @@ export class WeaponSystem implements System {
     this.spread.reset();
     this.shotIndex = 0;
     this.nextShotAt = this.timeNow;
+    this.clearPresentLatch();
   }
 
   grenadeStock(kind: GrenadeKind): number { return this.grenades.stock[kind]; }

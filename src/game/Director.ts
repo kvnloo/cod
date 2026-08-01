@@ -205,11 +205,39 @@ export class Director {
         this.targetIntensity = Math.max(this.targetIntensity, 0.62);
         this.spawnTimer = Math.min(this.spawnTimer, 0.35);
       }
-      if (this.pendingTtfc && alive && this.live.length > 0) {
-        // First living enemy after respawn counts as contact for the cadence.
-        this.ttfcSamples.push(this.now - this.respawnedAt);
-        if (this.ttfcSamples.length > 64) this.ttfcSamples.shift();
-        this.pendingTtfc = false;
+      // First-match / cold spawn: arm once when the director goes live with a
+      // living player (wasAlive starts true so respawn-only never fired).
+      if (!this.pendingTtfc && this.respawnedAt < 0 && alive && this.enabled) {
+        this.respawnedAt = this.now;
+        this.pendingTtfc = true;
+      }
+      if (this.pendingTtfc && alive) {
+        // Contact = engage distance, not "an enemy exists somewhere on the map".
+        // Category F: 3–8 s to first contact after respawn.
+        const CONTACT_M = 32;
+        let contact = false;
+        const actors = this.services.actors;
+        if (actors && this.live.length > 0) {
+          const px = player.position.x, py = player.position.y, pz = player.position.z;
+          for (const e of this.live) {
+            if (!actors.combatantPosition(e.id, this._p)) continue;
+            const dx = this._p.x - px, dy = this._p.y - py, dz = this._p.z - pz;
+            if (dx * dx + dy * dy + dz * dz <= CONTACT_M * CONTACT_M) {
+              contact = true;
+              break;
+            }
+          }
+        }
+        // Damage taken after arm also counts (shot from further out).
+        if (!contact && this.respawnedAt >= 0) {
+          const maxHp = player.maxHealth > 0 ? player.maxHealth : 100;
+          if (player.health < maxHp - 0.5) contact = true;
+        }
+        if (contact) {
+          this.ttfcSamples.push(this.now - this.respawnedAt);
+          if (this.ttfcSamples.length > 64) this.ttfcSamples.shift();
+          this.pendingTtfc = false;
+        }
       }
       this.wasAlive = alive;
       const frac = player.maxHealth > 0 ? player.health / player.maxHealth : 1;

@@ -11,7 +11,8 @@ import * as THREE from 'three';
 import { bus } from '../core/EventBus';
 import type { Rand } from '../core/Rand';
 import { LAYERS } from '../render/types';
-import { MASK_SIGHT } from '../physics/types';
+import { MASK_BULLET, MASK_SIGHT } from '../physics/types';
+import type { RayHit } from '../physics/types';
 import type { GameServices } from './Services';
 import type { CombatBridge } from './Combat';
 
@@ -49,6 +50,18 @@ export class SentryTurret {
   private readonly _m = new THREE.Vector3();
   private readonly _d = new THREE.Vector3();
   private readonly position = new THREE.Vector3();
+  private readonly _ray: RayHit = {
+    hit: false,
+    point: new THREE.Vector3(),
+    normal: new THREE.Vector3(0, 1, 0),
+    distance: 0,
+    surface: 'concrete',
+    object: null,
+    entityId: -1,
+    bodyHandle: -1,
+    zone: 'none',
+    backface: false,
+  };
 
   constructor(
     position: THREE.Vector3,
@@ -187,10 +200,32 @@ export class SentryTurret {
       position: this._m.clone(), color: 0xffc477, intensity: 26, radius: 6, lifetime: 0.045, decay: 'flash',
     });
 
-    const hitChance = THREE.MathUtils.clamp(0.92 - dist / (RANGE * 3), 0.45, 0.93);
-    if (this.rng.bool(hitChance)) {
+    // Same MASK_BULLET path the player uses — no coin-flip hitChance.
+    const physics = this.services.physics;
+    const maxRange = Math.min(RANGE * 1.2, Math.max(dist + 2, 4));
+    if (physics?.ready) {
+      const h = physics.raycast(this._m, this._d, maxRange, MASK_BULLET, this._ray);
+      if (h.hit) {
+        bus.emit('bullet:impact', {
+          point: h.point.clone(), normal: h.normal.clone(), surface: h.surface,
+          incoming: this._d.clone(), energy: DAMAGE * 22, penetrated: false,
+        });
+        // Prefer the acquired target when the ray lands on it; also accept any
+        // hostile entity the bullet collides with along the aim line.
+        const target = h.entityId >= 0 ? h.entityId : this.targetId;
+        if (h.entityId >= 0 || h.surface === 'flesh' || h.surface === 'armor' || h.surface === 'helmet') {
+          const zone = h.zone && h.zone !== 'none' ? h.zone : 'chest';
+          const multi = zone === 'head' || zone === 'neck' ? 2.0
+            : zone === 'stomach' ? 0.9
+              : zone === 'arm' || zone === 'leg' ? 0.7 : 1;
+          this.combat.damage(target, DAMAGE * multi, 'sentry', h.point, this._d);
+        }
+      }
+    } else {
+      // Headless / no physics: direct damage (deterministic lab path).
       this.combat.damage(this.targetId, DAMAGE, 'sentry', this._t, this._d);
     }
+    void this.rng;
   }
 
   private inArc(p: THREE.Vector3): boolean {

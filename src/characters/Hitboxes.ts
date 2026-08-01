@@ -168,14 +168,18 @@ export function livingHitboxLayout(
   const r = Math.max(0.2, radius);
   // Reference is a 1.80 m soldier; scale linear dimensions with height.
   const s = h / 1.80;
-  // Match geometric rig: chest x1 ≈ 0.55–0.62 R so the outer capsule ring is
-  // available for arm grazes (prior 0.88 R torso left almost no exclusive arm).
+  // Match geometric HITBOX_RIG: torso half-width ≈ 0.55 R so the outer capsule
+  // ring is exclusive arm (prior 0.88 R torso left almost no arm graze).
   const torsoW = Math.min(r * 0.55, 0.20 * s);
-  const torsoD = Math.min(r * 0.72, 0.25 * s);
-  const limbR = Math.min(r * 0.40, 0.125 * s);
-  // Arm centres sit just outside the torso edge so side rays resolve arm, not
-  // a chest volume that overlapped the limb.
-  const armOx = torsoW + limbR * 0.95;
+  const torsoD = Math.min(r * 0.55, 0.20 * s);
+  const limbR = Math.min(r * 0.38, 0.125 * s);
+  // Arm centres sit just outside the torso edge — no X-overlap with chest so a
+  // centre-mass ray never resolves arm, and a lateral aim at ≥0.55 R does.
+  const armOx = torsoW + limbR + 0.01 * s;
+  // Deep along the fore/aft axis: the proxy body does not yaw with facing, so
+  // lateral aim from any approach angle still clips an arm slab (half-depth
+  // covers the playtest/g3 0.85 R lateral offset from ± headings).
+  const armDepth = Math.min(r * 0.95, 0.34 * s);
 
   const box = (
     zone: HitZone,
@@ -194,6 +198,7 @@ export function livingHitboxLayout(
    * bands overlap slightly so a centre-mass ray never slips through a seam
    * (the previous layout left chest↔neck, stomach↔chest and leg↔stomach gaps).
    * Capsule centre is at 0.5 h from the feet; local offset.y = (mid − 0.5) · h.
+   * Kept in lockstep with `HITBOX_RIG` in `game/Combat.ts`.
    */
   const band = (
     zone: HitZone,
@@ -202,27 +207,28 @@ export function livingHitboxLayout(
     halfX: number,
     halfZ: number,
     ox = 0,
+    oz = 0,
     surface?: SurfaceType,
   ): CharacterHitboxDesc => {
     const mid = (y0 + y1) * 0.5;
     const halfY = (y1 - y0) * 0.5 * h;
-    return box(zone, [halfX, halfY, halfZ], [ox, (mid - 0.5) * h, 0], surface);
+    return box(zone, [halfX, halfY, halfZ], [ox, (mid - 0.5) * h, oz], surface);
   };
 
   return [
     // Playtest head band sits at 0.94 h; cover chin → crown. Flesh unless helmet.
-    band('head', 0.870, 1.015, 0.11 * s, 0.11 * s, 0),
+    band('head', 0.870, 1.015, 0.11 * s, 0.11 * s),
     band('neck', 0.810, 0.885, 0.07 * s, 0.07 * s),
     // Chest covers playtest 0.72; overlaps neck above and stomach below.
     band('chest', 0.555, 0.825, torsoW, torsoD),
     // Stomach covers playtest 0.52; overlaps legs.
     band('stomach', 0.395, 0.575, torsoW * 0.95, torsoD * 0.92),
-    // Arms: exclusive outer ring at torso height (side grazes / aimed arm band).
-    band('arm', 0.480, 0.820, limbR, limbR, armOx),
-    band('arm', 0.480, 0.820, limbR, limbR, -armOx),
+    // Arms: exclusive outer slabs. Deep Z so lateral aim works without body yaw.
+    band('arm', 0.480, 0.820, limbR, armDepth, armOx, 0),
+    band('arm', 0.480, 0.820, limbR, armDepth, -armOx, 0),
     // Legs cover playtest 0.22 and reach into the lower stomach band.
-    band('leg', 0.000, 0.430, limbR * 1.25, limbR * 1.15, r * 0.22),
-    band('leg', 0.000, 0.430, limbR * 1.25, limbR * 1.15, -r * 0.22),
+    band('leg', 0.000, 0.430, limbR * 1.25, limbR * 1.15, r * 0.22, 0),
+    band('leg', 0.000, 0.430, limbR * 1.25, limbR * 1.15, -r * 0.22, 0),
   ];
 }
 

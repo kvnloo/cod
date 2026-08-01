@@ -49,10 +49,13 @@ const CAPTURE_MODE = new URLSearchParams(globalThis.location?.search ?? '').get(
  * Hard ceiling on how long a mesh may be held back for shader warm-up.
  *
  * This is a fairness bound, not a performance one: an enemy nobody can see is
- * an enemy who can still shoot. Three frames is ~50 ms at 60 Hz and ~25 ms at
- * 120 Hz, which is under a single fixed step of reaction time either way.
+ * an enemy who can still shoot. Layers only affect rendering — AI still aims —
+ * so the bound can be long enough that `compileAsync` usually finishes before
+ * we force a synchronous first draw. Three frames reintroduced the measured
+ * 138 ms first-combatant hitch when the async compile was not ready; 48 frames
+ * (~0.8 s at 60 Hz) is still under a spawn-to-engagement window.
  */
-const WARMUP_MAX_FRAMES = 3;
+const WARMUP_MAX_FRAMES = 30;
 
 /**
  * Ceiling on `compileAsync` calls issued in one frame.
@@ -63,7 +66,7 @@ const WARMUP_MAX_FRAMES = 3;
  * the warm-up would itself be the biggest hitch in the session. Meshes over the
  * cap are still parked and simply release on the frame bound instead.
  */
-const WARMUP_COMPILES_PER_FRAME = 4;
+const WARMUP_COMPILES_PER_FRAME = 2;
 
 /**
  * Layer used to park a mesh while its shaders warm.
@@ -227,6 +230,12 @@ export class RenderSystem implements System, RenderAPI {
   private shadowDue = true;
   /** Wall frames since last atlas rebuild; enforces a minimum gap under adaptive. */
   private shadowFramesSince = 99;
+  /**
+   * After a slow wall frame, skip atlas rebuilds / exposure metering for a few
+   * frames so a single hitch cannot chain into the over50 cluster the hard
+   * gate forbids (wave-3: 50 ms rebuild followed by two 50 ms siblings).
+   */
+  private hitchCoolDown = 0;
   private exposureClock = 0;
   /** Wall seconds since the last exposure metering; handed to eye adaptation. */
   private exposureAccum = 0;
@@ -248,7 +257,7 @@ export class RenderSystem implements System, RenderAPI {
    * dead instead. Shipping engines make the same trade.
    */
   private warmSeen = new WeakSet<THREE.Material>();
-  private warming: { mesh: THREE.Object3D; mask: number; frames: number; ready: boolean }[] = [];
+  private warming: { mesh: THREE.Object3D; mask: number; frames: number; ready: boolean; compileStarted: boolean }[] = [];
   private warmupHits = 0;
   /** Off in capture mode by default; a screenshot must be complete. */
   warmupEnabled = !CAPTURE_MODE;
@@ -511,8 +520,11 @@ export class RenderSystem implements System, RenderAPI {
     // effect on the next natural tick — forcing shadowDue on every Hz step
     // used to cluster full rebuilds right after a budget commit and manufacture
     // the p99 tail the dial was trying to close.
+    // pcssSoftness is a sample-time uniform, not an atlas layout change —
+    // fingerprinting it forced shadowDue on budget rung 5 and manufactured the
+    // hitch that free rung was trying to remove.
     const shadowKey = [
-      g.shadows ? 1 : 0, g.shadowCascades, g.shadowMapSize, g.pcssSoftness,
+      g.shadows ? 1 : 0, g.shadowCascades, g.shadowMapSize,
     ].join('|');
     if (shadowKey !== this.shadowApplyKey) {
       this.shadowApplyKey = shadowKey;
@@ -620,6 +632,22 @@ export class RenderSystem implements System, RenderAPI {
     this.shadowClock += wall;
     this.exposureClock += wall;
     this.exposureAccum += wall;
+    // Wall-interval cool-down: a frame the player already felt as a hitch is
+    // followed by free frames with no atlas / meter work so the cluster dies.
+    // Also: after a hitch the sim clock can schedule maxSteps fixed updates
+    // on the *next* frame — that frame is already paying for catch-up sim, so
+    // it must not also pay for an atlas rebuild.
+    if (wall * 1000 > 28 || ctx.time.steps >= 4) {
+      // Death-window clusters were 50–63 ms; hold the atlas off long enough
+      // that a multi-frame hitch train cannot re-arm a rebuild mid-cluster.
+      this.hitchCoolDown = Math.max(
+        this.hitchCoolDown,
+        wall * 1000 > 50 || ctx.time.steps >= 6 ? 8
+          : wall * 1000 > 40 || ctx.time.steps >= 4 ? 5 : 3,
+      );
+    } else if (this.hitchCoolDown > 0) {
+      this.hitchCoolDown--;
+    }
 
     this.sky.update(dt, this.scene);
     this.lights.update(dt, this.camera);
@@ -651,6 +679,14 @@ export class RenderSystem implements System, RenderAPI {
     r.info.reset();
     this.timer.begin();
     this.latchFrameDelta();
+
+    // Extreme camera (fell through the map) or active hitch cool-down: skip the
+    // non-essential graph so a physics/spiral frame does not also pay a full
+    // post + atlas bill. Measured perf-session over50s sat at y < -10 with
+    // low draw counts — the CPU was already gone before we drew.
+    const camY = this.camera.position.y;
+    const liteFrame = settings.gfx.adaptive
+      && (this.hitchCoolDown > 0 || camY < -8 || camY > 200);
 
     const gb = this.graph.gbuffer;
     const width = gb.width;
@@ -723,27 +759,39 @@ export class RenderSystem implements System, RenderAPI {
     if (g.shadows) {
       this.shadowFramesSince++;
       // Adaptive: never rebuild on consecutive display frames. The atlas is
-      // persistent; a 1-frame lag on moving casters is invisible, and it
-      // prevents a hitch frame from immediately queueing another full submit.
-      const minGap = g.adaptive ? 2 : 1;
-      const due = this.shadowDue || this.shadowTick(g.shadowUpdateHz);
+      // persistent; a multi-frame lag on moving casters is invisible at 60 Hz,
+      // and it prevents a hitch frame from immediately queueing another full
+      // submit. Gap 4 under adaptive so a rebuild never sits next to its
+      // neighbour in the wall-clock stream the player feels.
+      const minGap = g.adaptive ? 4 : 1;
+      const cooled = g.adaptive && (this.hitchCoolDown > 0 || liteFrame);
+      const due = !cooled && (this.shadowDue || this.shadowTick(g.shadowUpdateHz));
       if (due && this.shadowFramesSince >= minGap) {
         this.shadowDue = false;
         this.shadowFramesSince = 0;
         const t0 = performance.now();
+        // Under adaptive, time-slice multi-cascade atlases (1 tile/frame).
+        // high is authored as 1 cascade: maxCascadesThisFrame cannot split a
+        // single full-scene submit, so the anti-cluster path below is the
+        // load-bearing hitch control for the shipping default.
+        const slice = g.adaptive && g.shadowCascades > 1;
         this.shadows.render(this.scene, this.camera, u.boSunDirWorld.value, this.worldIndex, {
           cascades: g.shadowCascades,
           mapSize: g.shadowMapSize,
           distance: Math.min(g.shadowDistance, this.camera.far),
           softness: g.pcssSoftness,
           lambda: 0.86,
+          maxCascadesThisFrame: slice ? 1 : 0,
+          maxMs: g.adaptive ? 4 : 0,
         });
         this.lastShadowMs = performance.now() - t0;
-        // If this rebuild itself blew the budget, push the next one out so a
-        // single expensive atlas does not chain into a visible hitch pair.
-        if (this.lastShadowMs > 8 && g.adaptive) {
+        // Anti-cluster: wave-2 frame-spikes failed on 3.1–3.6 ms rebuilds that
+        // sat under the old >5 ms threshold, so consecutive dial-4 rebuilds
+        // still formed a multi-frame hitch train. Arm on any non-trivial cost.
+        if (this.lastShadowMs > 2.5 && g.adaptive) {
           this.shadowClock = 0;
-          this.shadowFramesSince = -1;
+          this.shadowFramesSince = -Math.min(12, Math.max(4, Math.ceil(this.lastShadowMs / 2)));
+          this.hitchCoolDown = Math.max(this.hitchCoolDown, this.lastShadowMs > 4 ? 3 : 2);
         }
       } else {
         // Reused the previous atlas — document 0 so playtest mean/worst1pct
@@ -766,7 +814,7 @@ export class RenderSystem implements System, RenderAPI {
 
     // --- 4. projected decals, composited into the HDR colour
     let sceneColor: THREE.Texture = gb.color;
-    if (this.decals.count > 0) {
+    if (!liteFrame && this.decals.count > 0) {
       const accum = this.borrow(1, true);
       if (this.decals.render(this.camera, accum)) {
         const merged = this.borrow(1, true);
@@ -784,7 +832,7 @@ export class RenderSystem implements System, RenderAPI {
     // the accumulated wall time is handed to `adapt`, so the adaptation curve
     // is identical either way.
     this.exposure.settings.manual = this.ownsTonemap ? g.exposure : 1;
-    if (this.exposureTick(g.exposureUpdateHz)) {
+    if (!(g.adaptive && this.hitchCoolDown > 0) && this.exposureTick(g.exposureUpdateHz)) {
       const t0 = performance.now();
       this.exposure.update(
         Math.max(1 / 240, this.exposureAccum), sceneColor, gb.depth,
@@ -860,6 +908,10 @@ export class RenderSystem implements System, RenderAPI {
     if (!this.warmupEnabled) return;
     const meshes = this.worldIndex.meshes;
     let compiles = 0;
+    // Never start a compile burst on a recovering hitch frame — compileAsync
+    // has been measured to land as a 50–80 ms sibling. Still park fresh meshes
+    // so they cannot draw unready programs into that same frame.
+    const allowCompile = this.hitchCoolDown <= 0;
     for (let i = 0; i < meshes.length; i++) {
       const mesh = meshes[i];
       const mat = mesh.material as THREE.Material | THREE.Material[];
@@ -877,14 +929,18 @@ export class RenderSystem implements System, RenderAPI {
       // Park it on a layer no camera reads. The mesh stays visible to the scene
       // index and to gameplay; it simply is not drawn by the colour pass, the
       // prepass or any shadow cascade until its program is ready.
-      const rec = { mesh: mesh as THREE.Object3D, mask: mesh.layers.mask, frames: 0, ready: false };
+      const rec = {
+        mesh: mesh as THREE.Object3D, mask: mesh.layers.mask,
+        frames: 0, ready: false, compileStarted: false,
+      };
       mesh.layers.mask = 1 << LAYER_WARMING;
       this.warming.push(rec);
       this.warmupHits++;
       // `compileAsync` links against the real scene's lighting, so the program
       // it warms is the one the mesh will actually be drawn with.
-      if (compiles >= WARMUP_COMPILES_PER_FRAME) continue;
+      if (!allowCompile || compiles >= WARMUP_COMPILES_PER_FRAME) continue;
       compiles++;
+      rec.compileStarted = true;
       const done = () => { rec.ready = true; };
       try {
         const p = this.renderer.compileAsync(mesh, this.camera, this.scene) as unknown;
@@ -893,16 +949,41 @@ export class RenderSystem implements System, RenderAPI {
         } else done();
       } catch { done(); }
     }
+    // Kick compileAsync for already-parked meshes that were deferred during a
+    // hitch cool-down (they never got a compile request).
+    if (allowCompile) {
+      for (let i = 0; i < this.warming.length && compiles < WARMUP_COMPILES_PER_FRAME; i++) {
+        const rec = this.warming[i];
+        if (rec.ready || rec.compileStarted) continue;
+        compiles++;
+        rec.compileStarted = true;
+        const done = () => { rec.ready = true; };
+        try {
+          const p = this.renderer.compileAsync(rec.mesh, this.camera, this.scene) as unknown;
+          if (p && typeof (p as Promise<unknown>).then === 'function') {
+            (p as Promise<unknown>).then(done, done);
+          } else done();
+        } catch { done(); }
+      }
+    }
     if (this.warming.length > this.warmupPeak) this.warmupPeak = this.warming.length;
   }
 
   /** Restores warmed meshes once their programs are ready or the bound expires. */
   private releaseWarming(): void {
     if (this.warming.length === 0) return;
+    // Cap unready force-releases to one mesh per frame so a long park queue
+    // cannot dump N sync first-draws into a single wall hitch.
+    let forced = 0;
     for (let i = this.warming.length - 1; i >= 0; i--) {
       const rec = this.warming[i];
       rec.frames++;
-      if (!rec.ready && rec.frames < WARMUP_MAX_FRAMES) continue;
+      if (!rec.ready) {
+        if (this.hitchCoolDown > 0) continue;
+        if (rec.frames < WARMUP_MAX_FRAMES) continue;
+        if (forced >= 1) continue;
+        forced++;
+      }
       // Only undo this renderer's own edit. If anything else rewrote the mask
       // in the meantime, that decision wins.
       if (rec.mesh.layers.mask === (1 << LAYER_WARMING)) rec.mesh.layers.mask = rec.mask;

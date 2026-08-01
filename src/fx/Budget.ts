@@ -58,10 +58,11 @@ function slowTo(current: number, hz: number): number {
 
 /**
  * Index of the first rung that reallocates the G-buffer / particle pools.
- * Atlas cascade cuts above this are cheaper one-off stalls; render-scale rungs
- * resize every target and are last.
+ * Free rungs above this can still kill residual shadow/opaque cost (hz,
+ * distance, shadows-off, drawDistance) without resizing targets. REALLOC is
+ * last because mid-fight G-buffer resizes *create* the over50 frames we gate.
  */
-const FIRST_REALLOC_RUNG = 6;
+const FIRST_REALLOC_RUNG = 7;
 
 /**
  * The ladder, cheapest concession first.
@@ -70,19 +71,21 @@ const FIRST_REALLOC_RUNG = 6;
  * all the ones before it, so the dial is a single monotonic number and the
  * result is a pure function of (preset, dial) — no drift, no accumulated state.
  *
- * ## Rungs 1–5 are allocation-free, and that is load-bearing
+ * ## Rungs 1–6 are allocation-free, and that is load-bearing
  *
  * Changing `renderScale` resizes the G-buffer and every post target — multi-ms
  * stalls that manufacture the spikes this governor exists to remove. Measured:
  * `high` at 1080p went to a 90.7 ms p99 when scale led the ladder. So free rungs
- * only touch uniforms, booleans and update rates.
+ * only touch uniforms, booleans, update rates and draw distance.
  *
  * ## Relative to the live preset
  *
- * `high` authors 2 cascades @ 1024, 24 Hz, contact/prepass off. An early
- * `shadows-40hz` or `contact-off` rung is therefore a no-op on high and must
- * not consume a dial step. Free rungs start below the authored base, and
- * `nextEffectiveDial` skips anything that does not change gfx.
+ * `high` authors 1 cascade @ 1024, 12 Hz, contact/prepass off. Early contact/
+ * prepass rungs are no-ops on high and must not consume a dial step.
+ * `nextEffectiveDial` skips anything that does not change gfx. Wave-3 still
+ * saw over50 with dial stuck at 5 while REALLOC rungs 6–7 sat unused (long
+ * dwell + fear of resize hitches) — so rung 6 is now a free **shadows-off**
+ * floor that can actually kill the residual atlas hitch without reallocating.
  *
  * REALLOC rungs are last and require a long dwell: walking into them mid-
  * firefight was measured to *create* the over50 frames the gates forbid.
@@ -90,8 +93,7 @@ const FIRST_REALLOC_RUNG = 6;
 const LADDER: Rung[] = [
   { name: 'full', apply: () => { /* the preset, as authored */ } },
 
-  // 1 — atlas below high's 24 Hz + contact/prepass out (real on ultra with
-  // adaptive; no-op-safe on high via nextEffectiveDial).
+  // 1 — atlas ≤16 Hz + contact/prepass out (real on ultra; no-op-safe on high).
   {
     name: 'shadows-16hz+contact-off+prepass-off',
     apply: (g) => {
@@ -107,47 +109,65 @@ const LADDER: Rung[] = [
     apply: (g) => { g.exposureUpdateHz = slowTo(g.exposureUpdateHz, 15); g.dof = false; },
   },
 
-  // 3 — far shadow range, motion blur, atlas 12 Hz.
+  // 3 — far shadow range, motion blur, atlas 10 Hz, draw distance cut.
   {
-    name: 'shadow-dist-70%+motionblur-off+shadows-12hz',
+    name: 'shadow-dist-70%+motionblur-off+shadows-10hz+draw-85%',
     apply: (g, b) => {
       g.shadowDistance = b.shadowDistance * 0.7;
       g.motionBlur = false;
-      g.shadowUpdateHz = slowTo(g.shadowUpdateHz, 12);
+      g.shadowUpdateHz = slowTo(g.shadowUpdateHz, 10);
+      g.drawDistance = b.drawDistance * 0.85;
     },
   },
 
-  // 4 — SSR and SSAO out, atlas 10 Hz.
+  // 4 — SSR and SSAO out, atlas 8 Hz.
   {
-    name: 'ssr-off+ssao-off+shadows-10hz',
+    name: 'ssr-off+ssao-off+shadows-8hz',
     apply: (g) => {
       g.ssr = false;
       g.ssao = false;
-      g.shadowUpdateHz = slowTo(g.shadowUpdateHz, 10);
+      g.shadowUpdateHz = slowTo(g.shadowUpdateHz, 8);
       g.lensDirt = 0;
     },
   },
 
-  // 5 — last allocation-free rung: volumetrics out, shorter TAA, atlas 8 Hz.
-  // Do NOT touch maxParticles/maxDecals here — those reallocate GPU pools and
-  // were measured as the 50–80 ms hitch that kept frame-spikes red after p99
-  // was already green.
+  // 5 — volumetrics out, shorter TAA, atlas 6 Hz, half shadow range.
+  // Do NOT touch maxParticles/maxDecals here — those reallocate GPU pools.
+  // Do NOT clamp pcssSoftness: that fingerprint forces shadowDue=true and
+  // schedules a full atlas rebuild on a free rung meant to *cut* cost (wave-2:
+  // rung-5 commit manufactured the hitch class the dial was removing).
   {
-    name: 'volumetrics-off+taa-8+shadows-8hz',
+    name: 'volumetrics-off+taa-8+shadows-6hz+draw-70%',
     apply: (g, b) => {
       g.volumetrics = false;
       g.taaSamples = Math.min(b.taaSamples, 8);
-      g.shadowUpdateHz = slowTo(g.shadowUpdateHz, 8);
+      g.shadowUpdateHz = slowTo(g.shadowUpdateHz, 6);
       g.shadowDistance = b.shadowDistance * 0.5;
-      g.pcssSoftness = Math.min(g.pcssSoftness, 0.35);
+      g.drawDistance = b.drawDistance * 0.7;
     },
   },
 
-  // 6 — first real reallocation (G-buffer + particle/decal pools). Long dwell.
+  // 6 — last allocation-free floor: kill the atlas entirely + pull draw distance.
+  // Wave-3: dial sat at 5 while residual cascade+opaque submit still produced
+  // over50 clusters; REALLOC was unused because of the 4 s dwell. shadows-off
+  // is free, measured −5.66 ms / −70% draws on the reference machine, and is
+  // the only free concession that can zero a rebuild hitch.
+  {
+    name: 'shadows-off+draw-55%',
+    apply: (g, b) => {
+      g.shadows = false;
+      g.shadowUpdateHz = slowTo(g.shadowUpdateHz, 4);
+      g.drawDistance = b.drawDistance * 0.55;
+      g.ssr = false;
+      g.volumetrics = false;
+    },
+  },
+
+  // 7 — first real reallocation (G-buffer + particle/decal pools). Long dwell.
   {
     name: 'REALLOC scale-85%+pools-50%',
     apply: (g, b) => {
-      g.shadowCascades = 2;
+      g.shadowCascades = Math.min(g.shadowCascades, 1);
       g.renderScale = b.renderScale * 0.85;
       g.maxParticles = Math.round(b.maxParticles * 0.5);
       g.maxDecals = Math.round(b.maxDecals * 0.5);
@@ -155,16 +175,18 @@ const LADDER: Rung[] = [
     },
   },
 
-  // 7 — the floor.
+  // 8 — the floor.
   {
     name: 'REALLOC scale-70%+minimum',
     apply: (g, b) => {
-      g.shadowCascades = 2;
+      g.shadowCascades = 1;
+      g.shadows = false;
       g.renderScale = b.renderScale * 0.7;
       g.shadowMapSize = Math.max(512, Math.round(b.shadowMapSize / 2));
       g.maxDecals = Math.round(b.maxDecals * 0.3);
       g.maxParticles = Math.round(b.maxParticles * 0.25);
-      g.shadowUpdateHz = slowTo(g.shadowUpdateHz, 6);
+      g.shadowUpdateHz = slowTo(g.shadowUpdateHz, 4);
+      g.drawDistance = b.drawDistance * 0.45;
     },
   },
 ];
@@ -195,8 +217,7 @@ const LADDER_KEYS: (keyof GfxSettings)[] = [
   'shadowUpdateHz', 'exposureUpdateHz', 'contactShadows', 'depthPrepass',
   'dof', 'motionBlur', 'shadowDistance', 'ssr', 'volumetrics', 'shadowCascades',
   'ssao', 'taaSamples', 'renderScale', 'maxParticles', 'lensDirt', 'shadowMapSize',
-  'pcssSoftness',
-  'maxDecals',
+  'pcssSoftness', 'maxDecals', 'shadows', 'drawDistance',
 ];
 
 function gfxEqual(a: GfxSettings, b: GfxSettings): boolean {
@@ -328,11 +349,12 @@ export class FrameBudget {
       this.settle -= dtSeconds;
       return;
     }
-    // See SPIKE_MS: a frame this long is a one-off, and no rung would have
-    // prevented it. Letting it into the window only costs image quality.
-    if (ms > SPIKE_MS) return;
-
-    this.ring[this.cursor] = ms;
+    // See SPIKE_MS: a frame this long is a load/compile/tab-switch and must
+    // not pollute p90/p99. Record a synthetic 51 ms sample so over50 pressure
+    // still walks free rungs to shadows-off — and keep evaluating (early return
+    // here left the dial frozen during multi-frame hitch trains).
+    const sample = ms > SPIKE_MS ? 51 : ms;
+    this.ring[this.cursor] = sample;
     this.cursor = (this.cursor + 1) % WINDOW;
     if (this.filled < WINDOW) this.filled++;
 
@@ -379,34 +401,38 @@ export class FrameBudget {
     // fast; resolution rungs do not.
     const downDwell = next >= FIRST_REALLOC_RUNG
       ? 4.0
-      : over50 > 0 ? 0.2 : 0.35;
+      : over50 > 0 ? 0.15 : 0.35;
 
     if (this.overFor >= downDwell && next > this.dial) {
       // One effective rung is roughly a 10–15% saving. Take rungs proportional
-      // to how far out it is, then converge — but never skip *into* the
-      // reallocating rungs on a single verdict. over50 forces at least one
-      // real concession immediately.
+      // to how far out it is, then converge.
+      //
+      // CRITICAL: never *auto*-enter REALLOC rungs. Wave-3 measured that a
+      // G-buffer / pool resize mid-firefight manufactures 50–150 ms over50
+      // frames and walks the dial to the floor while still failing the gate.
+      // Free rungs (hz, post off, shadows-off, drawDistance) are the only
+      // automatic concessions. Tools / the settings menu can still force a
+      // REALLOC dial via setDial.
+      //
+      // over50 is a hard-gate red: walk every free rung up to shadows-off
+      // (FIRST_REALLOC_RUNG - 1) in one commit so a 50–63 ms cluster cannot age
+      // out of WINDOW=96 while the dial stalls at rung 4 (wave-2 end state).
       const over = signal / target;
-      const jump = over50 > 0 ? Math.max(1, over > 1.6 ? 2 : 1)
+      const jump = over50 > 0 ? 99
         : over > 2.5 ? 3 : over > 1.6 ? 2 : 1;
 
       let targetDial = this.dial;
       for (let s = 0; s < jump; s++) {
         const n = this.nextEffectiveDial(targetDial);
         if (n === targetDial) break;
-        // A multi-rung jump must stop at the last allocation-free rung.
-        if (targetDial < FIRST_REALLOC_RUNG && n >= FIRST_REALLOC_RUNG && s > 0) break;
-        if (targetDial < FIRST_REALLOC_RUNG && n >= FIRST_REALLOC_RUNG && over50 === 0 && over <= 1.6) {
-          // Enter realloc only with its own longer dwell (handled above).
-          if (this.overFor < 2.5) break;
-        }
+        if (n >= FIRST_REALLOC_RUNG) break;
         targetDial = n;
       }
 
       if (targetDial > this.dial) {
         this.dial = targetDial;
         this.downshifts++;
-        this.commit();
+        this.commit(over50 > 0);
       }
     } else if (this.underFor >= 4.0 && this.dial > 0) {
       const under = signal / target;
@@ -431,8 +457,13 @@ export class FrameBudget {
     this.commit();
   }
 
-  /** Rebuilds `settings.gfx` from the preset base plus rungs `1..dial`. */
-  private commit(): void {
+  /**
+   * Rebuilds `settings.gfx` from the preset base plus rungs `1..dial`.
+   * `fastSettle` shortens the post-commit freeze on free over50 walks so the
+   * ring can re-arm inside WINDOW and the dial is not frozen for a full second
+   * after already taking the free shadows-off concession.
+   */
+  private commit(fastSettle = false): void {
     const g = this.applyRungs(this.dial);
     // Mutated in place, never replaced: `__RENDER__.gfx`, `PassContext.settings`
     // and the settings menu all hold a reference to this object.
@@ -441,7 +472,9 @@ export class FrameBudget {
     this.cursor = 0;
     this.overFor = 0;
     this.underFor = 0;
-    this.settle = 1.0;
+    // REALLOC always needs a long settle (resize stall). Free over50 walks
+    // settle fast so the next sample window still sees the new quality.
+    this.settle = this.dial >= FIRST_REALLOC_RUNG ? 1.0 : fastSettle ? 0.2 : 0.55;
     this.applyHook?.();
   }
 

@@ -108,6 +108,10 @@ export class HUDSystem implements System {
   /** First-match click-to-look until pointer lock. */
   private controlsLookHint = false;
   private controlsShownThisSession = false;
+  /** Wall-clock (performance.now) when the first-match strip appeared; null if never. */
+  private controlsStripShownAt: number | null = null;
+  /** Sim/HUD seconds elapsed when strip was shown (for cold-spawn latency). */
+  private controlsStripHudAt: number | null = null;
 
   /* ------------------------------------------------------------- init -- */
 
@@ -226,6 +230,12 @@ export class HUDSystem implements System {
       window.setTimeout(() => this.menus.replace('summary'), 2200);
     }));
     this.disposers.push(bus.on('level:loaded', () => this.minimap.rebuild()));
+    // Cold boot: GameDirector.startMatch fires game:start without MainMenu.deploy.
+    // Category G — first-match controls must appear on any match start path.
+    this.disposers.push(bus.on('game:start', () => {
+      this.showFirstMatchControls();
+      this.publishNpe();
+    }));
 
     const onKey = (e: KeyboardEvent): void => this.onKeyDown(e);
     window.addEventListener('keydown', onKey);
@@ -237,6 +247,32 @@ export class HUDSystem implements System {
       this.root.clientHeight || window.innerHeight,
       Math.min(window.devicePixelRatio || 1, 2),
     );
+
+    // GameDirector (ORDER.GAMEPLAY) starts the match in its own init, which
+    // runs before ORDER.UI — so `game:start` was already emitted. Catch up.
+    this.ensureFirstMatchControlsFromBoot();
+  }
+
+  /**
+   * Cold-boot catch-up: if a match is already running when the HUD finishes
+   * init, surface the first-match control strip + look hint immediately.
+   */
+  private ensureFirstMatchControlsFromBoot(): void {
+    const g = (globalThis as unknown as {
+      __BLACKOUT_GAME__?: { phase?: string; started?: boolean };
+    }).__BLACKOUT_GAME__;
+    const phase = g?.phase;
+    if (g && phase && phase !== 'idle') {
+      this.showFirstMatchControls();
+      return;
+    }
+    // Deferred one rAF in case the director starts on the next tick.
+    requestAnimationFrame(() => {
+      const g2 = (globalThis as unknown as {
+        __BLACKOUT_GAME__?: { phase?: string };
+      }).__BLACKOUT_GAME__;
+      if (g2 && g2.phase && g2.phase !== 'idle') this.showFirstMatchControls();
+    });
   }
 
   /* ------------------------------------------------------------ frame -- */
@@ -273,6 +309,7 @@ export class HUDSystem implements System {
       } else {
         this.banners.setLookHint(true);
       }
+      this.publishNpe();
     }
 
     // `CaptureAPI.setHUD(false)` hides #ui-root; the blend plate lives outside
@@ -441,27 +478,58 @@ export class HUDSystem implements System {
    * Once per browser profile via localStorage.
    */
   private showFirstMatchControls(): void {
-    if (this.controlsShownThisSession) return;
-    const key = 'ob-seen-controls-v1';
-    try {
-      if (localStorage.getItem(key) === '1') {
-        // Still prompt click-to-look every cold boot until lock once.
+    if (this.controlsShownThisSession) {
+      // Already stripped this session — keep look-hint armed until lock.
+      if (!input.locked) {
         this.controlsLookHint = true;
         this.banners.setLookHint(true);
-        return;
       }
-      localStorage.setItem(key, '1');
+      this.publishNpe();
+      return;
+    }
+    const key = 'ob-seen-controls-v1';
+    let returning = false;
+    try {
+      returning = localStorage.getItem(key) === '1';
+      if (!returning) localStorage.setItem(key, '1');
     } catch { /* private mode — still show once this session */ }
     this.controlsShownThisSession = true;
-    // Immediate strip (not queued behind the ~3.6 s mode banner). Acceptance:
-    // control strip not blocked >1 s by mode banner.
+    // Returning profiles still get the strip on cold spawn for <=1 s legibility
+    // (localStorage only suppresses the long 6.5 s card after first profile visit
+    // would have been too aggressive for "cold boot skips strip"). Always show
+    // immediately — never queue behind the ~3.6 s mode banner.
+    const life = returning ? 4.0 : 6.5;
     this.banners.showControlStrip('CONTROLS', [
       'WASD MOVE  ·  MOUSE LOOK  ·  LMB FIRE  ·  RMB ADS',
       'SPACE JUMP  ·  C / CTRL CROUCH  ·  SHIFT SPRINT  ·  R RELOAD',
       'V MELEE  ·  G GRENADE  ·  1/2 WEAPON  ·  TAB SCORE  ·  ESC PAUSE',
-    ], 6.5);
+    ], life);
+    this.controlsStripShownAt = performance.now();
+    this.controlsStripHudAt = this.elapsed;
+    // Click-to-look every cold boot until pointer lock.
     this.controlsLookHint = true;
     this.banners.setLookHint(true);
+    this.publishNpe();
+  }
+
+  /** Probe surface for playtest NPE gates (category G). */
+  private publishNpe(): void {
+    const g = globalThis as unknown as {
+      __BLACKOUT_NPE__?: {
+        controlStripShown: boolean;
+        stripHudSec: number | null;
+        stripWallMs: number | null;
+        lookHint: boolean;
+        pointerLocked: boolean;
+      };
+    };
+    g.__BLACKOUT_NPE__ = {
+      controlStripShown: this.controlsStripShownAt !== null || this.controlsShownThisSession,
+      stripHudSec: this.controlsStripHudAt,
+      stripWallMs: this.controlsStripShownAt,
+      lookHint: this.controlsLookHint,
+      pointerLocked: !!input.locked,
+    };
   }
 
   /** Full-width objective banner. */

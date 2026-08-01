@@ -50,6 +50,10 @@ const BIAS_MATRIX = new THREE.Matrix4().set(
   0, 0, 0, 1,
 );
 
+/** Debug/API rounding — keep cascade dumps compact and stable across frames. */
+const round2 = (v: number): number => Math.round(v * 100) / 100;
+const round3 = (v: number): number => Math.round(v * 1000) / 1000;
+
 interface Cascade {
   camera: THREE.OrthographicCamera;
   near: number;
@@ -225,6 +229,11 @@ export class ShadowSystem {
   private frame = 0;
   private lastCalls = 0;
   private lastTriangles = 0;
+  /** Draw calls and triangles attributed to each cascade of the last build. */
+  private readonly cascadeCalls: number[] = [0, 0, 0, 0];
+  private readonly cascadeTris: number[] = [0, 0, 0, 0];
+  private readonly auditFrustum = new THREE.Frustum();
+  private readonly auditSphere = new THREE.Sphere();
   private rescanMs = 0;
   private rescans = 0;
   private last: {
@@ -392,7 +401,11 @@ export class ShadowSystem {
       renderer.setViewport(px, py, this.mapSize, this.mapSize);
       renderer.setScissor(px, py, this.mapSize, this.mapSize);
       renderer.setScissorTest(true);
+      const cc = renderer.info.render.calls;
+      const ct = renderer.info.render.triangles;
       renderer.render(scene, c.camera);
+      this.cascadeCalls[i] = renderer.info.render.calls - cc;
+      this.cascadeTris[i] = renderer.info.render.triangles - ct;
 
       this.publish(i, c, splits[i]);
     }
@@ -781,7 +794,100 @@ export class ShadowSystem {
         return out;
       },
       bench: (iters?: number, cfg?: Partial<ShadowConfig>) => this.bench(iters ?? 40, cfg),
+      audit: (q?: string) => this.audit(q),
+      cascades: () => this.cascades.slice(0, this.cascadeCount).map((c, i) => ({
+        i,
+        near: round2(c.near),
+        far: round2(c.far),
+        radius: round2(c.radius),
+        texel: round3(c.radius * 2 / this.mapSize),
+        centre: [
+          round2(c.camera.position.x),
+          round2(c.camera.position.y),
+          round2(c.camera.position.z),
+        ],
+        calls: this.cascadeCalls[i],
+        triangles: this.cascadeTris[i],
+      })),
     };
+  }
+
+  /**
+   * Answers "what actually reaches the atlas, and from which cascade" without
+   * a GPU readback.
+   *
+   * The whole bearing-dependency class of bug lives between three predicates —
+   * `visible` at atlas time, `castShadow`, and each cascade's own frustum test —
+   * and every one of them is a CPU-side fact. This replays the exact scene state
+   * the depth passes see (`hideNonCasters` + the alpha binding), walks the graph
+   * the same way three's `projectObject` does, and reports per mesh which
+   * cascades would draw it. A caster that shows here and still throws nothing is
+   * a shading bug; one that does not show is a visibility bug, and the two have
+   * never once had the same fix.
+   */
+  private audit(query?: string): unknown {
+    const l = this.last;
+    if (!l) return null;
+    l.index.hideNonCasters();
+    this.bindAlphaCasters();
+
+    const count = this.cascadeCount;
+    const frustums: THREE.Frustum[] = [];
+    for (let i = 0; i < count; i++) {
+      const cam = this.cascades[i].camera;
+      const f = new THREE.Frustum();
+      f.setFromProjectionMatrix(this.tmpM.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse));
+      frustums.push(f);
+    }
+
+    const perCascade = new Array(count).fill(0);
+    const hits: { name: string; cascades: number[]; instances: number; centre: number[]; radius: number }[] = [];
+    let casters = 0;
+    let hidden = 0;
+    let noCast = 0;
+
+    const walk = (o: THREE.Object3D): void => {
+      if (!o.visible) { hidden++; return; }
+      const mesh = o as THREE.Mesh;
+      if (mesh.isMesh === true) {
+        if (mesh.castShadow !== true) noCast++;
+        else if (l.camera.layers.test(mesh.layers) || mesh.layers.test(this.cascades[0].camera.layers)) {
+          casters++;
+          const inst = mesh as THREE.InstancedMesh;
+          const bs = inst.isInstancedMesh === true
+            ? (inst.boundingSphere ?? (inst.computeBoundingSphere(), inst.boundingSphere))
+            : (mesh.geometry.boundingSphere ?? (mesh.geometry.computeBoundingSphere(), mesh.geometry.boundingSphere));
+          const seen: number[] = [];
+          if (bs) {
+            this.auditSphere.copy(bs).applyMatrix4(mesh.matrixWorld);
+            for (let i = 0; i < count; i++) {
+              const on = mesh.frustumCulled === false || frustums[i].intersectsSphere(this.auditSphere);
+              if (on) { seen.push(i); perCascade[i]++; }
+            }
+          }
+          if (query === undefined || mesh.name.includes(query)) {
+            hits.push({
+              name: mesh.name,
+              cascades: seen,
+              instances: inst.isInstancedMesh === true ? inst.count : 1,
+              centre: [
+                round2(this.auditSphere.center.x),
+                round2(this.auditSphere.center.y),
+                round2(this.auditSphere.center.z),
+              ],
+              radius: round2(this.auditSphere.radius),
+            });
+          }
+        }
+      }
+      const kids = o.children;
+      for (let i = 0; i < kids.length; i++) walk(kids[i]);
+    };
+    walk(l.scene);
+
+    this.unbindAlphaCasters();
+    l.index.restoreNonCasters();
+    return { casters, hidden, noCast, perCascade, drawn: this.cascadeCalls.slice(0, count), hits };
   }
 
   /**

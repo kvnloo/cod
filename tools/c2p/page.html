@@ -1,0 +1,224 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>c2p input path</title>
+<style>html,body{margin:0;padding:0;background:#101014;color:#ddd;font:12px monospace;overflow:hidden}
+canvas{display:block;width:100vw;height:100vh}#hud{position:fixed;top:4px;left:6px;z-index:9}</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="hud">c2p</div>
+<script>
+(() => {
+'use strict';
+const hud = document.getElementById('hud');
+const canvas = document.getElementById('gl');
+canvas.width = innerWidth; canvas.height = innerHeight;
+
+/* ---------------------------------------------------------------- render load */
+const gl = canvas.getContext('webgl2', { antialias:false, powerPreference:'high-performance', desynchronized:false });
+let prog = null, vao = null, uPhase = null;
+if (gl) {
+  const vs = `#version 300 es
+  const vec2 P[3] = vec2[3](vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.));
+  void main(){ gl_Position = vec4(P[gl_VertexID]*0.6, 0., 1.); }`;
+  const fs = `#version 300 es
+  precision highp float; uniform float uPhase; out vec4 o;
+  void main(){ float a=uPhase; for(int i=0;i<48;i++){ a = fract(sin(a*12.9898+float(i))*43758.5453); }
+    o = vec4(a*0.02, 0.01, 0.02, 1.); }`;
+  const mk = (t,s)=>{const sh=gl.createShader(t);gl.shaderSource(sh,s);gl.compileShader(sh);
+    if(!gl.getShaderParameter(sh,gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(sh)); return sh;};
+  prog = gl.createProgram(); gl.attachShader(prog, mk(gl.VERTEX_SHADER,vs)); gl.attachShader(prog, mk(gl.FRAGMENT_SHADER,fs));
+  gl.linkProgram(prog); gl.useProgram(prog); uPhase = gl.getUniformLocation(prog,'uPhase');
+  vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+}
+let drawCalls = 0;
+
+/* ---------------------------------------------------------------- recording */
+let rec = null;
+
+function newRec(opts) {
+  return {
+    opts,
+    ev: [],            // per delivered event
+    frames: [],        // per rAF
+    t0: performance.now(),
+    evSinceFrame: 0,
+    coalSinceFrame: 0,
+    lastRaf: -1,
+  };
+}
+
+// Push one event record. `kind` = 'raw' | 'move' | 'down' | 'up'
+function onEvt(kind, e) {
+  if (!rec) return;
+  const nowAtEntry = performance.now();
+  let coal = null;
+  if (rec.opts.coalesced && typeof e.getCoalescedEvents === 'function') {
+    let ce = [];
+    try { ce = e.getCoalescedEvents(); } catch (_) { ce = []; }
+    coal = { n: ce.length, ts: [], mx: [], my: [] };
+    for (let i = 0; i < ce.length; i++) { coal.ts.push(ce[i].timeStamp); coal.mx.push(ce[i].movementX); coal.my.push(ce[i].movementY); }
+  }
+  let pred = null;
+  if (rec.opts.predicted && typeof e.getPredictedEvents === 'function') {
+    let pe = []; try { pe = e.getPredictedEvents(); } catch (_) { pe = []; }
+    pred = pe.length;
+  }
+  rec.ev.push({
+    k: kind, ts: e.timeStamp, now: nowAtEntry,
+    mx: e.movementX, my: e.movementY, cx: e.clientX, cy: e.clientY,
+    tr: e.isTrusted ? 1 : 0, coal, pred,
+  });
+  rec.evSinceFrame++;
+  if (coal) rec.coalSinceFrame += coal.n;
+}
+
+const handlers = {};
+function bind(target, opts) {
+  unbind();
+  handlers.raw  = (e) => onEvt('raw', e);
+  handlers.move = (e) => onEvt('move', e);
+  handlers.down = (e) => onEvt('down', e);
+  handlers.up   = (e) => onEvt('up', e);
+  handlers.mmove= (e) => onEvt('mmove', e);
+  handlers._t = target;
+  if (opts.raw)   target.addEventListener('pointerrawupdate', handlers.raw, { passive: true });
+  if (opts.move)  target.addEventListener('pointermove', handlers.move, { passive: true });
+  if (opts.mouse) target.addEventListener('mousemove', handlers.mmove, { passive: true });
+  if (opts.click) { target.addEventListener('pointerdown', handlers.down, { passive: true });
+                    target.addEventListener('pointerup', handlers.up, { passive: true }); }
+}
+function unbind() {
+  const t = handlers._t; if (!t) return;
+  t.removeEventListener('pointerrawupdate', handlers.raw);
+  t.removeEventListener('pointermove', handlers.move);
+  t.removeEventListener('mousemove', handlers.mmove);
+  t.removeEventListener('pointerdown', handlers.down);
+  t.removeEventListener('pointerup', handlers.up);
+  handlers._t = null;
+}
+
+/* ---------------------------------------------------------------- rAF loop */
+let rafOn = false;
+function frame(t) {
+  if (!rafOn) return;
+  requestAnimationFrame(frame);
+  const now = performance.now();
+  if (gl && drawCalls > 0) {
+    gl.useProgram(prog); gl.bindVertexArray(vao);
+    for (let i = 0; i < drawCalls; i++) { gl.uniform1f(uPhase, (i + now) * 0.001); gl.drawArrays(gl.TRIANGLES, 0, 3); }
+  }
+  if (rec) {
+    rec.frames.push({ t: t, now, ev: rec.evSinceFrame, coal: rec.coalSinceFrame });
+    rec.evSinceFrame = 0; rec.coalSinceFrame = 0;
+  }
+}
+
+/* ---------------------------------------------------------------- worker */
+let worker = null, workerRes = null;
+function ensureWorker() {
+  if (worker) return worker;
+  const src = `
+    let acc = [];
+    self.onmessage = (e) => {
+      const d = e.data;
+      if (d.cmd === 'reset') { acc = []; self.postMessage({ok:1}); return; }
+      if (d.cmd === 'drain') { const a = acc; acc = []; self.postMessage({drain:a}); return; }
+      if (d.cmd === 'ping')  { self.postMessage({pong: performance.now(), sent: d.sent, org: performance.timeOrigin}); return; }
+      if (d.cmd === 'origin') { self.postMessage({origin: performance.timeOrigin}); return; }
+      acc.push([d.sent, performance.now(), d.ts]);
+    };`;
+  worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+  worker.onmessage = (e) => { if (workerRes) { const r = workerRes; workerRes = null; r(e.data); } };
+  return worker;
+}
+function wcall(msg) { return new Promise((res) => { workerRes = res; ensureWorker().postMessage(msg); }); }
+
+/* ---------------------------------------------------------------- clock probes */
+function clockRes(iter) {
+  // smallest nonzero delta observable from performance.now()
+  let minD = Infinity, n = 0;
+  let prev = performance.now();
+  for (let i = 0; i < iter; i++) {
+    const t = performance.now();
+    const d = t - prev;
+    if (d > 0) { if (d < minD) minD = d; n++; prev = t; }
+  }
+  return { minDeltaMs: minD === Infinity ? null : minD, changes: n, iter };
+}
+
+/* ---------------------------------------------------------------- API */
+const API = {
+  info() {
+    let renderer = 'none';
+    try { const d = gl.getExtension('WEBGL_debug_renderer_info'); renderer = gl.getParameter(d.UNMASKED_RENDERER_WEBGL); } catch (_) {}
+    return {
+      ua: navigator.userAgent,
+      coi: !!self.crossOriginIsolated,
+      sab: typeof SharedArrayBuffer,
+      origin: location.origin,
+      dpr: devicePixelRatio,
+      w: innerWidth, h: innerHeight,
+      renderer,
+      hasRaw: 'onpointerrawupdate' in window,
+      hasCoalesced: typeof PointerEvent.prototype.getCoalescedEvents === 'function',
+      hasPredicted: typeof PointerEvent.prototype.getPredictedEvents === 'function',
+      timeOrigin: performance.timeOrigin,
+      hasHid: !!navigator.hid,
+    };
+  },
+  clockRes,
+  setLoad(n) { drawCalls = n | 0; hud.textContent = 'load=' + drawCalls; return drawCalls; },
+  startRaf() { if (!rafOn) { rafOn = true; requestAnimationFrame(frame); } return true; },
+  stopRaf() { rafOn = false; return true; },
+  async lock(unadjusted) {
+    try {
+      const p = canvas.requestPointerLock({ unadjustedMovement: !!unadjusted });
+      if (p && p.then) await p;
+      else await new Promise((r, j) => { const ok=()=>{cleanup();r()}, bad=()=>{cleanup();j(new Error('pointerlockerror'))};
+        const cleanup=()=>{document.removeEventListener('pointerlockchange',ok);document.removeEventListener('pointerlockerror',bad)};
+        document.addEventListener('pointerlockchange', ok); document.addEventListener('pointerlockerror', bad);
+        setTimeout(bad, 3000); });
+      return { locked: document.pointerLockElement === canvas, err: null };
+    } catch (err) { return { locked: document.pointerLockElement === canvas, err: String(err && err.message || err) }; }
+  },
+  unlock() { document.exitPointerLock(); return true; },
+  isLocked() { return document.pointerLockElement === canvas; },
+  arm(opts) {
+    rec = newRec(Object.assign({ raw: true, move: true, mouse: false, click: false, coalesced: true, predicted: false, target: 'window' }, opts || {}));
+    bind(rec.opts.target === 'canvas' ? canvas : window, rec.opts);
+    return true;
+  },
+  harvest() {
+    unbind();
+    const r = rec; rec = null;
+    if (!r) return null;
+    return { opts: r.opts, ev: r.ev, frames: r.frames, t0: r.t0, tEnd: performance.now() };
+  },
+  // Main-thread -> worker relay. A dedicated worker has its OWN timeOrigin, so
+  // one-way numbers are meaningless unless corrected; report both corrected
+  // one-way and an origin-free round trip.
+  async workerRelay(n) {
+    const o = await wcall({ cmd: 'origin' });
+    const dOrg = o.origin - performance.timeOrigin;   // worker origin - main origin
+    await wcall({ cmd: 'reset' });
+    const w = ensureWorker();
+    for (let i = 0; i < n; i++) w.postMessage({ sent: performance.now(), ts: i });
+    await new Promise(r => setTimeout(r, 120));
+    const d = await wcall({ cmd: 'drain' });
+    const oneWay = d.drain.map((x) => (x[1] + dOrg) - x[0]);
+    const rt = [];
+    for (let i = 0; i < Math.min(n, 800); i++) {
+      const t0 = performance.now();
+      await wcall({ cmd: 'ping', sent: t0 });
+      rt.push(performance.now() - t0);
+    }
+    return { oneWay, rt, dOrg };
+  },
+};
+window.__C2P__ = API;
+window.__C2P_READY__ = true;
+})();
+</script>
+</body>
+</html>

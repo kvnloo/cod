@@ -1,19 +1,33 @@
 /**
  * Fallback combatant simulation.
  *
- * The director talks to actors through `ActorAPI`. When the AI system provides
- * that surface the director uses it and this file never runs. Until then this
- * is a complete, deterministic stand-in: real soldiers with health, line of
- * sight, an approach/engage/reposition state machine, hit resolution against
- * the player's shots, muzzle flashes and tracers — enough that every mode,
- * objective and killstreak can be played and screenshotted for real.
+ * The director talks to actors through `ActorAPI`. `src/ai/` is now wired to
+ * that surface (`AIActorBridge` in `Services.ts`), so in the shipping game this
+ * file is never constructed. It survives for the case it was always meant for:
+ * a build with no AI module registered at all — headless game tests, a stripped
+ * bundle, a debug scene that wants bodies without a tactical stack.
  *
  * It is deliberately self-contained:
  *   • one `InstancedMesh` for every body → a single draw call for the crowd
  *   • no `Math.random`, no per-frame allocation
  *   • damage to the player goes out as `damage:taken` on the bus, which is
- *     exactly what the real AI will emit, so nothing downstream can tell the
+ *     exactly what the real AI emits, so nothing downstream can tell the
  *     difference.
+ *
+ * ## No coin flip
+ *
+ * This used to decide whether you were hit with `rng.bool(chance)`. That is the
+ * single worst thing a shooter can do: it makes cover, range, movement and
+ * stance all cosmetic, and it is why an enemy could shoot at you for a minute
+ * without killing you and then kill you for no visible reason.
+ *
+ * Every round now leaves the barrel along a real direction and is traced with
+ * `MASK_BULLET` — the same collider set the player's own rounds resolve
+ * against. Whether it hits is decided by where the muzzle was pointing, what
+ * was in the way, and which part of the body the line passed through. The
+ * *skill* knobs are where they belong: a reaction delay before the first shot,
+ * an aim cone that starts wide and converges while the shooter tracks you, and
+ * deliberate opening misses so the fight has a readable first beat.
  */
 
 import * as THREE from 'three';
@@ -33,6 +47,36 @@ const MAX_BOTS_BY_PRESET: Record<string, number> = {
 
 const TRACERS = 48;
 const CORPSE_LINGER = 14;
+
+/**
+ * Fire-control constants, mirroring `src/ai/Combat.ts` so the two backends feel
+ * like the same enemy.
+ *
+ * `reaction*` is the gap between acquiring line of sight and the first round.
+ * CoD campaign AI sits around 300-500 ms on Regular; below ~200 ms an enemy
+ * appearing from cover is an unavoidable death.
+ */
+const FIRE = {
+  reactionMin: 0.34,
+  reactionMax: 0.62,
+  /** Aim cone at the moment of acquisition, radians. ~4.9° */
+  aimErrorStart: 0.085,
+  /** Time constant of the exponential convergence toward the floor, seconds. */
+  aimConverge: 1.7,
+  /** Tightest cone a perfectly-accurate archetype ever reaches, radians. */
+  aimFloorBest: 0.006,
+  /** Widest floor, for the sloppiest archetype. */
+  aimFloorWorst: 0.030,
+  /** Opening rounds of an engagement thrown deliberately wide. */
+  missFirstShots: 2,
+  /** Damage falls off linearly past the archetype's range, down to this. */
+  falloffFloor: 0.4,
+  /** Per-zone damage multipliers. */
+  zone: { head: 2.2, neck: 1.7, chest: 1, stomach: 0.9, arm: 0.7, leg: 0.7, none: 1 },
+} as const;
+
+/** The player capsule, as the fallback sim models it. Matches `TUNING` in Movement. */
+const PLAYER_BODY = { height: 1.8, radius: 0.4 } as const;
 
 /** Colour groups for the stand-in bodies. */
 type BodyGroup = 'hostile' | 'elite' | 'friendly' | 'dead';
@@ -61,6 +105,7 @@ interface Bot {
   yaw: number;
   health: number;
   maxHealth: number;
+  /** 0..1 marksmanship. Drives the aim cone floor — never a hit probability. */
   accuracy: number;
   aggression: number;
   speed: number;
@@ -71,6 +116,20 @@ interface Bot {
   fireTimer: number;
   burstLeft: number;
   burstCooldown: number;
+  /** Seconds left before this engagement's first round may leave the barrel. */
+  reactionTimer: number;
+  /** True once the reaction has elapsed for the current engagement. */
+  ready: boolean;
+  /** Current angular aim error, radians. Converges while the target is held. */
+  aimError: number;
+  /** Rounds fired since this engagement began — drives the opening misses. */
+  engagementShots: number;
+  /** Slow random walk so successive rounds group instead of scattering. */
+  errorPhase: number;
+  errorYaw: number;
+  errorPitch: number;
+  shotsFired: number;
+  shotsHit: number;
   state: 'advance' | 'engage' | 'reposition' | 'dead';
   stateTimer: number;
   losTimer: number;
@@ -89,7 +148,13 @@ interface Bot {
 export class BotFallback implements ActorAPI {
   private bots: Bot[] = [];
   private byId = new Map<number, Bot>();
-  private nextId = 1000;
+  /**
+   * Entity ids start well clear of `Agent.entityId`, which is `1000 + agentId`.
+   * The two backends are mutually exclusive today, but a debug scene that
+   * spawns AI agents alongside a forced fallback would otherwise alias two
+   * different combatants onto the same id and route damage to the wrong one.
+   */
+  private nextId = 5000;
   private accuracyScale = 1;
   private combatEnabled = true;
 
@@ -200,6 +265,15 @@ export class BotFallback implements ActorAPI {
       fireTimer: this.rng.range(0.3, 1.2),
       burstLeft: 0,
       burstCooldown: this.rng.range(0.2, 0.8),
+      reactionTimer: -1,
+      ready: false,
+      aimError: FIRE.aimErrorStart,
+      engagementShots: 0,
+      errorPhase: this.rng.range(0, 6.28),
+      errorYaw: 0,
+      errorPitch: 0,
+      shotsFired: 0,
+      shotsHit: 0,
       state: 'advance',
       stateTimer: 0,
       losTimer: this.rng.range(0, 0.25),
@@ -363,9 +437,18 @@ export class BotFallback implements ActorAPI {
       if (b.losTimer <= 0) {
         b.losTimer = 0.22 + (b.phase * 0.03);
         this._a.copy(b.position); this._a.y += b.muzzleHeight;
-        this._b.copy(targetPos); this._b.y += 1.35;
+        // Chest height on whatever we are looking at. The player's `position`
+        // is the capsule *centre*, not the feet, so this used to aim a third of
+        // a metre over his head — invisible while hits were a coin flip, fatal
+        // to the shot once they stopped being one.
+        this._b.copy(targetPos);
+        this._b.y += targetIsPlayer ? 0.12 : 1.2;
+        const had = b.hasLos;
         b.hasLos = physics?.ready ? physics.lineOfSight(this._a, this._b, MASK_SIGHT) : dist < 70;
+        if (b.hasLos && !had) this.beginEngagement(b);
+        else if (!b.hasLos && had) { b.ready = false; b.reactionTimer = -1; }
       }
+      this.stepAim(b, dt);
 
       /* --- state machine --- */
       b.stateTimer -= dt;
@@ -434,7 +517,45 @@ export class BotFallback implements ActorAPI {
     b.yaw += dt * 0.25;
   }
 
+  /**
+   * Starts the clock on a fresh engagement.
+   *
+   * This is the beat the player needs: the enemy has seen you, but the first
+   * round is still `reaction` seconds away, and the ones after it open wide.
+   */
+  private beginEngagement(b: Bot): void {
+    b.ready = false;
+    b.reactionTimer = this.rng.range(FIRE.reactionMin, FIRE.reactionMax)
+      / Math.max(0.35, this.accuracyScale);
+    b.aimError = FIRE.aimErrorStart;
+    b.engagementShots = 0;
+    b.burstLeft = 0;
+  }
+
+  /**
+   * Converges the aim cone while the shooter holds the target, and relaxes it
+   * back out when he loses it. This is the whole difficulty curve: standing in
+   * the open is survivable for a moment and *staying* there is not.
+   */
+  private stepAim(b: Bot, dt: number): void {
+    if (b.hasLos && b.ready) {
+      const floor = THREE.MathUtils.lerp(
+        FIRE.aimFloorWorst, FIRE.aimFloorBest, THREE.MathUtils.clamp(b.accuracy / 0.45, 0, 1),
+      ) / Math.max(0.35, this.accuracyScale);
+      b.aimError += (floor - b.aimError) * (1 - Math.exp(-dt / FIRE.aimConverge));
+    } else {
+      b.aimError = Math.min(FIRE.aimErrorStart, b.aimError + dt * 0.05);
+    }
+    b.errorPhase += dt * 2.7;
+  }
+
   private stepFiring(b: Bot, dt: number, target: THREE.Vector3, dist: number, targetIsPlayer: boolean): void {
+    if (!b.ready) {
+      if (b.reactionTimer < 0) this.beginEngagement(b);
+      b.reactionTimer -= dt;
+      if (b.reactionTimer > 0) return;
+      b.ready = true;
+    }
     if (b.burstCooldown > 0) { b.burstCooldown -= dt; return; }
     if (b.burstLeft <= 0) {
       b.burstLeft = burstSizeFor(b.archetype, this.rng);
@@ -445,17 +566,46 @@ export class BotFallback implements ActorAPI {
 
     b.fireTimer = b.fireInterval;
     b.burstLeft--;
+    b.engagementShots++;
+    b.shotsFired++;
     if (b.burstLeft <= 0) b.burstCooldown = this.rng.range(0.55, 1.6) / (0.6 + b.aggression * 0.6);
 
-    /* origin + aim */
+    /* --- origin ---------------------------------------------------------- */
     this._a.copy(b.position); this._a.y += b.muzzleHeight;
-    this._b.copy(target); this._b.y += 1.15;
-    this._b.sub(this._a);
-    const range = this._b.length();
-    if (range < 0.01) return;
-    this._b.multiplyScalar(1 / range);
 
-    bus.emit('ai:fire', { id: b.id, origin: this._a.clone(), direction: this._b.clone() });
+    /* --- aim point: centre mass, or deliberately past it on the opening --- */
+    this._b.copy(target);
+    this._b.y += targetIsPlayer ? 0.05 : 1.15;
+    if (b.engagementShots <= FIRE.missFirstShots) {
+      this._c.copy(this._b).sub(this._a);
+      this._c.y = 0;
+      if (this._c.lengthSq() > 1e-6) {
+        this._c.normalize();
+        const side = this.rng.bool() ? 1 : -1;
+        this._b.x += this._c.z * side * this.rng.range(0.55, 1.45);
+        this._b.z += -this._c.x * side * this.rng.range(0.55, 1.45);
+        this._b.y += this.rng.range(0.35, 1.1);
+      }
+    }
+
+    /* --- aim error: a converging cone, wobbled by a slow random walk so the
+       rounds land as a group rather than as noise ------------------------- */
+    const lead = THREE.MathUtils.clamp(this.accuracyScale, 0.35, 2);
+    const cone = b.aimError / lead;
+    b.errorYaw += (Math.sin(b.errorPhase * 1.7) * 0.6 + this.rng.signed() * 0.4 - b.errorYaw) * 0.1;
+    b.errorPitch += (Math.cos(b.errorPhase * 1.3) * 0.5 + this.rng.signed() * 0.4 - b.errorPitch) * 0.1;
+
+    this._d.copy(this._b).sub(this._a);
+    const range = this._d.length();
+    if (range < 0.01) return;
+    this._d.multiplyScalar(1 / range);
+    const cy = Math.cos(b.errorYaw * cone);
+    const sy = Math.sin(b.errorYaw * cone);
+    const dx = this._d.x * cy + this._d.z * sy;
+    const dz = -this._d.x * sy + this._d.z * cy;
+    this._d.set(dx, this._d.y + b.errorPitch * cone, dz).normalize();
+
+    bus.emit('ai:fire', { id: b.id, origin: this._a.clone(), direction: this._d.clone() });
     b.char?.play('fire', { fade: 0.04 });
     b.char?.addRecoil(0.7);
     this.services.render?.addDynamicLight({
@@ -463,46 +613,88 @@ export class BotFallback implements ActorAPI {
       radius: 5.5, lifetime: 0.05, decay: 'flash',
     });
 
-    /* hit roll — falloff past the archetype's comfortable range */
-    const falloff = THREE.MathUtils.clamp(1 - (dist - b.range * 0.4) / (b.range * 1.6), 0.12, 1);
-    const chance = THREE.MathUtils.clamp(b.accuracy * this.accuracyScale * falloff, 0.02, 0.94);
-    const hit = this.rng.bool(chance);
+    this.resolveBotShot(b, target, dist, targetIsPlayer);
+  }
 
-    if (hit && targetIsPlayer) {
-      const dmg = b.damage * this.rng.range(0.85, 1.15);
-      this._c.copy(this._b).negate();
-      bus.emit('damage:taken', {
-        amount: dmg, fromDirection: this._c.clone(), sourceId: b.id, lethal: false,
-      });
-      this.spawnTracer(this._a, this._b, dist);
-      return;
-    }
-    if (hit && !targetIsPlayer) {
-      const victim = this.nearest(target, b.team === 'hostile' ? 'friendly' : 'hostile', 2.5);
-      if (victim >= 0) this.damageCombatant(victim, b.damage, { direction: this._b, fromPlayer: false, source: 'ai' });
-      this.spawnTracer(this._a, this._b, dist);
-      return;
-    }
-
-    /* a miss still needs to hit *something* so impacts read on the wall behind */
+  /**
+   * Traces one round. `this._a` is the muzzle and `this._d` the direction; both
+   * are already set by the caller.
+   *
+   * World geometry wins over the target — a round that clips the corner the
+   * shooter is peeking around hits the corner — because the trace uses
+   * `MASK_BULLET`, the same collider set the player's rounds use.
+   */
+  private resolveBotShot(b: Bot, target: THREE.Vector3, dist: number, targetIsPlayer: boolean): void {
     const physics = this.services.physics;
-    this._d.copy(this._b);
-    this._d.x += this.rng.range(-0.05, 0.05);
-    this._d.y += this.rng.range(-0.03, 0.05);
-    this._d.z += this.rng.range(-0.05, 0.05);
-    this._d.normalize();
+    const maxRange = Math.max(40, b.range * 2.2);
+
+    // Target capsule. The player's `position` is his capsule centre; a bot's is
+    // his feet, so each gets its own base.
+    const height = targetIsPlayer ? PLAYER_BODY.height : 1.8;
+    const radius = targetIsPlayer ? PLAYER_BODY.radius : 0.4;
+    const base = targetIsPlayer ? target.y - height * 0.5 : target.y;
+    _capA.set(target.x, base + radius, target.z);
+    _capB.set(target.x, base + height - radius, target.z);
+    const capT = rayCapsule(this._a, this._d, _capA, _capB, radius);
+
+    let worldDist = maxRange;
+    let worldHit = false;
     if (physics?.ready) {
-      const h = physics.raycast(this._a, this._d, 120, MASK_BULLET, this.ray, b.id);
-      if (h.hit) {
+      const h = physics.raycast(this._a, this._d, maxRange, MASK_BULLET, this.ray, b.id);
+      if (h.hit) { worldHit = true; worldDist = h.distance; }
+    }
+
+    const hitTarget = capT >= 0 && capT < worldDist + 0.05;
+    if (!hitTarget) {
+      if (worldHit) {
         bus.emit('bullet:impact', {
-          point: h.point.clone(), normal: h.normal.clone(), surface: h.surface,
+          point: this.ray.point.clone(), normal: this.ray.normal.clone(), surface: this.ray.surface,
           incoming: this._d.clone(), energy: 900, penetrated: false,
         });
-        this.spawnTracer(this._a, this._d, h.distance);
-        return;
+        this.spawnTracer(this._a, this._d, this.ray.distance);
+      } else {
+        this.spawnTracer(this._a, this._d, Math.min(90, dist * 1.4));
       }
+      return;
     }
-    this.spawnTracer(this._a, this._d, Math.min(90, dist * 1.4));
+
+    /* --- a hit. Which part of him, and how much does it cost -------------- */
+    b.shotsHit++;
+    this._c.copy(this._d).multiplyScalar(capT).add(this._a);
+    const frac = THREE.MathUtils.clamp((this._c.y - base) / Math.max(0.4, height), 0, 1);
+    const zone: keyof typeof FIRE.zone = frac > 0.88 ? 'head'
+      : frac > 0.72 ? 'neck'
+        : frac > 0.48 ? 'chest'
+          : frac > 0.34 ? 'stomach' : 'leg';
+    // Linear falloff past the archetype's comfortable range, floored so a long
+    // shot still stings.
+    const over = Math.max(0, dist - b.range);
+    const falloff = THREE.MathUtils.clamp(
+      1 - (over / Math.max(1, b.range)) * (1 - FIRE.falloffFloor), FIRE.falloffFloor, 1,
+    );
+    const dmg = b.damage * FIRE.zone[zone] * falloff;
+
+    this.spawnTracer(this._a, this._d, capT);
+    if (targetIsPlayer) {
+      bus.emit('bullet:impact', {
+        point: this._c.clone(), normal: this._d.clone().negate(),
+        surface: zone === 'head' ? 'helmet' : 'flesh',
+        incoming: this._d.clone(), energy: dmg * 22, penetrated: false,
+      });
+      bus.emit('damage:taken', {
+        amount: dmg,
+        fromDirection: this._c.copy(this._d).negate().clone(),
+        sourceId: b.id, lethal: false,
+      });
+      return;
+    }
+    const victim = this.nearest(target, b.team === 'hostile' ? 'friendly' : 'hostile', 2.5);
+    if (victim >= 0) {
+      this.damageCombatant(victim, dmg, {
+        headshot: zone === 'head', point: this._c, direction: this._d,
+        fromPlayer: false, source: 'ai',
+      });
+    }
   }
 
   /* ------------------------------------------------------------- damage -- */
@@ -758,6 +950,8 @@ function approachAngle(current: number, target: number, t: number): number {
 const _ab = new THREE.Vector3();
 const _ao = new THREE.Vector3();
 const _tmp = new THREE.Vector3();
+const _capA = new THREE.Vector3();
+const _capB = new THREE.Vector3();
 function rayCapsule(
   ro: THREE.Vector3, rd: THREE.Vector3,
   a: THREE.Vector3, b: THREE.Vector3, radius: number,

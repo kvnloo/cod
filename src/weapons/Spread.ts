@@ -37,22 +37,34 @@ export class SpreadState {
 
   reset(): void { this.bloom = 0; this.burst = 0; this.sinceShot = 999; }
 
-  tick(dt: number, p: SpreadProfile): void {
+  /**
+   * `holdTime` is how long after a shot bloom stops growing but has not yet
+   * started to decay — it must be at least one refire interval, or the decay
+   * runs *between* rounds of sustained fire and the gun gets more accurate the
+   * longer you hold the trigger. The old fixed 0.06 s was shorter than a 720 rpm
+   * cycle (0.083 s), so bloom was effectively dead code on every automatic
+   * weapon in the catalogue: 0.10°/shot of growth against 0.093°/shot of decay.
+   * The weapon system passes `refireInterval × 1.35`.
+   */
+  tick(dt: number, p: SpreadProfile, holdTime = 0.06): void {
     this.sinceShot += dt;
-    if (this.bloom > 0) {
-      // Bloom holds briefly then decays, so tap-firing recovers and holding
-      // the trigger does not.
-      const hold = 0.06;
-      if (this.sinceShot > hold) this.bloom = Math.max(0, this.bloom - p.bloomDecay * dt);
+    if (this.bloom > 0 && this.sinceShot > holdTime) {
+      this.bloom = Math.max(0, this.bloom - p.bloomDecay * dt);
     }
     if (this.sinceShot > 0.35) this.burst = 0;
   }
 
+  /**
+   * Bloom accumulates the same amount whatever the stance; `bloomAdsScale` is
+   * applied where it belongs, at the point bloom reaches the *cone* (see
+   * `cone`). Scaling it on the way in instead meant a magazine that started
+   * hip-fired and finished aimed carried hip-sized bloom into the sights, and
+   * one that did the reverse was rewarded for it.
+   */
   onShot(p: SpreadProfile, ctx: SpreadContext): void {
     this.sinceShot = 0;
     this.burst++;
-    const add = p.bloomPerShot * ctx.bloomScale * (ctx.ads > 0.5 ? p.bloomAdsScale : 1);
-    this.bloom = Math.min(p.bloomMax, this.bloom + add);
+    this.bloom = Math.min(p.bloomMax, this.bloom + p.bloomPerShot * ctx.bloomScale);
   }
 
   /** Cone half-angle in degrees for the next shot. */
@@ -68,7 +80,10 @@ export class SpreadState {
     if (ctx.prone) s *= p.crouchScale * 0.8;
     else if (ctx.crouched) s *= p.crouchScale;
 
-    s += this.bloom;
+    // Aiming suppresses bloom rather than preventing it: a good gun barely
+    // blooms down the sights (0.35× on the rifles) but a 30-round burst still
+    // opens up, which is what makes controlled pairs beat holding the trigger.
+    s += this.bloom * (1 - ctx.ads * (1 - p.bloomAdsScale));
 
     // First-shot accuracy: settled, aimed, stationary and not mid-burst.
     if (

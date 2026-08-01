@@ -64,6 +64,13 @@ export const AGENT = {
   health: 100,
 } as const;
 
+/**
+ * How long a man will keep his head up when he is the squad's only gun. Long
+ * enough that the player never gets a free lull, short enough that holding the
+ * angle stays a decision with a cost.
+ */
+const MAX_SOLO_EXPOSURE = 4.0;
+
 export type MoveMode = 'walk' | 'combat' | 'sprint' | 'crouch';
 export type FireMode = 'hold' | 'aimed' | 'suppress';
 
@@ -77,6 +84,8 @@ const _fwd = new THREE.Vector3();
 const _right = new THREE.Vector3();
 const _hit: RayHit = makeHit();
 const _shot: ShotResult = makeShotResult();
+/** Reused neighbour list for the avoidance sampler; never escapes `avoid`. */
+const _neighbours: Agent[] = [];
 
 /** What the agent needs from the owning system. */
 export interface AgentHost {
@@ -127,6 +136,15 @@ export class Agent {
   alive = true;
   health: number = AGENT.health;
   maxHealth: number = AGENT.health;
+  /**
+   * Weapons-free. The match layer holds this low through warmup, intermission
+   * and the post-match beat, exactly like `ActorAPI.setCombatEnabled` promises.
+   * Everything else — perception, movement, callouts — keeps running, so the
+   * level does not look like a freeze-frame.
+   */
+  combatEnabled = true;
+  /** Staging helper: holds the agent exactly where it was placed. */
+  frozen = false;
   readonly position = new THREE.Vector3();
   readonly velocity = new THREE.Vector3();
   readonly eye = new THREE.Vector3();
@@ -184,6 +202,8 @@ export class Agent {
   private peekTarget = 0;
   private peekPhase: 'hidden' | 'out' = 'hidden';
   private peekTimer = 0;
+  /** Seconds this agent has been leaning out of cover on the current peek. */
+  private exposureTimer = 0;
   private coverEvalTimer = 0;
   coverCompromised = false;
   exposedToTarget = false;
@@ -294,6 +314,19 @@ export class Agent {
     this.combat.setProfile(this.profile);
   }
 
+  /**
+   * The director's per-spawn aggression scalar.
+   *
+   * `DIFFICULTY[...]` hands out a *shared* object; writing to it would retune
+   * every agent in the level, so the first override forks a private copy.
+   */
+  setAggression(aggression: number): void {
+    if (!Number.isFinite(aggression)) return;
+    if (this.profile === DIFFICULTY[this.difficulty]) this.profile = { ...this.profile };
+    this.profile.aggression = clamp01(aggression);
+    this.combat.setProfile(this.profile);
+  }
+
   /* ------------------------------------------------------------ accessors -- */
 
   get now(): number { return this.host.now; }
@@ -319,6 +352,7 @@ export class Agent {
 
   fixedUpdate(dt: number): void {
     if (!this.alive) return;
+    if (this.frozen) { this.updateBasis(); return; }
     const now = this.now;
 
     this.updateBasis();
@@ -418,6 +452,41 @@ export class Agent {
         bus.emit('ai:alert', { id: this.id, level: ALERT_LEVEL.combat });
       }
     }
+  }
+
+  /**
+   * A soft prior: "there is a fight, roughly over there."
+   *
+   * A reinforcement walking into a firefight is not a sleeping guard, and the
+   * failure this fixes is ugly: an agent dropped in facing away from the player
+   * sits permanently outside his own 130° vision cone, never fills the
+   * awareness meter, and stands in a corner while you shoot his squad. That is
+   * a large part of what "the enemies don't engage" feels like.
+   *
+   * Deliberately *not* `alertTo`: awareness goes to merely suspicious, not
+   * weapons-hot. He still has to see you with his own eyes to enter combat, and
+   * he still pays the full reaction time, so the opening beat stays readable.
+   *
+   * The authored facing is respected when it already points within 90° of the
+   * threat — a designer who aimed a guard at a doorway keeps his guard.
+   */
+  noticeThreat(position: THREE.Vector3, awareness = 0.30): void {
+    const p = this.perception;
+    p.interest.copy(position);
+    p.hasInterest = true;
+    p.awareness = Math.max(p.awareness, clamp01(awareness));
+    p.timeSinceStimulus = 0;
+
+    _v0.copy(position).sub(this.position);
+    _v0.y = 0;
+    if (_v0.lengthSq() < 1e-4) return;
+    const want = Math.atan2(_v0.x, _v0.z);
+    if (Math.abs(angleDelta(this.bodyYaw, want)) < Math.PI * 0.5) return;
+    this.bodyYaw = want;
+    this.spawnYaw = want;
+    this.updateBasis();
+    this.aimPoint.copy(this.eye).addScaledVector(this.forward, 8);
+    this.aimSmoothed.copy(this.aimPoint);
   }
 
   /** External alert (damage, squadmate call, scripted trigger). */
@@ -654,6 +723,23 @@ export class Agent {
     let bestScore = -Infinity;
     _v3.copy(desired);
 
+    /*
+     * Gather the neighbours once instead of re-filtering the whole roster
+     * inside every candidate. The old loop was O(candidates × agents) per fixed
+     * step — 12 × N × 120 Hz — even though in practice nobody is inside
+     * `avoidRadius`. Same agents, same order, so the score sum is unchanged.
+     */
+    const near = _neighbours;
+    near.length = 0;
+    const rad2 = AGENT.avoidRadius * AGENT.avoidRadius;
+    for (const other of agents) {
+      if (other === this || !other.alive) continue;
+      _v1.copy(other.position).sub(this.position);
+      _v1.y = 0;
+      if (_v1.lengthSq() > rad2) continue;
+      near.push(other);
+    }
+
     for (let c = 0; c < CANDIDATES.length; c++) {
       const [angle, scale] = CANDIDATES[c];
       _v0.copy(desired).multiplyScalar(scale);
@@ -662,12 +748,9 @@ export class Agent {
       // Penalty for deviating from what we wanted.
       let score = -Math.abs(angle) * 0.55 - (1 - scale) * 0.9;
 
-      for (const other of agents) {
-        if (other === this || !other.alive) continue;
+      for (const other of near) {
         _v1.copy(other.position).sub(this.position);
         _v1.y = 0;
-        const distSq = _v1.lengthSq();
-        if (distSq > AGENT.avoidRadius * AGENT.avoidRadius) continue;
         _v2.copy(_v0).sub(other.velocity);
         _v2.y = 0;
         const tc = timeToCollision(_v1, _v2, r * 2 + 0.1);
@@ -897,7 +980,7 @@ export class Agent {
   private updateFiring(dt: number): void {
     void dt;
     const t = this.target;
-    if (!t || this.fireMode === 'hold' || !this.alive) {
+    if (!t || this.fireMode === 'hold' || !this.alive || !this.combatEnabled) {
       this.combat.firing = false;
       return;
     }
@@ -918,7 +1001,7 @@ export class Agent {
     const suppressive = this.fireMode === 'suppress';
     this.combat.tryFire(
       this.now, this.muzzle, t, this.distanceToTarget, this.host.physics,
-      this.id, suppressive, this.aimSmoothed, _shot,
+      this.id, suppressive, this.aimSmoothed, _shot, this.entityId,
     );
     if (_shot.fired) {
       this.character?.play('fire');
@@ -1030,18 +1113,38 @@ export class Agent {
     const c = this.currentCover;
     if (!c) { this.setFireMode(this.canEngage ? 'aimed' : 'hold'); return; }
     this.peekTimer -= dt;
+    this.exposureTimer = this.peekPhase === 'out' ? this.exposureTimer + dt : 0;
 
     const wantHide = this.combat.reloading
       || this.combat.suppression > 0.62
       || this.combat.needsReload
       || !this.combat.ready;
 
+    /*
+     * Base of fire.
+     *
+     * A squad whose peek cycles happen to line up all duck at the same moment,
+     * and the player gets long stretches with nothing coming at him — which is
+     * how a cover-based AI ends up reading as passive even though every
+     * individual is behaving correctly. Somebody keeps a gun up: if nobody else
+     * in the squad can currently shoot, this man does not drop back on the
+     * timer, only when he genuinely has to (reloading, suppressed, not ready).
+     *
+     * `MAX_SOLO_EXPOSURE` stops that turning into a statue standing in the
+     * open — he is still a man you can push and kill.
+     */
+    const others = this.squad ? this.squad.gunsOn - (this.canEngage ? 1 : 0) : 0;
+    const soleGun = others < 1;
+
     if (this.peekPhase === 'hidden') {
       this.setFireMode('hold');
       this.setStance(c.height === 'low' ? 'crouch' : 'stand');
       this.peekTarget = 0;
+      // Nobody covering: skip the dwell and get rounds going out now.
+      if (soleGun && this.peekTimer > 0) this.peekTimer = 0;
       if (!wantHide && this.peekTimer <= 0 && this.perception.confidence > 0.2) {
         this.peekPhase = 'out';
+        this.exposureTimer = 0;
         this.peekTimer = 0.9 + this.rand.next() * 1.3;
         // Alternate sides sometimes so the player cannot pre-aim one corner.
         if (this.rand.next() < 0.3 && this.peekSide !== 0) this.peekSide = (-this.peekSide) as -1 | 1;
@@ -1053,8 +1156,11 @@ export class Agent {
       this.setFireMode(this.perception.hasLOS ? 'aimed' : 'suppress');
       this.aimAtTarget();
       const burstDone = this.combat.burstLeft <= 0 && this.now < this.combat.nextBurstAt;
-      if (wantHide || this.peekTimer <= 0 || burstDone) {
+      const timeUp = this.peekTimer <= 0 || burstDone;
+      const overstayed = this.exposureTimer > MAX_SOLO_EXPOSURE;
+      if (wantHide || overstayed || (timeUp && !soleGun)) {
         this.peekPhase = 'hidden';
+        this.exposureTimer = 0;
         this.peekTimer = 0.35 + this.rand.next() * 0.75;
         this.character?.play(c.height === 'low' ? 'coverLow' : 'coverHigh');
       }
@@ -1174,11 +1280,45 @@ export class Agent {
 
   /* -------------------------------------------------------------- damage -- */
 
+  /**
+   * One-shot receipt for a hit that has *already* been applied by whoever owns
+   * damage arbitration (the game layer's actor bridge, driven by the weapon
+   * system's `DamageResolver`).
+   *
+   * `Ballistics.resolveImpact` calls the resolver and then publishes
+   * `damage:dealt` on the same synchronous call stack; `AISystem` listens to
+   * that event and would apply the identical hit a second time. Arming the
+   * claim immediately after applying means the echo lands on a token that
+   * matches, is swallowed, and the token is gone before anything else can use
+   * it. Nothing about the ordinary bus path changes when no resolver is
+   * installed — the token is simply never armed.
+   */
+  private claimAmount = 0;
+  private claimArmed = false;
+  private claimKilled = false;
+
+  claimBusEcho(amount: number, killed: boolean): void {
+    this.claimAmount = amount;
+    this.claimKilled = killed;
+    this.claimArmed = true;
+  }
+
+  private consumeBusEcho(amount: number): boolean {
+    if (!this.claimArmed) return false;
+    // Float-exact would be fine (it is the same number round-tripped through a
+    // struct) but a relative epsilon costs nothing and survives a future
+    // rounding step in the event payload.
+    if (Math.abs(amount - this.claimAmount) > Math.max(1e-6, this.claimAmount * 1e-6)) return false;
+    this.claimArmed = false;
+    return true;
+  }
+
   /** Applies damage from the outside world. Returns true when it killed. */
   applyDamage(
     amount: number, fromDirection: THREE.Vector3, zone: HitZone, byPlayer: boolean,
     point?: THREE.Vector3,
   ): boolean {
+    if (this.consumeBusEcho(amount)) return this.claimKilled;
     if (!this.alive) return false;
     this.health -= amount;
 

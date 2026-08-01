@@ -32,8 +32,51 @@ import { LightPool } from './LightPool';
 import { DecalSystem } from './Decals';
 import { bakeDecalAtlas, type DecalAtlasTextures } from './DecalAtlas';
 import { registerRenderDebugScene } from './DebugScene';
+import { FrameBudget } from '../fx/Budget';
 
 /* ------------------------------------------------------------- constants -- */
+
+/**
+ * Read once, at module scope, because `get renderer()` can be reached before
+ * `init()` — the material and world systems generate GPU textures during their
+ * own boot, which forces the context into existence early. The two context
+ * attributes below have to be decided at creation time and cannot be changed
+ * afterwards, so they cannot wait for `init()`.
+ */
+const CAPTURE_MODE = new URLSearchParams(globalThis.location?.search ?? '').get('capture') === '1';
+
+/**
+ * Hard ceiling on how long a mesh may be held back for shader warm-up.
+ *
+ * This is a fairness bound, not a performance one: an enemy nobody can see is
+ * an enemy who can still shoot. Three frames is ~50 ms at 60 Hz and ~25 ms at
+ * 120 Hz, which is under a single fixed step of reaction time either way.
+ */
+const WARMUP_MAX_FRAMES = 3;
+
+/**
+ * Ceiling on `compileAsync` calls issued in one frame.
+ *
+ * three's `compile()` walks the *whole* target scene to gather lights before it
+ * touches the object it was asked about, so N calls in a frame is N full scene
+ * traversals. Level load presents ~500 new materials at once; without this cap
+ * the warm-up would itself be the biggest hitch in the session. Meshes over the
+ * cap are still parked and simply release on the frame bound instead.
+ */
+const WARMUP_COMPILES_PER_FRAME = 4;
+
+/**
+ * Layer used to park a mesh while its shaders warm.
+ *
+ * `Object3D.layers` is chosen over `Object3D.visible` deliberately. Visibility
+ * is owned by gameplay — culling, spawn state, gibbing all write it — so a
+ * renderer that flips it back on has no way to know whether it is undoing its
+ * own change or someone else's. Layers are a rendering concern that nothing
+ * outside `src/render/` touches, and no camera in this engine enables bit 31:
+ * the world masks are built from `LAYERS` (bits 0–5) and three's cameras default
+ * to bit 0 alone.
+ */
+const LAYER_WARMING = 31;
 
 const MASK_WORLD_OPAQUE = (1 << LAYERS.DEFAULT) | (1 << LAYERS.NO_REFLECT) | (1 << LAYERS.BACKDROP);
 const MASK_WORLD_ALL = MASK_WORLD_OPAQUE | (1 << LAYERS.TRANSPARENT) | (1 << LAYERS.MARKER);
@@ -167,6 +210,49 @@ export class RenderSystem implements System, RenderAPI {
   private atlas: { textures: DecalAtlasTextures; dispose(): void } | null = null;
   private captureMode = false;
 
+  /**
+   * Adaptive quality governor. Holds the preset's `targetFrameMs` as a p90 by
+   * walking a ladder of concessions; see `src/fx/Budget.ts` for the ladder and
+   * the measurements that ordered it. Disabled in capture mode.
+   */
+  readonly budget = new FrameBudget();
+
+  /* --- update cadences ---------------------------------------------------
+   * The shadow atlas and the auto-exposure chain are the two things in the
+   * frame that do not need to run at display rate. Both accumulate real time
+   * and fire on their own clock, so their cost per second is fixed no matter
+   * what the frame rate does — which is the property that matters, because
+   * the frames that need help are exactly the slow ones. */
+  private shadowClock = 0;
+  private shadowDue = true;
+  private exposureClock = 0;
+  /** Wall seconds since the last exposure metering; handed to eye adaptation. */
+  private exposureAccum = 0;
+  private lastShadowMs = 0;
+  private lastExposureMs = 0;
+
+  /* --- first-draw warm-up ------------------------------------------------
+   * three compiles a program and uploads a geometry's buffers the first time
+   * it draws them, inside the draw call, synchronously. In a level where every
+   * mesh exists at boot that is a load-time cost and nobody notices. In a
+   * shooter where enemies spawn during play it is a freeze, and it was measured
+   * as one: 138 ms on the frame the first combatant became visible, then 50–59
+   * ms again on each of the next three, all of it inside `renderer.render`.
+   *
+   * So a mesh whose material this renderer has never drawn is held out of the
+   * colour pass for a few frames while `compileAsync` gives the driver a head
+   * start. The cost is that a newly spawned character can pop in up to
+   * `WARMUP_MAX_FRAMES` late; the alternative is that everyone's frame stops
+   * dead instead. Shipping engines make the same trade.
+   */
+  private warmSeen = new WeakSet<THREE.Material>();
+  private warming: { mesh: THREE.Object3D; mask: number; frames: number; ready: boolean }[] = [];
+  private warmupHits = 0;
+  /** Off in capture mode by default; a screenshot must be complete. */
+  warmupEnabled = !CAPTURE_MODE;
+  /** Peak simultaneous parked meshes, so a leak shows up as a number. */
+  private warmupPeak = 0;
+
   /* --- camera shake --- */
   private shakeAmount = 0;
   private shakeFreq = 22;
@@ -238,10 +324,20 @@ export class RenderSystem implements System, RenderAPI {
       depth: true,
       stencil: false,
       powerPreference: 'high-performance',
-      preserveDrawingBuffer: true, // required for harness screenshots
+      // Required for harness screenshots, and *only* for those. Keeping the
+      // drawing buffer alive forces the compositor to copy the back buffer
+      // every frame instead of swapping it; a player never screenshots, so a
+      // player should never pay for it.
+      preserveDrawingBuffer: CAPTURE_MODE,
       failIfMajorPerformanceCaveat: false,
     });
-    renderer.debug.checkShaderErrors = true;
+    // Every program link is validated with `getProgramParameter(LINK_STATUS)`,
+    // which is a *synchronous* GL query: it blocks the CPU until the driver has
+    // finished compiling. That is fine while authoring shaders and expensive in
+    // a shipped build, where the first muzzle flash and the first enemy spawn
+    // each linked a program mid-frame and produced 60–100 ms hitches. Keep the
+    // check where it earns its cost: capture runs and dev servers.
+    renderer.debug.checkShaderErrors = CAPTURE_MODE || !!import.meta.env?.DEV;
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.NoToneMapping;  // done in the present stage
     // three's own shadow pipeline is replaced wholesale by the CSM system.
@@ -262,8 +358,12 @@ export class RenderSystem implements System, RenderAPI {
     this.canvas = ctx.engine.canvas;
     const renderer = this.renderer;
 
-    const params = new URLSearchParams(globalThis.location?.search ?? '');
-    this.captureMode = params.get('capture') === '1';
+    this.captureMode = CAPTURE_MODE;
+    // A governor that reacts to machine load is, by construction, not
+    // reproducible. Capture runs, replays and network sessions get the preset
+    // exactly as authored.
+    this.budget.enabled = !this.captureMode;
+    this.budget.onApply(() => this.applyQuality(false));
 
     this.viewModelCamera.layers.enable(LAYERS.DEFAULT);
     this.viewModelCamera.layers.enable(LAYERS.VIEW_MODEL);
@@ -309,6 +409,28 @@ export class RenderSystem implements System, RenderAPI {
   private installDebugHandle(): void {
     (globalThis as unknown as Record<string, unknown>).__RENDER__ = {
       gfx: settings.gfx,
+      /** Live quality-governor state, and a way to pin it for an A/B. */
+      budget: () => this.budget.telemetry(),
+      setBudgetDial: (dial: number) => { this.budget.setDial(dial); return this.budget.telemetry(); },
+      setAdaptive: (on: boolean) => { this.budget.enabled = !!on; },
+      /** Shader warm-up: independent of capture mode so an A/B can see it. */
+      setWarmup: (on: boolean) => { this.warmupEnabled = !!on; },
+      warmup: () => ({
+        enabled: this.warmupEnabled,
+        parked: this.warming.length,
+        peak: this.warmupPeak,
+        total: this.warmupHits,
+      }),
+      /** Per-stage cost of the most recent frame, for a perf gate to attribute. */
+      cost: () => ({
+        shadowMs: +this.lastShadowMs.toFixed(3),
+        exposureMs: +this.lastExposureMs.toFixed(3),
+        captureSync: this.captureMode,
+        gpuMs: +this.timer.lastMs.toFixed(3),
+        drawCalls: this.renderer.info.render.calls,
+        shadowUpdateHz: settings.gfx.shadowUpdateHz,
+        exposureUpdateHz: settings.gfx.exposureUpdateHz,
+      }),
       passes: () => this.passes.map((p) => ({ name: p.name, order: p.order, enabled: p.enabled !== false })),
       setPass: (name: string, on: boolean) => {
         for (const p of this.passes) if (p.name === name) p.enabled = on;
@@ -339,16 +461,32 @@ export class RenderSystem implements System, RenderAPI {
     }
   }
 
-  private applyQuality(): void {
+  /**
+   * Pushes `settings.gfx` into everything that caches it.
+   *
+   * `full` is true for a preset change, where the sky and the light meter have
+   * to be rebuilt from scratch. The adaptive governor passes false: it moves the
+   * dial as often as every few seconds, and re-metering the scene each time
+   * would show up as an exposure pump — a far more visible artefact than the
+   * quality step it is reacting to. Targets are still reallocated when the
+   * render scale actually changed the drawing buffer.
+   */
+  private applyQuality(full = true): void {
     const g = settings.gfx;
     this.renderer.setPixelRatio(this.pixelRatio * g.renderScale);
     this.lights.setBudget(this.lightBudget());
     this.decals.setCapacity(g.maxDecals);
-    this.sky.invalidate();
-    this.exposure.reset();
+    if (full) {
+      this.sky.invalidate();
+      this.exposure.reset();
+    }
     const size = this.renderer.getDrawingBufferSize(new THREE.Vector2());
+    const changed = size.x !== this.graph.width || size.y !== this.graph.height;
     this.graph.resize(size.x, size.y);
-    for (const p of this.passes) p.resize(this.graph.width, this.graph.height);
+    if (full || changed) for (const p of this.passes) p.resize(this.graph.width, this.graph.height);
+    // A new cadence must take effect on the next frame, not after the old
+    // interval expires.
+    this.shadowDue = true;
   }
 
   /**
@@ -440,9 +578,17 @@ export class RenderSystem implements System, RenderAPI {
 
   /* ----------------------------------------------------------------- update */
 
-  update(dt: number, _ctx: EngineContext): void {
+  update(dt: number, ctx: EngineContext): void {
     this.elapsed += dt;
     this.uniforms.boTime.value = this.elapsed;
+
+    // Unscaled: slow-motion on a kill is a gameplay effect and must not read as
+    // a performance problem.
+    const wall = ctx.time.deltaReal;
+    this.budget.update(wall);
+    this.shadowClock += wall;
+    this.exposureClock += wall;
+    this.exposureAccum += wall;
 
     this.sky.update(dt, this.scene);
     this.lights.update(dt, this.camera);
@@ -473,6 +619,7 @@ export class RenderSystem implements System, RenderAPI {
     const g = settings.gfx;
     r.info.reset();
     this.timer.begin();
+    this.latchFrameDelta();
 
     const gb = this.graph.gbuffer;
     const width = gb.width;
@@ -523,26 +670,46 @@ export class RenderSystem implements System, RenderAPI {
     this.updateFog();
 
     // --- scene bookkeeping
+    // Released first, so anything that finished warming is in this frame's index.
+    this.releaseWarming();
     this.worldIndex.scan(this.scene);
     this.viewModelIndex.scan(this.viewModelScene);
+    this.collectWarming();
     this.neutraliseForeignLights();
     this.updateViewModelRig();
 
     // --- 1. cascaded shadow maps
+    //
+    // The single most expensive thing in the frame: re-submitting every
+    // shadow-casting mesh once per cascade. Measured on an RTX 3080 Ti at 1080p
+    // in a live firefight it was 5.7 ms of CPU and 1212 of the frame's 1728
+    // draw calls — 70% of them — while the whole post chain cost nothing
+    // measurable on the CPU at all.
+    //
+    // The atlas is not cleared between frames, so skipping this call reuses the
+    // previous atlas at zero cost and the published cascade matrices stay
+    // consistent with it. `shadowUpdateHz` sets how often it is rebuilt.
     if (g.shadows) {
-      this.shadows.render(this.scene, this.camera, u.boSunDirWorld.value, this.worldIndex, {
-        cascades: g.shadowCascades,
-        mapSize: g.shadowMapSize,
-        distance: Math.min(g.shadowDistance, this.camera.far),
-        softness: g.pcssSoftness,
-        lambda: 0.86,
-      });
+      if (this.shadowDue || this.shadowTick(g.shadowUpdateHz)) {
+        this.shadowDue = false;
+        const t0 = performance.now();
+        this.shadows.render(this.scene, this.camera, u.boSunDirWorld.value, this.worldIndex, {
+          cascades: g.shadowCascades,
+          mapSize: g.shadowMapSize,
+          distance: Math.min(g.shadowDistance, this.camera.far),
+          softness: g.pcssSoftness,
+          lambda: 0.86,
+        });
+        this.lastShadowMs = performance.now() - t0;
+      }
     } else {
       this.shadows.setDisabled();
+      this.lastShadowMs = 0;
+      this.shadowDue = true;
     }
 
-    // --- 2. depth prepass (drives contact shadows and projected decals)
-    this.renderPrepass();
+    // --- 2. depth prepass (drives contact shadows, soft particles and decals)
+    if (g.depthPrepass) this.renderPrepass();
 
     // --- 3. sky + opaque + transparent + view model into the MRT
     this.renderMain(width, height);
@@ -560,11 +727,22 @@ export class RenderSystem implements System, RenderAPI {
     gb.color = sceneColor;
 
     // --- 5. auto exposure (the external tonemapper applies gfx.exposure itself)
+    //
+    // Metering is a 256x144 luminance downsample, a 36,864-point histogram
+    // scatter and two reduction blits. Eye adaptation is a ~1 s exponential, so
+    // re-metering at 20–60 Hz is indistinguishable from doing it every frame —
+    // the accumulated wall time is handed to `adapt`, so the adaptation curve
+    // is identical either way.
     this.exposure.settings.manual = this.ownsTonemap ? g.exposure : 1;
-    this.exposure.update(
-      Math.max(1 / 240, this.elapsedDelta()), sceneColor, gb.depth,
-      width, height, this.camera.near, this.camera.far,
-    );
+    if (this.exposureTick(g.exposureUpdateHz)) {
+      const t0 = performance.now();
+      this.exposure.update(
+        Math.max(1 / 240, this.exposureAccum), sceneColor, gb.depth,
+        width, height, this.camera.near, this.camera.far,
+      );
+      this.lastExposureMs = performance.now() - t0;
+      this.exposureAccum = 0;
+    }
 
     // --- 6. post chain
     const finalTexture = this.runPasses(sceneColor, width, height);
@@ -602,10 +780,104 @@ export class RenderSystem implements System, RenderAPI {
   }
 
   private lastElapsed = 0;
-  private elapsedDelta(): number {
+  private frameDelta = 1 / 60;
+  /**
+   * This frame's presentation delta, latched once per frame.
+   *
+   * It used to be computed on demand and *consumed* its own accumulator, so the
+   * second caller in the frame always saw zero and silently fell back to the
+   * 1/60 default. `PassContext.dt` was the second caller, which meant every
+   * temporal post pass — TAA history blend, motion blur, volumetric reprojection
+   * — was fed a constant 16.7 ms no matter what the frame actually took.
+   */
+  private latchFrameDelta(): void {
     const d = this.elapsed - this.lastElapsed;
     this.lastElapsed = this.elapsed;
-    return d > 0 ? d : 1 / 60;
+    this.frameDelta = d > 0 ? d : 1 / 60;
+  }
+
+  /**
+   * Finds meshes carrying a material this renderer has never drawn, hides them
+   * and asks the driver to start compiling.
+   *
+   * Runs after the world scan and *before* any draw, so a mesh is caught on the
+   * frame it appears rather than after it has already cost a frame. The view
+   * model is deliberately not scanned: the player's own weapon must never pop,
+   * and it is created once at loadout time where a hitch is already hidden by
+   * the transition.
+   */
+  private collectWarming(): void {
+    if (!this.warmupEnabled) return;
+    const meshes = this.worldIndex.meshes;
+    let compiles = 0;
+    for (let i = 0; i < meshes.length; i++) {
+      const mesh = meshes[i];
+      const mat = mesh.material as THREE.Material | THREE.Material[];
+      let fresh = false;
+      if (Array.isArray(mat)) {
+        for (let k = 0; k < mat.length; k++) {
+          if (!this.warmSeen.has(mat[k])) { this.warmSeen.add(mat[k]); fresh = true; }
+        }
+      } else if (mat && !this.warmSeen.has(mat)) {
+        this.warmSeen.add(mat);
+        fresh = true;
+      }
+      if (!fresh) continue;
+
+      // Park it on a layer no camera reads. The mesh stays visible to the scene
+      // index and to gameplay; it simply is not drawn by the colour pass, the
+      // prepass or any shadow cascade until its program is ready.
+      const rec = { mesh: mesh as THREE.Object3D, mask: mesh.layers.mask, frames: 0, ready: false };
+      mesh.layers.mask = 1 << LAYER_WARMING;
+      this.warming.push(rec);
+      this.warmupHits++;
+      // `compileAsync` links against the real scene's lighting, so the program
+      // it warms is the one the mesh will actually be drawn with.
+      if (compiles >= WARMUP_COMPILES_PER_FRAME) continue;
+      compiles++;
+      const done = () => { rec.ready = true; };
+      try {
+        const p = this.renderer.compileAsync(mesh, this.camera, this.scene) as unknown;
+        if (p && typeof (p as Promise<unknown>).then === 'function') {
+          (p as Promise<unknown>).then(done, done);
+        } else done();
+      } catch { done(); }
+    }
+    if (this.warming.length > this.warmupPeak) this.warmupPeak = this.warming.length;
+  }
+
+  /** Restores warmed meshes once their programs are ready or the bound expires. */
+  private releaseWarming(): void {
+    if (this.warming.length === 0) return;
+    for (let i = this.warming.length - 1; i >= 0; i--) {
+      const rec = this.warming[i];
+      rec.frames++;
+      if (!rec.ready && rec.frames < WARMUP_MAX_FRAMES) continue;
+      // Only undo this renderer's own edit. If anything else rewrote the mask
+      // in the meantime, that decision wins.
+      if (rec.mesh.layers.mask === (1 << LAYER_WARMING)) rec.mesh.layers.mask = rec.mask;
+      this.warming.splice(i, 1);
+    }
+  }
+
+  /** True when the shadow atlas is due for a rebuild. `hz <= 0` means always. */
+  private shadowTick(hz: number): boolean {
+    if (!(hz > 0)) { this.shadowClock = 0; return true; }
+    const interval = 1 / hz;
+    if (this.shadowClock < interval) return false;
+    // Subtract rather than zero, so the cadence does not drift with frame rate.
+    // Clamped so a long hitch cannot bank several updates and burst them.
+    this.shadowClock = Math.min(this.shadowClock - interval, interval);
+    return true;
+  }
+
+  /** True when auto-exposure is due to re-meter. `hz <= 0` means every frame. */
+  private exposureTick(hz: number): boolean {
+    if (!(hz > 0)) { this.exposureClock = 0; return true; }
+    const interval = 1 / hz;
+    if (this.exposureClock < interval) return false;
+    this.exposureClock = Math.min(this.exposureClock - interval, interval);
+    return true;
   }
 
   private hasTemporalPass(): boolean {
@@ -633,8 +905,10 @@ export class RenderSystem implements System, RenderAPI {
     this.camera.layers.mask = savedMask;
     this.scene.overrideMaterial = prevOverride;
 
-    // The weapon must occupy the prepass too, otherwise decals project through it.
-    if (this.viewModelScene.visible && this.viewModelIndex.meshes.length > 0) {
+    // The weapon must occupy the prepass too, otherwise decals project through
+    // it. Only the decal projection reads this depth against the weapon, so
+    // when there is nothing to project the submission is pure cost.
+    if (this.decals.count > 0 && this.viewModelScene.visible && this.viewModelIndex.meshes.length > 0) {
       const vmOverride = this.viewModelScene.overrideMaterial;
       this.viewModelScene.overrideMaterial = this.depthOnly();
       r.render(this.viewModelScene, this.viewModelCamera);
@@ -757,7 +1031,7 @@ export class RenderSystem implements System, RenderAPI {
       camera: this.camera,
       gbuffer: gb,
       atmosphere: atmo,
-      dt: this.elapsedDelta(),
+      dt: this.frameDelta,
       frame: this.frameIndex,
       time: this.elapsed,
       width,
@@ -988,6 +1262,21 @@ export class RenderSystem implements System, RenderAPI {
       textures: i.memory.textures,
       geometries: i.memory.geometries,
       gpuMs: this.timer.lastMs,
+      /** Cost of the last shadow-atlas rebuild; 0 on frames that reused it. */
+      shadowMs: +this.lastShadowMs.toFixed(3),
+      /** Cost of the last auto-exposure metering pass. */
+      exposureMs: +this.lastExposureMs.toFixed(3),
+      /**
+       * True when this session pays the capture-mode synchronous exposure
+       * readback — a full GPU pipeline flush, measured at ~7 ms/frame at 1080p.
+       *
+       * Every perf tool in this repo drives the game with `?capture=1`, so every
+       * frame-time number any of them has ever printed included it, and no
+       * player has ever paid it. A perf gate that does not check this flag is
+       * measuring the instrument.
+       */
+      captureSync: this.captureMode,
+      budget: this.budget.telemetry(),
     };
   }
 

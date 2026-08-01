@@ -57,6 +57,19 @@ interface Slot {
 
 const MASK_MELEE = MASK_MOVE | LAYER.ENEMY | LAYER.RAGDOLL;
 
+/**
+ * Slack on every fire-clock comparison, seconds.
+ *
+ * The clock is a float accumulated one 1/120 step at a time and the schedule is
+ * a float built from `60 / rpm`; the two round differently, so their difference
+ * creeps by an ULP or so per second. Without slack that creep eventually flips
+ * a comparison and one round in a magazine slips a whole step — measurable as
+ * 720 rpm at one framerate and 718.8 at another, for no reason a player could
+ * ever explain. 1 µs is 1/8333 of a fixed step: far too small to fire a round
+ * early, far too large for accumulated rounding to cross.
+ */
+const FIRE_EPS = 1e-6;
+
 const _hit: RayHit = {
   hit: false, point: new THREE.Vector3(), normal: new THREE.Vector3(0, 1, 0),
   distance: Infinity, surface: 'concrete', object: null, entityId: -1,
@@ -86,11 +99,47 @@ export class WeaponSystem implements System {
   private adsActive = false;
   private meleeUntil = 0;
   private switchTo = -1;
+  /**
+   * The weapon clock, in seconds, accumulated from the *fixed* step.
+   *
+   * Deliberately not `Time.elapsed`: that advances once per displayed frame
+   * (`Time.tick`), so every fixed step inside one frame reads the same value.
+   * Scheduling a 720 rpm cadence off it quantises every shot to the frame
+   * boundary — and because the next shot was scheduled from the quantised
+   * "now" rather than from the previous scheduled time, the error compounded
+   * instead of averaging out, so the gun fired at a different rate at 60 fps
+   * than at 144. This clock ticks once per 120 Hz step and nothing else.
+   */
   private timeNow = 0;
   /* Edge guards: input edges persist for a whole frame, which is two or more
    * fixed steps, so anything that toggles state needs its own debounce. */
   private lastToggleAt = -1;
   private lastJumpAt = -1;
+
+  /**
+   * The last fixed step on which the player was in a sprint stance. The
+   * sprint-to-fire gate is `lastSprintAt + stats.sprintOut`, i.e. a timer that
+   * starts when the sprint *ends* — gating on the sprint state itself (the old
+   * behaviour) is a no-op, because the state drops on the same step the input
+   * does and the trigger is serviced on that very step.
+   */
+  private lastSprintAt = -999;
+  /** Sim time the sprint-out finishes; a round cannot leave before it. */
+  private fireReadyAt = -999;
+  /** Sim time of the most recent shot, for telemetry. */
+  private lastShotAt = -1;
+
+  /**
+   * Gameplay ADS blend, advanced on the fixed step.
+   *
+   * The view model runs its own spring for the *pose* at display rate, which is
+   * right for presentation and wrong for anything that decides where a bullet
+   * goes: spread, first-shot accuracy and recoil scaling would all become
+   * frame-rate dependent. This is the authoritative one and it reaches 1.0
+   * exactly `stats.adsTime` after the aim button goes down.
+   */
+  private adsProgress = 0;
+  private adsBlendSim = 0;
 
   private recoil = new RecoilState();
   private spread = new SpreadState();
@@ -208,6 +257,10 @@ export class WeaponSystem implements System {
     this.recoil.reset();
     this.spread.reset();
     this.burstLeft = 0;
+    // A swap re-runs the whole ADS transition: carrying the previous weapon's
+    // blend across would hand the new gun an instant sight picture.
+    this.adsProgress = 0;
+    this.adsBlendSim = 0;
     this.state = 'drawing';
     const draw = immediate ? slot.stats.drawTime * 0.6 : slot.stats.drawTime;
     this.viewModel.startDraw(draw);
@@ -276,20 +329,37 @@ export class WeaponSystem implements System {
     this.ballistics.clear();
     this.tracers.clear();
     this.state = 'idle';
+    this.lastSprintAt = -999;
+    this.fireReadyAt = -999;
+    this.adsProgress = 0;
+    this.adsBlendSim = 0;
+    this.recoil.reset();
+    this.spread.reset();
   }
 
   /* --------------------------------------------------------- fixed update */
 
-  fixedUpdate(dt: number, ctx: EngineContext): void {
-    this.timeNow = ctx.time.elapsed;
+  fixedUpdate(dt: number, _ctx: EngineContext): void {
+    this.timeNow += dt;
     const slot = this.slots[this.index];
     if (!slot) return;
     const w = slot.runtime;
     const def = w.def;
 
     this.readStance();
+    // Recoil recovery is driven from here, not from the render frame, so a
+    // spray recovers identically at 30 and 540 fps.
+    this.player?.camera.stepRecoil(dt);
+    if (this.stanceSprinting) {
+      this.lastSprintAt = this.timeNow;
+      this.fireReadyAt = this.timeNow + slot.stats.sprintOut;
+    }
     this.recoil.tick(dt, def.recoil);
-    this.spread.tick(dt, def.spread);
+    // Bloom must not decay faster than the gun cycles, or holding the trigger
+    // recovers accuracy — which is the exact opposite of what bloom is for. The
+    // hold window is therefore one refire interval plus a margin, not a
+    // constant that happens to be shorter than a 720 rpm cycle.
+    this.spread.tick(dt, def.spread, this.refireInterval(def) * 1.35);
     w.bloom = this.spread.bloom;
     w.heat = Math.max(0, w.heat - dt * 0.18);
 
@@ -309,7 +379,12 @@ export class WeaponSystem implements System {
       this.viewModel.jump();
     }
 
+    // Order matters and is the whole point: aim intent → the blend that intent
+    // drives → the spread context that reads the blend → actions → the trigger.
+    // Running the blend before the intent cost a step of latency on every ADS.
     this.updateAds();
+    this.updateAdsBlend(dt, slot.stats);
+    this.syncSpreadCtx(slot.stats);
     this.updateActions();
     this.updateFiring();
     this.updateGrenades();
@@ -360,6 +435,56 @@ export class WeaponSystem implements System {
       this.adsEmitting = false;
     }
   }
+
+  /**
+   * Advances the gameplay ADS blend on the fixed step.
+   *
+   * `stats.adsTime` is the contract — hip to fully sighted — and it is honoured
+   * exactly: linear progress at `1 / adsTime`, shaped by a smootherstep so the
+   * blend has zero velocity at both ends and never snaps. Coming *out* of the
+   * sights is 25% quicker, which is how every CoD since MW2019 handles it (you
+   * drop the gun faster than you raise it).
+   *
+   * The 0.92 threshold Spread uses for first-shot accuracy lands at 79% of
+   * `adsTime` — 198 ms on the 250 ms VKR-7 — which is within a step of where
+   * the view-model spring finishes its pose. Being "sighted" to the eye and
+   * "sighted" to the ballistics therefore happen together.
+   */
+  private updateAdsBlend(dt: number, stats: ResolvedStats): void {
+    const inRate = 1 / Math.max(0.02, stats.adsTime);
+    const outRate = 1 / Math.max(0.02, stats.adsTime * 0.8);
+    this.adsProgress = this.adsActive
+      ? Math.min(1, this.adsProgress + inRate * dt)
+      : Math.max(0, this.adsProgress - outRate * dt);
+    const t = this.adsProgress;
+    this.adsBlendSim = t * t * t * (t * (t * 6 - 15) + 10);
+  }
+
+  /**
+   * Refreshes the spread context once per fixed step.
+   *
+   * It used to be written only inside `shoot`, which left `snapshot().spreadDeg`
+   * — the crosshair the player is looking at — describing the stance they were
+   * in when they last pulled the trigger.
+   */
+  private syncSpreadCtx(stats: ResolvedStats): void {
+    // Every gameplay-visible aim term reads the fixed-step blend, never the
+    // view model's display-rate spring: where the bullet goes must not depend
+    // on the refresh rate.
+    this.spreadCtx.ads = this.adsBlendSim;
+    this.spreadCtx.speed01 = this.stanceSpeed01;
+    this.spreadCtx.grounded = this.stanceGrounded;
+    this.spreadCtx.crouched = this.stanceCrouched;
+    this.spreadCtx.prone = this.stanceProne;
+    this.spreadCtx.hipScale = stats.hipSpreadScale;
+    this.spreadCtx.adsScale = stats.adsSpreadScale;
+    this.spreadCtx.bloomScale = stats.bloomScale;
+  }
+
+  /** Authoritative ADS blend, 0..1, on the fixed step. */
+  get adsBlend(): number { return this.adsBlendSim; }
+  /** Linear ADS progress, 0..1 — 1.0 means fully sighted, exactly at `adsTime`. */
+  get adsProgress01(): number { return this.adsProgress; }
 
   /* -------------------------------------------------------------- actions */
 
@@ -504,6 +629,33 @@ export class WeaponSystem implements System {
 
   /* --------------------------------------------------------------- firing */
 
+  /**
+   * Seconds between rounds. `60 / rpm` is the mechanical cycle; `cycleTime` is
+   * the manual action on top of it (pump, bolt); `semiRefire` is the floor a
+   * human trigger finger cannot beat.
+   */
+  private refireInterval(def: WeaponDef): number {
+    return Math.max(60 / def.rpm + def.handling.cycleTime, def.handling.semiRefire);
+  }
+
+  /**
+   * Schedules the next round.
+   *
+   * The remainder is *carried*: the next shot is anchored to the previous
+   * scheduled time, not to the step the trigger happened to be serviced on. A
+   * 640 rpm LMG wants a round every 93.75 ms, which is 11.25 fixed steps — with
+   * carry the cadence alternates 11/11/11/12 steps and the mean is exact; the
+   * old `now + interval` rounded up every single time and the gun lost 4% of
+   * its rate of fire. Only when the schedule is stale by a full interval (idle
+   * trigger, reload, weapon swap) does the anchor reset to now.
+   */
+  private scheduleNextShot(interval: number): void {
+    const over = this.timeNow - this.nextShotAt;
+    this.nextShotAt = over >= -FIRE_EPS && over < interval
+      ? this.nextShotAt + interval
+      : this.timeNow + interval;
+  }
+
   private updateFiring(): void {
     const slot = this.slots[this.index];
     const w = slot.runtime;
@@ -512,13 +664,20 @@ export class WeaponSystem implements System {
     const pressed = input.pressed('fire');
     if (!held) this.triggerHeld = false;
 
+    // Sprint-to-fire: the timer starts when the sprint *ends*. CoD MW2019 runs
+    // 80-250 ms by class and it is the single biggest reason its gunfights feel
+    // committed — you cannot sprint around a corner and instantly shoot.
+    // `stats.sprintOut` is the authored per-weapon number (VKR-7 190 ms, Hornet
+    // 130 ms, Vulcan 360 ms) and attachments scale it.
+    const sprintBlocked = this.timeNow < this.fireReadyAt - FIRE_EPS;
     const blocked = w.reloading || this.state === 'drawing' || this.state === 'holstering'
-      || this.state === 'melee' || this.stanceSprinting || this.grenades.cooking;
+      || this.state === 'melee' || this.stanceSprinting || sprintBlocked
+      || this.grenades.cooking;
     if (blocked) { if (this.state === 'firing') this.state = 'idle'; return; }
 
     // A burst finishes on its own once started.
     if (this.burstLeft > 0) {
-      if (this.timeNow >= this.nextShotAt && w.ammo > 0) {
+      if (this.timeNow >= this.nextShotAt - FIRE_EPS && w.ammo > 0) {
         this.shoot();
         this.burstLeft--;
         if (this.burstLeft === 0) this.nextShotAt = this.timeNow + def.handling.burstDelay;
@@ -530,7 +689,7 @@ export class WeaponSystem implements System {
     // 120 Hz — twice per displayed frame at 60 fps. Semi-auto must therefore
     // latch on `triggerHeld`, not on the edge, or every click fires twice.
     const canStart = w.fireMode === 'auto' ? held : (held && !this.triggerHeld);
-    if (!canStart || this.timeNow < this.nextShotAt) {
+    if (!canStart || this.timeNow < this.nextShotAt - FIRE_EPS) {
       if (this.state === 'firing' && !held) this.state = 'idle';
       return;
     }
@@ -568,8 +727,8 @@ export class WeaponSystem implements System {
     w.ammo--;
     w.heat = Math.min(1, w.heat + 1 / Math.max(8, def.magSize * 0.8));
     this.state = 'firing';
-    const interval = 60 / def.rpm + def.handling.cycleTime;
-    this.nextShotAt = this.timeNow + Math.max(interval, def.handling.semiRefire);
+    this.scheduleNextShot(this.refireInterval(def));
+    this.lastShotAt = this.timeNow;
 
     /* --- direction ------------------------------------------------------- */
     // The round is aimed from the eye, not the muzzle: that is what makes what
@@ -579,14 +738,6 @@ export class WeaponSystem implements System {
     this._right.set(1, 0, 0).applyQuaternion(cam.quaternion);
     this._up.set(0, 1, 0).applyQuaternion(cam.quaternion);
 
-    this.spreadCtx.ads = this.viewModel.adsBlend;
-    this.spreadCtx.speed01 = this.stanceSpeed01;
-    this.spreadCtx.grounded = this.stanceGrounded;
-    this.spreadCtx.crouched = this.stanceCrouched;
-    this.spreadCtx.prone = this.stanceProne;
-    this.spreadCtx.hipScale = stats.hipSpreadScale;
-    this.spreadCtx.adsScale = stats.adsSpreadScale;
-    this.spreadCtx.bloomScale = stats.bloomScale;
     const cone = this.spread.cone(def, this.spreadCtx);
     this.spread.onShot(def.spread, this.spreadCtx);
 
@@ -613,7 +764,7 @@ export class WeaponSystem implements System {
     }
 
     /* --- recoil ---------------------------------------------------------- */
-    this.recoilCtx.ads = this.viewModel.adsBlend > 0.5;
+    this.recoilCtx.ads = this.adsBlendSim > 0.5;
     this.recoilCtx.crouched = this.stanceCrouched;
     this.recoilCtx.prone = this.stanceProne;
     this.recoilCtx.scale = stats.recoilScale;
@@ -624,7 +775,7 @@ export class WeaponSystem implements System {
     const rig = this.player?.camera;
     if (rig) {
       rig.addRecoil(imp.pitch * (Math.PI / 180), -imp.yaw * (Math.PI / 180), imp.recover);
-      rig.addShake(def.recoil.shake * (1 - this.viewModel.adsBlend * 0.45), 30, 0.18);
+      rig.addShake(def.recoil.shake * (1 - this.adsBlendSim * 0.45), 30, 0.18);
     }
     this.viewModel.onFire(imp.pitch, imp.yaw);
     // A can turns a fireball into a puff; the view-model emitter has to know.
@@ -758,6 +909,51 @@ export class WeaponSystem implements System {
 
   /** Damage at a distance for the current weapon — used by the HUD and tests. */
   damageAtRange(metres: number): number { return damageAt(this.definition, metres); }
+
+  /**
+   * Everything the gunfeel probe needs to check the clock without reaching into
+   * private state: the fixed-step time base, the shot schedule, the sprint-out
+   * gate and the authoritative ADS blend. All times are seconds on the *sim*
+   * clock, which is the only clock any of this is scheduled against.
+   */
+  fireClock(): {
+    time: number; interval: number; nextShotAt: number; lastShotAt: number;
+    fireReadyAt: number; lastSprintAt: number; sprintOut: number;
+    adsProgress: number; adsBlend: number; viewAdsBlend: number;
+    bloom: number; coneDeg: number; patternIndex: number; shotIndex: number;
+  } {
+    const slot = this.slots[this.index];
+    const def = slot.runtime.def;
+    return {
+      time: this.timeNow,
+      interval: this.refireInterval(def),
+      nextShotAt: this.nextShotAt,
+      lastShotAt: this.lastShotAt,
+      fireReadyAt: this.fireReadyAt,
+      lastSprintAt: this.lastSprintAt,
+      sprintOut: slot.stats.sprintOut,
+      adsProgress: this.adsProgress,
+      adsBlend: this.adsBlendSim,
+      viewAdsBlend: this.viewModel.adsBlend,
+      bloom: this.spread.bloom,
+      coneDeg: this.spread.cone(def, this.spreadCtx),
+      patternIndex: this.recoil.index,
+      shotIndex: this.shotIndex,
+    };
+  }
+
+  /**
+   * Re-seeds the weapon RNG and clears the pattern walk. Two sprays taken after
+   * the same call are byte-identical, which is what makes an authored recoil
+   * pattern a *pattern* rather than a suggestion.
+   */
+  resetSpray(seed: number | string = 'weapons'): void {
+    this.rand.seed(seed);
+    this.recoil.reset();
+    this.spread.reset();
+    this.shotIndex = 0;
+    this.nextShotAt = this.timeNow;
+  }
 
   grenadeStock(kind: GrenadeKind): number { return this.grenades.stock[kind]; }
   grenadeDef(kind: GrenadeKind): GrenadeDef { return GRENADES[kind]; }

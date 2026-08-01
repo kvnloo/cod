@@ -8,6 +8,7 @@
  * dependency, so it can be tested headlessly.
  */
 
+import type * as THREE from 'three';
 import type { EngineContext, System } from '../core/Engine';
 import { ORDER } from '../core/Engine';
 import { bus } from '../core/EventBus';
@@ -18,16 +19,31 @@ import { BotFallback } from './BotFallback';
 import { CharacterSystem } from '../characters/CharacterSystem';
 import type { CharacterFactory } from '../characters/types';
 import { MatchRunner } from './Match';
-import { resolveServices, type GameServices } from './Services';
+import { AIActorBridge, resolveServices, type GameServices } from './Services';
 import type { DirectorAPI, DirectorSnapshot, GameModeId, MatchPhase } from './types';
 import './events';
 import './DebugScene';
+
+/** What the weapon system looks like from here. Structural: no import. */
+interface WeaponsLike {
+  setDamageResolver(
+    fn: ((
+      entityId: number, amount: number, headshot: boolean, point: THREE.Vector3,
+      direction: THREE.Vector3, fromPlayer: boolean,
+    ) => { killed: boolean; applied: number; armor?: boolean }) | null,
+  ): void;
+}
 
 const VALID_MODES: readonly GameModeId[] = ['operation', 'tdm', 'firefight'];
 
 function paramMode(): GameModeId | null {
   const p = new URLSearchParams(globalThis.location?.search ?? '').get('mode');
   return p && (VALID_MODES as readonly string[]).includes(p) ? (p as GameModeId) : null;
+}
+
+/** `?actors=fallback` forces the stand-in sim even when the AI module is live. */
+function paramActors(): string {
+  return new URLSearchParams(globalThis.location?.search ?? '').get('actors') ?? '';
 }
 
 function paramSeed(): number {
@@ -43,6 +59,23 @@ export class GameDirector implements System, DirectorAPI {
   match!: MatchRunner;
   services!: GameServices;
   private fallback: BotFallback | null = null;
+  /** Set when the real AI stack is the actor backend; null when it is not. */
+  aiBridge: AIActorBridge | null = null;
+  /** Which backend actually got installed. Readable at runtime, on purpose. */
+  actorBackend: 'ai' | 'fallback' | 'none' = 'none';
+  private weapons: WeaponsLike | null = null;
+  /**
+   * True for exactly one fixed step after an `explosion`.
+   *
+   * `AISystem` damages its own agents from the `explosion` event. Ballistics
+   * *also* walks the blast sphere and calls the damage resolver. Without this
+   * every grenade would be applied twice. The flag is raised by the event and
+   * cleared at the top of the next `fixedUpdate`, which brackets exactly the
+   * window in which the two can collide (ballistics runs at `ORDER.BALLISTICS`,
+   * this system at `ORDER.GAMEPLAY`, same step).
+   */
+  private blastInFlight = false;
+  private unbindBlast: (() => void) | null = null;
   private tick = 0;
   private started = false;
   /**
@@ -57,15 +90,39 @@ export class GameDirector implements System, DirectorAPI {
     const seed = paramSeed();
     this.services = resolveServices(ctx, new Rand(seed));
 
-    // No actor backend yet → stand up our own so the whole game layer is
-    // playable and verifiable. The moment `ai` implements `ActorAPI` this is
-    // never constructed.
-    if (!this.services.actors) {
+    /*
+     * Backend selection.
+     *
+     * `resolveServices` hands back the real AI stack wrapped in an
+     * `AIActorBridge` whenever `src/ai/` is registered and still has the shape
+     * the bridge expects. `BotFallback` is now genuinely a fallback: it only
+     * gets built when there is no AI system at all (headless tests, a build
+     * with the module stripped) — or when `?actors=fallback` asks for it, which
+     * exists so the two backends can be A/B'd in the same build.
+     */
+    if (paramActors() === 'fallback') this.services.actors = null;
+    if (this.services.actors instanceof AIActorBridge) {
+      this.aiBridge = this.services.actors;
+      this.actorBackend = 'ai';
+    } else if (!this.services.actors) {
       this.fallback = new BotFallback(this.services, this.services.rng.fork('bots'));
       this.services.actors = this.fallback;
+      this.actorBackend = 'fallback';
+    } else {
+      this.actorBackend = 'ai';
     }
+    console.info(`[game] actor backend: ${this.actorBackend}`
+      + (this.aiBridge ? ` (${this.aiBridge.ai.cover.points.length} cover points)` : ''));
 
-    this.match = new MatchRunner(this.services, this.fallback !== null);
+    if (this.aiBridge) this.installDamageResolver(ctx);
+
+    /*
+     * `ownsFallback` means "the actor backend already answers the `explosion`
+     * event itself, do not apply blast damage a second time". That is true of
+     * `BotFallback` (it subscribes) and equally true of `AISystem`. Any other
+     * backend keeps the old behaviour.
+     */
+    this.match = new MatchRunner(this.services, this.fallback !== null || this.aiBridge !== null);
     this.match.attachBus((key, fn) => bus.on(key, fn));
     this.match.seed = seed;
 
@@ -78,6 +135,51 @@ export class GameDirector implements System, DirectorAPI {
       // the director never spawns soldiers into another module's shots.
       this.startMatch(forced ?? 'operation', seed);
     }
+  }
+
+  /**
+   * Routes the player's rounds into enemy health.
+   *
+   * Without a resolver `Ballistics` still publishes `damage:dealt` and the AI
+   * module's own listener applies it — but every hit reports `killed: false`,
+   * so the hitmarker never reads as a kill and the armour flag is never set.
+   * More importantly there is no single place that owns the arbitration.
+   *
+   * With one installed, the game layer owns it: the resolver applies the hit,
+   * returns the truth, and `Agent.claimBusEcho` swallows the `damage:dealt`
+   * echo that follows on the same call stack so nothing lands twice. Damage
+   * *amounts* still come entirely from `src/weapons/` — per-zone multipliers
+   * and range falloff — which is exactly where they belong.
+   */
+  private installDamageResolver(ctx: EngineContext): void {
+    const w = ctx.engine.tryGet('weapons') as unknown as WeaponsLike | undefined;
+    if (!w || typeof w.setDamageResolver !== 'function') return;
+    this.weapons = w;
+    this.unbindBlast = bus.on('explosion', () => { this.blastInFlight = true; });
+
+    w.setDamageResolver((entityId, amount, headshot, point, direction, fromPlayer) => {
+      const bridge = this.aiBridge;
+      if (!bridge) return { killed: false, applied: amount };
+      const view = bridge.viewOf(entityId);
+      if (!view) return { killed: false, applied: amount };
+
+      /*
+       * Blast damage arrives here from `Ballistics.detonate`'s overlap sweep,
+       * always with a straight-up direction, in the same fixed step as the
+       * `explosion` event that `AISystem` has already applied. Report it, do
+       * not apply it, and claim the echo so it cannot be applied a third time.
+       */
+      if (this.blastInFlight && !headshot
+        && direction.x === 0 && direction.z === 0 && direction.y === 1) {
+        view.agent.claimBusEcho(amount, !view.alive);
+        return { killed: !view.alive, applied: amount };
+      }
+
+      const killed = bridge.hurt(view, amount, {
+        headshot, point, direction, fromPlayer, source: fromPlayer ? 'player' : 'ai',
+      });
+      return { killed, applied: amount, armor: view.archetype === 'juggernaut' };
+    });
   }
 
   /* --------------------------------------------------------------- API -- */
@@ -103,6 +205,9 @@ export class GameDirector implements System, DirectorAPI {
     // the match then reacts to.
     this.fallback?.fixedUpdate(dt, this.tick);
     this.match.fixedUpdate(dt);
+    // Corpses are the director's to clean up; see `AIActorBridge.reap`.
+    if (this.aiBridge && (this.tick & 63) === 0) this.aiBridge.reap();
+    this.blastInFlight = false;
   }
 
   update(dt: number, ctx: EngineContext): void {
@@ -141,6 +246,15 @@ export class GameDirector implements System, DirectorAPI {
       }
     }
     this.fallback?.setFactory(factory);
+    /*
+     * `AISystem.characterFactory()` probes the engine registry and then this
+     * global. `main.ts` does not register `CharacterSystem`, so without the
+     * hand-off every AI agent would fall back to the untextured proxy rig even
+     * though a real factory exists — one line, and enemies get skinned bodies.
+     */
+    if (factory) {
+      (globalThis as unknown as { __CHARACTERS__?: CharacterFactory }).__CHARACTERS__ = factory;
+    }
   }
 
   /**
@@ -173,8 +287,13 @@ export class GameDirector implements System, DirectorAPI {
   }
 
   dispose(): void {
+    this.unbindBlast?.();
+    this.unbindBlast = null;
+    this.weapons?.setDamageResolver(null);
+    this.weapons = null;
     this.match?.dispose();
     this.fallback?.dispose();
+    this.aiBridge?.dispose();
     this.ownedCharacters?.dispose?.();
   }
 }

@@ -1,13 +1,49 @@
 /**
- * Movement state machine and locomotion physics.
+ * Movement state machine and locomotion physics — **Apex Legends model**.
  *
- * Tuned to modern-military-shooter feel rather than a physics simulation: high
- * ground acceleration so direction changes are instant, a small amount of air
- * control, momentum-preserving slides, and automatic mantling. Every constant
- * here is a design value — they are collected at the top so the feel can be
- * tuned in one place.
+ * The design target for this file, and only this file, is Apex Legends
+ * traversal. Everything else in the game stays Call of Duty: the weapon
+ * handling budgets, the ADS timings, the recoil patterns and the health model
+ * are deliberately *not* Apex. What Apex contributes is the part a player feels
+ * with their hands between fights — momentum.
  *
- * ## One step function, three drivers
+ * The five mechanics that make Apex movement Apex, and where each lives:
+ *
+ *   1. **Momentum-preserving slide** (`stepSlide`). Gravity accelerates you
+ *      downhill; friction only really bites on the flat; the slide timer barely
+ *      advances while you are gaining speed, so a hill is a ride and not a
+ *      1.15-second animation.
+ *   2. **Slide-jump chaining** (`slideJump`). Jumping out of a slide keeps every
+ *      metre per second you had and adds a little, with a falloff that makes the
+ *      chain converge instead of exploding.
+ *   3. **Air-strafe** (`accelerateAir`). The classic Quake/Source projected
+ *      acceleration with the wish speed clamped per tick. This single clamp is
+ *      what separates a player who moves their mouse in time with their strafe
+ *      key from one who holds W.
+ *   4. **Tap-strafe** (`airControl`). Quake3/CPMA-style air control — a *pure
+ *      rotation* of the velocity vector, so it redirects without ever creating
+ *      speed — normally weak and forward-only, briefly and dramatically stronger
+ *      on a re-press of the forward key. That re-press is exactly the input Apex
+ *      players bind to the scroll wheel.
+ *   5. **Mantle / climb** (`tryMantle`). Any ledge up to 2.5 × character height,
+ *      as a timed climb the player commits to, with the kind and the height
+ *      published so the animation layer can pick a clip.
+ *
+ * Plus the two smaller ones that make the above chain: **bunny-hop retention**
+ * (friction is skipped on a landing step that already has a jump buffered) and
+ * the **wall-bounce** (a shallow-angle wall contact reflects instead of
+ * absorbing).
+ *
+ * ### Sourced constants
+ *
+ * Where a number has a real-world reference it is cited at the constant. The
+ * important one is `airWishCap`: Source's `AIR_MAX_WISHSPEED` is 30 units/s and
+ * Valve's scale is 1 unit = 1 inch, so 30 × 0.0254 = 0.762 m/s. Titanfall and
+ * Apex are Source derivatives and inherit the model. Everything downstream of
+ * that clamp — how fast strafing accelerates you, why holding W in the air does
+ * nothing — falls out of it rather than being hand-tuned.
+ *
+ * ### One step function, three drivers
  *
  * `stepCommand(cmd)` is the *only* place movement is integrated. It is driven by
  *   1. the local client, predicting its own freshly-sampled input;
@@ -24,7 +60,8 @@
 import * as THREE from 'three';
 import { bus } from '../core/EventBus';
 import { readSurface, type SurfaceType } from '../core/Surfaces';
-import { MASK_MOVE, type CharacterController, type CharacterMoveResult, type PhysicsAPI, type RayHit } from '../physics/types';
+import { MASK_MOVE, type CharacterController, type PhysicsAPI, type RayHit } from '../physics/types';
+import type { CharacterMoveResultEx } from '../physics/CharacterController';
 import { BTN, type MoveCommand } from './MoveCommand';
 import { copyMovementState, createMovementState, type MovementState } from './MovementState';
 import { CommandBuilder } from './CommandBuilder';
@@ -34,11 +71,17 @@ export type MoveState =
   | 'crouchIdle' | 'crouchWalk' | 'prone' | 'proneCrawl'
   | 'slide' | 'air' | 'mantle';
 
+/** What the animation layer should play for the traversal in progress. */
+export type MantleKind = 'none' | 'vault' | 'mantle' | 'climb';
+
+/** Wire ordering for `MantleKind`, so a snapshot can carry it as an index. */
+export const MANTLE_KINDS: readonly MantleKind[] = ['none', 'vault', 'mantle', 'climb'];
+
 export const TUNING: Record<string, number> & {
   standHeight: number; crouchHeight: number; proneHeight: number;
   standEye: number; crouchEye: number; proneEye: number;
 } = {
-  /** Ground speeds, metres/second. */
+  /** Ground speeds, metres/second. Unchanged — the audit certified these. */
   walkSpeed: 2.6,
   runSpeed: 4.55,
   sprintSpeed: 6.4,
@@ -51,22 +94,105 @@ export const TUNING: Record<string, number> & {
 
   groundAccel: 62,
   groundFriction: 14,
-  airAccel: 11,
-  airControl: 0.42,
+  /**
+   * Friction above `tacSprintSpeed`. Apex does not confiscate momentum the
+   * instant you touch the ground — it bleeds it. Low enough that a landing costs
+   * a few percent, high enough that standing still on the flat is not a
+   * hoverboard.
+   */
+  groundFrictionFast: 4.6,
+
+  /* ---- air model (Quake/Source projected acceleration) ------------------- */
+  /**
+   * Source `AIR_MAX_WISHSPEED` = 30 units/s at Valve's 1 unit = 1 inch, i.e.
+   * 30 × 0.0254 = 0.762 m/s. The per-tick ceiling on how much of the wish
+   * direction you are allowed to already be moving in. Everything interesting
+   * about strafe-jumping is a consequence of this one number.
+   */
+  airWishCap: 0.762,
+  /**
+   * Below this speed the cap is relaxed so a standing jump still has usable air
+   * control; it falls back to `airWishCap` by ~2.5 m/s, well under any speed a
+   * player could exploit. Apex is more forgiving than CS here and so are we.
+   */
+  airCapBaseSpeed: 3.2,
+  airCapFalloff: 1.0,
+  /** Acceleration coefficient, m/s². Near the theoretical optimum for a 120 Hz
+   *  tick with the cap above: gain per tick peaks at k·(cap − k·dt)/v. */
+  airAccel: 45,
+  /** CPMA-style air control, rad/s of *velocity rotation*. Never adds speed. */
+  airControlTurn: 2.6,
+  /** Air control is forward-only, as in Quake3 — strafe input disables it,
+   *  which is what stops it from cancelling out a strafe-jump. */
+  airControlMaxStrafe: 0.30,
+
+  /* ---- tap-strafe --------------------------------------------------------- */
+  /** Seconds of amplified air control opened by a forward re-press. */
+  tapStrafeTime: 0.20,
+  /** Amplified rotation rate, rad/s (≈ 630 °/s at full weight). */
+  tapStrafeTurn: 11.0,
+  /** Forward axis must fall below this, then rise above `tapStrafeOn`. */
+  tapStrafeOff: 0.25,
+  tapStrafeOn: 0.55,
+  /** Redirect is allowed until the wish direction is this far behind velocity
+   *  (cos φ). −0.45 ≈ 117°, so two taps comfortably turn you around. */
+  tapStrafeDotFloor: -0.45,
+  tapStrafeMinSpeed: 2.5,
+
+  /* ---- slide -------------------------------------------------------------- */
+  slideEntrySpeed: 5.2,
+  slideBoost: 2.1,
+  /** Entry boost fades linearly to zero at this speed, so chaining converges. */
+  slideBoostFalloff: 14.0,
+  slideFriction: 1.15,
+  /**
+   * Quadratic drag above `slideDragSpeed`, 1/m. Gives a long descent a real
+   * terminal speed (~19-20 m/s on a 30-40° ramp) instead of running into
+   * `speedHardCap` — a safety clamp is not a design. It is deliberately zero at
+   * the speeds a flat slide reaches, so it cannot quietly tax the slide-jump
+   * chain, which is measured in single percent.
+   */
+  slideDrag: 0.16,
+  slideDragSpeed: 10.0,
+  slideMinSpeed: 3.0,
+  slideMaxTime: 1.6,
+  slideSteer: 2.4,
+  slideCooldown: 0.30,
+  /** Fraction of gravity along the slope that accelerates a downhill slide. */
+  slideSlopeGain: 1.25,
+  /** Downhill relief applied to slide friction and to the slide timer. */
+  slideSlopeRelief: 3.0,
+  slideTimerRelief: 1.6,
+  /** A slide survives this much airtime — small drops do not break the chain. */
+  slideAirGrace: 0.22,
+  slideJumpBoost: 1.045,
+  /** Above this the slide-jump boost is not applied; the chain plateaus. */
+  slideJumpCap: 12.5,
+
+  /* ---- wall-bounce -------------------------------------------------------- */
+  wallBounceMinSpeed: 5.0,
+  /** Max |v̂·n| for a contact to count as shallow. 0.72 ≈ 46° off the wall. */
+  wallBounceMaxInto: 0.72,
+  wallBounceRetain: 1.0,
+  wallBounceLift: 1.35,
+  wallBounceCooldown: 0.30,
+  /**
+   * Air control is muted for this long after a bounce. Without it the same
+   * forward key that carried you into the wall immediately rotates the velocity
+   * back toward the view and cancels the redirect the wall just gave you — the
+   * bounce fires, and the player cannot see that it did.
+   */
+  wallBounceLock: 0.16,
+
+  /** Safety clamp only — 3.3 × sprint. Exists so nothing tunnels; it is not a
+   *  design cap and no legitimate chain reaches it. */
+  speedHardCap: 26,
+
   gravity: 20.5,
   jumpVelocity: 5.55,
   /** Grace window after leaving a ledge during which a jump still registers. */
   coyoteTime: 0.11,
   jumpBufferTime: 0.13,
-
-  /** Slide. */
-  slideEntrySpeed: 5.2,
-  slideBoost: 2.1,
-  slideFriction: 3.4,
-  slideMinSpeed: 2.5,
-  slideMaxTime: 1.15,
-  slideSteer: 2.4,
-  slideCooldown: 0.55,
 
   /** Stances — capsule heights and eye offsets. */
   standHeight: 1.80,
@@ -77,12 +203,19 @@ export const TUNING: Record<string, number> & {
   proneEye: 0.34,
   stanceBlendSpeed: 11,
 
-  /** Mantle / vault. */
-  mantleMaxHeight: 1.95,
+  /* ---- mantle / climb ------------------------------------------------------ */
+  /** 2.5 × `standHeight`. Apex's defining traversal affordance. */
+  mantleMaxHeight: 4.50,
   mantleMinHeight: 0.42,
-  mantleReach: 0.95,
-  mantleDurationLow: 0.36,
-  mantleDurationHigh: 0.62,
+  mantleReach: 1.05,
+  /** Below this it is a vault (fast, no commit); above it is a wall climb. */
+  mantleVaultHeight: 1.05,
+  mantleClimbHeight: 2.20,
+  mantleDurationLow: 0.30,
+  mantleDurationHigh: 1.15,
+  mantleCooldown: 0.25,
+  /** Forward speed carried out of a climb. */
+  mantleExitSpeed: 1.9,
 
   /** Lean. */
   leanAngle: 0.30,
@@ -116,13 +249,57 @@ export interface MovementOutput {
   landImpact: number;
   /** True on the frame a mantle starts. */
   mantleStarted: boolean;
+
+  /* --- traversal, published for the animation layer ------------------------ */
+  /** Which climb is running, so a clip can be chosen by kind rather than height. */
+  mantleKind: MantleKind;
+  /** Height of the ledge being climbed, metres. Valid while `mantleKind` ≠ none. */
+  mantleHeight: number;
+  /** Total duration of the climb, seconds — drives clip playback rate. */
+  mantleDuration: number;
+  /** Climb progress in [0,1]. */
+  mantleProgress: number;
+  /** True on the step a wall-bounce fired. */
+  wallBounce: boolean;
+  /** True on the step a tap-strafe redirect window opened. */
+  tapStrafe: boolean;
+  /** True on the step a slide-jump fired. */
+  slideJump: boolean;
+  /** Horizontal speed in m/s — animation wants the real number, not 0..1. */
+  speed: number;
+  /** Vertical velocity, m/s. */
+  verticalSpeed: number;
+  /** Seconds since leaving the ground; 0 while grounded. */
+  airTime: number;
 }
 
-function moveResult(): CharacterMoveResult {
+/**
+ * State carried across steps that `MovementState` (a shared contract this
+ * package does not own) has no field for.
+ *
+ * They are written onto the captured state object as extra own properties, so a
+ * capture → restore round-trip is exact and `movementStatesIdentical` still
+ * compares them. What it cannot survive is `copyMovementState`, which only knows
+ * the declared fields — see the note on `copyState`.
+ */
+interface ApexMovementState extends MovementState {
+  axPrevMoveY: number;
+  axTapWindow: number;
+  axWallCooldown: number;
+  axMantleCooldown: number;
+  axMantleHeight: number;
+  axMantleKind: number;
+  axGroundY: number;
+}
+
+function moveResult(): CharacterMoveResultEx {
   return {
     applied: new THREE.Vector3(), grounded: false,
     groundNormal: new THREE.Vector3(0, 1, 0), groundSurface: 'concrete',
     blocked: false, ceiling: false, impactSpeed: 0,
+    // Allocated so `CapsuleCharacterController` fills them in — see
+    // `CharacterMoveResultEx`.
+    wallNormal: new THREE.Vector3(), stepped: false, stepRise: 0,
   };
 }
 
@@ -147,6 +324,12 @@ export class Movement {
    */
   emitEvents = true;
 
+  /** Diagnostic counters — read by the movement lab, never by the simulation. */
+  wallBounceCount = 0;
+  tapStrafeCount = 0;
+  mantleCount = 0;
+  slideJumpCount = 0;
+
   private controller: CharacterController | null = null;
   private physics: PhysicsAPI | null = null;
   private result = moveResult();
@@ -154,6 +337,8 @@ export class Movement {
   private hit2 = rayHit();
   /** Buttons of the previous command — press edges are derived, not sent. */
   private prevButtons = 0;
+  /** Forward axis of the previous command — the tap-strafe edge comes off this. */
+  private prevMoveY = 0;
   private legacyCommands: CommandBuilder | null = null;
 
   /* stance */
@@ -173,10 +358,20 @@ export class Movement {
   private lean = 0;
   private stepAccum = 0;
   private stepPhase = 0;
+  /** Seconds of amplified air control remaining. */
+  private tapWindow = 0;
+  private wallCooldown = 0;
+  private mantleCooldown = 0;
+  /** Seconds a slide has been airborne; a slide survives `slideAirGrace`. */
+  private slideAirTime = 0;
+  /** Foot height of the last ground contact — the datum a climb is measured from. */
+  private lastGroundY = 0;
 
   /* mantle */
   private mantleT = 0;
   private mantleDuration = 0;
+  private mantleHeight = 0;
+  private mantleKind: MantleKind = 'none';
   private readonly mantleStart = new THREE.Vector3();
   private readonly mantleEnd = new THREE.Vector3();
   private readonly mantleMid = new THREE.Vector3();
@@ -189,11 +384,15 @@ export class Movement {
   private readonly _tmp = new THREE.Vector3();
   private readonly _origin = new THREE.Vector3();
   private readonly _dir = new THREE.Vector3();
+  private readonly _slope = new THREE.Vector3();
 
   readonly out: MovementOutput = {
     state: 'idle', eyeOffset: TUNING.standEye - TUNING.standHeight * 0.5, lean: 0,
     speed01: 0, stepPhase: 0, grounded: true, groundSurface: 'concrete',
     landImpact: 0, mantleStarted: false,
+    mantleKind: 'none', mantleHeight: 0, mantleDuration: 0, mantleProgress: 0,
+    wallBounce: false, tapStrafe: false, slideJump: false,
+    speed: 0, verticalSpeed: 0, airTime: 0,
   };
 
   attach(physics: PhysicsAPI): void {
@@ -207,11 +406,18 @@ export class Movement {
     this.yaw = yaw;
     this.state = 'idle';
     this.mantleT = 0;
+    this.mantleKind = 'none';
     this.prevButtons = 0;
+    this.prevMoveY = 0;
     this.jumpBuffer = 0;
     this.slideTime = 0;
     this.slideCooldown = 0;
+    this.slideAirTime = 0;
     this.sprintTime = 0;
+    this.tapWindow = 0;
+    this.wallCooldown = 0;
+    this.mantleCooldown = 0;
+    this.lastGroundY = p.y - this.currentHeight * 0.5;
     this.controller?.teleport?.(p);
   }
 
@@ -238,15 +444,23 @@ export class Movement {
     const yaw = cmd.yaw;
     const buttons = cmd.buttons;
     const prev = this.prevButtons;
+    const prevMoveY = this.prevMoveY;
     this.prevButtons = buttons;
+    this.prevMoveY = cmd.moveY;
 
     this.yaw = yaw;
     this.out.landImpact = 0;
     this.out.mantleStarted = false;
+    this.out.wallBounce = false;
+    this.out.tapStrafe = false;
+    this.out.slideJump = false;
 
     const jumpPressed = (buttons & BTN.JUMP) !== 0 && (prev & BTN.JUMP) === 0;
     this.jumpBuffer = Math.max(0, this.jumpBuffer - dt);
     this.slideCooldown = Math.max(0, this.slideCooldown - dt);
+    this.tapWindow = Math.max(0, this.tapWindow - dt);
+    this.wallCooldown = Math.max(0, this.wallCooldown - dt);
+    this.mantleCooldown = Math.max(0, this.mantleCooldown - dt);
     if (jumpPressed) this.jumpBuffer = TUNING.jumpBufferTime;
 
     if (this.state === 'mantle') { this.stepMantle(dt); return this.out; }
@@ -274,6 +488,19 @@ export class Movement {
     if (wishLen > 1) this._wish.multiplyScalar(1 / wishLen);
     const wishing = wishLen > 0.06;
 
+    // ---- tap-strafe edge --------------------------------------------------
+    // Apex players bind forward to the scroll wheel: every notch is a release
+    // and a re-press. We look for exactly that shape on the analog forward axis,
+    // which means a keyboard tap and a scroll notch produce the same mechanic
+    // and neither is special-cased.
+    if (!grounded
+      && moveY >= TUNING.tapStrafeOn && prevMoveY < TUNING.tapStrafeOff
+      && this.horizontalSpeed() > TUNING.tapStrafeMinSpeed) {
+      this.tapWindow = TUNING.tapStrafeTime;
+      this.out.tapStrafe = true;
+      this.tapStrafeCount++;
+    }
+
     // ---- stance / sprint / slide decisions ------------------------------
     const forwardIntent = moveY;
     const wantsSprint = (buttons & BTN.SPRINT) !== 0
@@ -286,23 +513,31 @@ export class Movement {
     } else if (
       this.crouchHeld && grounded && this.slideCooldown <= 0
       && this.horizontalSpeed() >= TUNING.slideEntrySpeed
-      && (this.sprintTime > 0 || this.state === 'sprint' || this.state === 'tacSprint')
+      && (this.sprintTime > 0 || this.state === 'sprint' || this.state === 'tacSprint'
+        || this.horizontalSpeed() >= TUNING.sprintSpeed)
     ) {
       this.enterSlide();
     }
 
+    // ---- jump decision, taken before the acceleration ---------------------
+    // Resolved here rather than after, because ground friction needs the answer:
+    // a landing step that is already going to jump must keep its speed. That is
+    // the whole of bunny-hop retention — without it a single 8.3 ms tick of
+    // friction costs ~12% per hop and the chain dies in three bounces. Taking
+    // the decision once also means one `canStand` raycast instead of two, and
+    // the friction skip can never disagree with the jump it was skipped for.
+    const canJump = (grounded || this.groundedTime < TUNING.coyoteTime)
+      && this.state !== 'prone' && this.jumpBuffer > 0 && this.canStand();
+
     // ---- acceleration ----------------------------------------------------
     const maxSpeed = this.targetSpeed(moveX, moveY, wantsSprint, adsHeld);
     if (this.state !== 'slide') {
-      if (grounded) this.accelerateGround(this._wish, maxSpeed, dt, wishing);
-      else this.accelerateAir(this._wish, maxSpeed, dt);
+      if (grounded) this.accelerateGround(this._wish, maxSpeed, dt, wishing, canJump);
+      else this.accelerateAir(this._wish, maxSpeed, dt, moveX, moveY);
     }
 
-    // ---- jump ------------------------------------------------------------
-    const canJump = (grounded || this.groundedTime < TUNING.coyoteTime)
-      && this.state !== 'prone' && this.jumpBuffer > 0 && this.canStand();
     if (canJump) {
-      if (this.state === 'slide') this.exitSlide();
+      if (this.state === 'slide') this.slideJump();
       this.velocity.y = TUNING.jumpVelocity;
       this.jumpBuffer = 0;
       this.groundedTime = 999;
@@ -313,7 +548,9 @@ export class Movement {
     if (this.velocity.y < -55) this.velocity.y = -55;
 
     // ---- mantle detection -------------------------------------------------
-    if (!grounded || this.velocity.y > 0.5) {
+    // Airborne (including the first tick of a jump, which is how a standing
+    // wall-climb is initiated) and pushing into the wall.
+    if (this.mantleCooldown <= 0 && (!grounded || this.velocity.y > 0.5)) {
       if (wishing && this.tryMantle()) return this.out;
     }
 
@@ -329,16 +566,7 @@ export class Movement {
         this.velocity.y = 0;
       }
       if (this.result.ceiling && this.velocity.y > 0) this.velocity.y = 0;
-      if (this.result.blocked) {
-        // Kill the component of velocity into the wall so we do not build up
-        // pressure and pop out when the wall ends.
-        const applied = this.result.applied;
-        if (applied.lengthSq() > 1e-8) {
-          this._tmp.copy(applied).normalize();
-          const along = this.velocity.dot(this._tmp);
-          this.velocity.copy(this._tmp).multiplyScalar(Math.max(0, along));
-        }
-      }
+      this.resolveWall(wasGrounded);
     } else {
       this.position.add(this._motion);
       this.out.grounded = this.position.y <= this.currentHeight * 0.5;
@@ -349,8 +577,19 @@ export class Movement {
       }
     }
 
-    if (this.out.grounded) { this.groundedTime = 0; this.airTime = 0; }
-    else { this.groundedTime += dt; this.airTime += dt; }
+    // Safety clamp only — see `speedHardCap`.
+    const hs0 = this.horizontalSpeed();
+    if (hs0 > TUNING.speedHardCap) {
+      const k = TUNING.speedHardCap / hs0;
+      this.velocity.x *= k;
+      this.velocity.z *= k;
+    }
+
+    if (this.out.grounded) {
+      this.groundedTime = 0;
+      this.airTime = 0;
+      this.lastGroundY = this.position.y - this.currentHeight * 0.5;
+    } else { this.groundedTime += dt; this.airTime += dt; }
 
     // ---- footsteps --------------------------------------------------------
     this.updateFootsteps(dt);
@@ -370,6 +609,9 @@ export class Movement {
 
     this.out.state = this.state;
     this.out.speed01 = Math.min(1, hs / TUNING.tacSprintSpeed);
+    this.out.speed = hs;
+    this.out.verticalSpeed = this.velocity.y;
+    this.out.airTime = this.airTime;
     this.out.stepPhase = this.stepPhase;
     this.out.eyeOffset = this.eye - this.currentHeight * 0.5;
     this.out.lean = this.lean;
@@ -400,11 +642,17 @@ export class Movement {
     return base;
   }
 
-  private accelerateGround(wish: THREE.Vector3, maxSpeed: number, dt: number, wishing: boolean): void {
-    // Friction first, applied to the horizontal plane only.
+  private accelerateGround(
+    wish: THREE.Vector3, maxSpeed: number, dt: number, wishing: boolean, hopping: boolean,
+  ): void {
+    // Friction first, applied to the horizontal plane only. A step that is about
+    // to jump skips it entirely — see `hopping` at the call site.
     const speed = this.horizontalSpeed();
-    if (speed > 0.0001) {
-      const drop = Math.max(speed, 2.0) * TUNING.groundFriction * dt * (wishing ? 0.55 : 1);
+    if (speed > 0.0001 && !hopping) {
+      // Above sprint speed the world lets go of you more slowly, which is what
+      // makes a landing feel like a landing and not a handbrake.
+      const rate = speed > TUNING.tacSprintSpeed ? TUNING.groundFrictionFast : TUNING.groundFriction;
+      const drop = Math.max(speed, 2.0) * rate * dt * (wishing ? 0.55 : 1);
       const scale = Math.max(0, speed - drop) / speed;
       this.velocity.x *= scale;
       this.velocity.z *= scale;
@@ -412,7 +660,9 @@ export class Movement {
     if (!wishing) return;
 
     // Quake-style projected acceleration: preserves speed when strafing, which is
-    // what makes direction changes feel crisp rather than mushy.
+    // what makes direction changes feel crisp rather than mushy. Note it can only
+    // ever *add* — a player already faster than `maxSpeed` is never braked here,
+    // which is what lets momentum survive a touch of ground.
     const current = this.velocity.x * wish.x + this.velocity.z * wish.z;
     const add = maxSpeed - current;
     if (add <= 0) return;
@@ -421,14 +671,175 @@ export class Movement {
     this.velocity.z += wish.z * accel;
   }
 
-  private accelerateAir(wish: THREE.Vector3, maxSpeed: number, dt: number): void {
-    const target = maxSpeed * TUNING.airControl;
+  /**
+   * Air movement, in two parts that must not be confused with each other.
+   *
+   * **Acceleration** is the classic Quake/Source projection with the wish speed
+   * clamped to `airWishCap`. Because the clamp is on *how much of the wish
+   * direction you may already be moving in*, holding the stick toward your own
+   * velocity gains nothing at all, while holding it perpendicular gains
+   * `cap − v·ŵ` every tick. Turning the view so the wish direction tracks just
+   * outside your velocity is what accelerates you, and doing it well is the
+   * skill.
+   *
+   * **Air control** is a rotation, not an acceleration: it re-points the
+   * velocity vector without changing its length. It is gated to forward-only
+   * input exactly as in Quake3, which is what keeps it from quietly undoing a
+   * strafe, and it is what a tap-strafe amplifies.
+   */
+  private accelerateAir(
+    wish: THREE.Vector3, maxSpeed: number, dt: number, moveX: number, moveY: number,
+  ): void {
+    const speed = this.horizontalSpeed();
+
+    // --- 1. projected acceleration with a capped wish speed ------------------
+    const cap = Math.min(
+      TUNING.airCapBaseSpeed,
+      Math.max(TUNING.airWishCap, TUNING.airCapBaseSpeed - speed * TUNING.airCapFalloff),
+    );
+    const capped = Math.min(maxSpeed, cap);
     const current = this.velocity.x * wish.x + this.velocity.z * wish.z;
-    const add = target - current;
-    if (add <= 0) return;
-    const accel = Math.min(TUNING.airAccel * maxSpeed * dt, add);
-    this.velocity.x += wish.x * accel;
-    this.velocity.z += wish.z * accel;
+    const add = capped - current;
+    if (add > 0) {
+      const accel = Math.min(TUNING.airAccel * dt, add);
+      this.velocity.x += wish.x * accel;
+      this.velocity.z += wish.z * accel;
+    }
+
+    // --- 2. air control / tap-strafe ----------------------------------------
+    this.airControl(wish, dt, moveX, moveY);
+  }
+
+  /**
+   * Quake3/CPMA air control: rotate the horizontal velocity toward the wish
+   * direction, preserving its magnitude exactly. Forward-only, and weighted by
+   * `dot²` so it falls away as the redirect gets wider — except during a
+   * tap-strafe window, which both amplifies the rate and widens the angle it
+   * will work across.
+   */
+  private airControl(wish: THREE.Vector3, dt: number, moveX: number, moveY: number): void {
+    const tapping = this.tapWindow > 0;
+    if (moveY <= 0.1) return;
+    // A wall-bounce commits: see `wallBounceLock`.
+    if (this.wallCooldown > TUNING.wallBounceCooldown - TUNING.wallBounceLock) return;
+    if (!tapping && Math.abs(moveX) > TUNING.airControlMaxStrafe) return;
+
+    const speed = this.horizontalSpeed();
+    if (speed < 0.05) return;
+
+    const vx = this.velocity.x / speed, vz = this.velocity.z / speed;
+    const dot = vx * wish.x + vz * wish.z;
+    const floor = tapping ? TUNING.tapStrafeDotFloor : 0;
+    if (dot <= floor) return;
+
+    // Angle we may sweep this step.
+    const weight = tapping ? 1 : dot * dot;
+    const rate = tapping ? TUNING.tapStrafeTurn : TUNING.airControlTurn;
+    const maxTurn = rate * weight * dt;
+
+    const angle = Math.acos(THREE.MathUtils.clamp(dot, -1, 1));
+    if (angle < 1e-4) return;
+    const turn = Math.min(angle, maxTurn);
+
+    // Rotate (vx, vz) toward (wish.x, wish.z) by `turn`, in the plane's own
+    // handedness. Cross product's y component gives the sign.
+    const cross = vx * wish.z - vz * wish.x;
+    const s = cross >= 0 ? 1 : -1;
+    const c = Math.cos(turn * s), sn = Math.sin(turn * s);
+    const nx = vx * c - vz * sn;
+    const nz = vx * sn + vz * c;
+    this.velocity.x = nx * speed;
+    this.velocity.z = nz * speed;
+  }
+
+  /**
+   * Reacts to whatever the collide-and-slide solver ran into.
+   *
+   * This is the fix for the audited blocker. The previous implementation rebuilt
+   * the velocity from the *applied displacement*, so a successful step-up — whose
+   * displacement necessarily has an upward component — rewrote horizontal speed
+   * as vertical speed and launched the player off every kerb. Nothing here writes
+   * `velocity.y` except a deliberate wall-bounce.
+   */
+  private resolveWall(wasGrounded: boolean): void {
+    const r = this.result;
+    // A step-up is not a collision as far as momentum is concerned: the whole
+    // point of a step is that you keep walking. Leave the velocity alone.
+    if (r.stepped) return;
+    if (!r.blocked) return;
+
+    const n = r.wallNormal;
+    if (!n || n.lengthSq() < 1e-8) return;
+
+    // Work in the horizontal plane: a wall's tilt must never become lift.
+    this._tmp.set(n.x, 0, n.z);
+    const len = this._tmp.length();
+    if (len < 1e-6) return;
+    this._tmp.multiplyScalar(1 / len);
+
+    const speed = this.horizontalSpeed();
+    const into = -(this.velocity.x * this._tmp.x + this.velocity.z * this._tmp.z);
+    if (into <= 0) return;                    // already moving away
+    if (!this.wallConfirmed(this._tmp)) return;
+
+    // --- wall-bounce: a shallow airborne contact reflects instead of stopping.
+    const shallow = speed > 1e-4 && into / speed < TUNING.wallBounceMaxInto;
+    if (!wasGrounded && !this.out.grounded && shallow
+      && speed >= TUNING.wallBounceMinSpeed && this.wallCooldown <= 0) {
+      // Keep the tangential component, mirror the normal component.
+      this.velocity.x += this._tmp.x * into * 2;
+      this.velocity.z += this._tmp.z * into * 2;
+      const after = this.horizontalSpeed();
+      if (after > 1e-4) {
+        const k = (speed * TUNING.wallBounceRetain) / after;
+        this.velocity.x *= k;
+        this.velocity.z *= k;
+      }
+      if (this.velocity.y < TUNING.wallBounceLift) this.velocity.y = TUNING.wallBounceLift;
+      this.wallCooldown = TUNING.wallBounceCooldown;
+      this.out.wallBounce = true;
+      this.wallBounceCount++;
+      return;
+    }
+
+    // --- otherwise just remove the component pushing into the wall, so we do
+    // not build up pressure and pop out when the wall ends. Horizontal only.
+    this.velocity.x += this._tmp.x * into;
+    this.velocity.z += this._tmp.z * into;
+  }
+
+  /**
+   * Second opinion on a reported wall, from two short rays.
+   *
+   * A swept capsule resting on the floor grazes it, and the solver's contact
+   * normal on a grazing hit comes off the edge cone of the face rather than the
+   * face itself — so once in a few hundred steps a run across dead-flat ground
+   * reports `blocked` with a normal pointing straight back at the player. It is
+   * one tick, but cancelling velocity against it stops a sprint dead, and a
+   * sprint that stops dead once every few seconds is exactly the "not smooth"
+   * the playtest complained about.
+   *
+   * Two rays — one just above the step height, one at the capsule centre —
+   * settle it. A real wall is in front of at least one of them; a phantom floor
+   * contact is in front of neither. This runs only on steps that actually
+   * reported a blocker, which on open ground is almost never.
+   */
+  private wallConfirmed(n: THREE.Vector3): boolean {
+    if (!this.physics) return true;
+    this._dir.set(-n.x, 0, -n.z);
+    const l = this._dir.length();
+    if (l < 1e-6) return false;
+    this._dir.multiplyScalar(1 / l);
+    const reach = 0.34 + 0.12;                 // capsule radius + margin
+    const feet = this.position.y - this.currentHeight * 0.5;
+
+    this._origin.set(this.position.x, feet + 0.52, this.position.z);
+    this.physics.raycast(this._origin, this._dir, reach, MASK_MOVE, this.hit);
+    if (this.hit.hit) return true;
+
+    this._origin.set(this.position.x, this.position.y, this.position.z);
+    this.physics.raycast(this._origin, this._dir, reach, MASK_MOVE, this.hit);
+    return this.hit.hit;
   }
 
   private updateStance(dt: number, wantCrouch: boolean, wantProne: boolean): void {
@@ -455,9 +866,14 @@ export class Movement {
     const prevHeight = this.currentHeight;
     this.currentHeight += (want - this.currentHeight) * k;
     this.eye += (wantEye - this.eye) * k;
-    // Keep the feet planted while the capsule shrinks/grows.
-    this.position.y += (this.currentHeight - prevHeight) * 0.5;
-    this.controller?.setHeight(this.currentHeight);
+    // Keeping the feet planted while the capsule shrinks is the *controller's*
+    // job (`setHeight` queues exactly this shift, and every other character in
+    // the game relies on it). Doing it here as well applied the correction
+    // twice and the depenetration pass had to claw half of it back, which is
+    // what put ~19 mm of vertical wobble into a crouch that measures 0 without
+    // it. The no-controller fallback path still needs it.
+    if (this.controller) this.controller.setHeight(this.currentHeight);
+    else this.position.y += (this.currentHeight - prevHeight) * 0.5;
   }
 
   private canStand(target = TUNING.standHeight): boolean {
@@ -476,31 +892,77 @@ export class Movement {
     if (Math.abs(this.lean) < 0.001) this.lean = 0;
   }
 
+  /* ------------------------------------------------------------------ slide */
+
   private enterSlide(): void {
     this.state = 'slide';
     this.slideTime = 0;
+    this.slideAirTime = 0;
     const speed = this.horizontalSpeed();
     if (speed > 0.001) {
-      const boost = (speed + TUNING.slideBoost) / speed;
-      this.velocity.x *= boost;
-      this.velocity.z *= boost;
+      // The boost fades to nothing by `slideBoostFalloff`, so slide → jump →
+      // slide converges on a plateau instead of compounding without bound. This
+      // is the difference between a chainable mechanic and an exploit.
+      const gain = TUNING.slideBoost * Math.max(0, 1 - speed / TUNING.slideBoostFalloff);
+      const k = (speed + gain) / speed;
+      this.velocity.x *= k;
+      this.velocity.z *= k;
     }
     if (this.emitEvents) bus.emit('player:slide', { start: true });
   }
 
-  private exitSlide(): void {
+  private exitSlide(cooldown = TUNING.slideCooldown): void {
     this.state = this.crouchHeld ? 'crouchIdle' : 'idle';
-    this.slideCooldown = TUNING.slideCooldown;
+    this.slideCooldown = cooldown;
+    this.slideAirTime = 0;
     if (this.emitEvents) bus.emit('player:slide', { start: false });
   }
 
+  /**
+   * Jumping out of a slide. Apex's signature chain: the horizontal velocity is
+   * kept in full and nudged, and no slide cooldown is imposed, so the player can
+   * be sliding again the tick they land.
+   */
+  private slideJump(): void {
+    const speed = this.horizontalSpeed();
+    if (speed > 0.001 && speed < TUNING.slideJumpCap) {
+      const k = TUNING.slideJumpBoost;
+      this.velocity.x *= k;
+      this.velocity.z *= k;
+    }
+    this.exitSlide(0);
+    this.out.slideJump = true;
+    this.slideJumpCount++;
+  }
+
   private stepSlide(dt: number, moveX: number): void {
-    this.slideTime += dt;
     const speed = this.horizontalSpeed();
 
-    // Steering: rotate the velocity toward the look direction rather than
+    // --- slope: gravity along the surface. A slide is a ride downhill.
+    let downhill = 0;
+    const n = this.result.groundNormal;
+    const nh = Math.sqrt(n.x * n.x + n.z * n.z);
+    if (this.out.grounded && nh > 1e-4 && speed > 1e-4) {
+      // The horizontal part of a surface normal points straight downhill.
+      this._slope.set(n.x / nh, 0, n.z / nh);
+      const sinTheta = Math.min(1, nh);
+      const accel = TUNING.gravity * sinTheta * TUNING.slideSlopeGain;
+      this.velocity.x += this._slope.x * accel * dt;
+      this.velocity.z += this._slope.z * accel * dt;
+      // How much of our travel is downhill, 0..1 — drives friction relief.
+      const along = (this.velocity.x * this._slope.x + this.velocity.z * this._slope.z)
+        / Math.max(1e-4, this.horizontalSpeed());
+      downhill = Math.max(0, along) * sinTheta;
+    }
+
+    // The clock only really runs on the flat: a slide that is still gaining
+    // speed should not be cut off by a timer.
+    this.slideTime += dt * Math.max(0, 1 - TUNING.slideTimerRelief * downhill);
+
+    // --- steering: rotate the velocity toward the input rather than
     // accelerating, so the slide keeps its momentum.
-    if (Math.abs(moveX) > 0.05 && speed > 0.1) {
+    const s2 = this.horizontalSpeed();
+    if (Math.abs(moveX) > 0.05 && s2 > 0.1) {
       const angle = -moveX * TUNING.slideSteer * dt;
       const cos = Math.cos(angle), sin = Math.sin(angle);
       const vx = this.velocity.x, vz = this.velocity.z;
@@ -508,20 +970,40 @@ export class Movement {
       this.velocity.z = vx * sin + vz * cos;
     }
 
-    const drop = TUNING.slideFriction * dt * Math.max(1, speed * 0.35);
-    const scale = speed > 0 ? Math.max(0, speed - drop) / speed : 0;
+    // --- friction, relieved by how much of the motion is downhill, plus a
+    // quadratic drag that sets the terminal speed of a long descent.
+    const relief = Math.max(0.15, 1 - TUNING.slideSlopeRelief * downhill);
+    const over = Math.max(0, s2 - TUNING.slideDragSpeed);
+    const drop = TUNING.slideFriction * relief * dt * Math.max(1, s2 * 0.35)
+      + TUNING.slideDrag * over * over * dt;
+    const scale = s2 > 0 ? Math.max(0, s2 - drop) / s2 : 0;
     this.velocity.x *= scale;
     this.velocity.z *= scale;
 
+    // --- airborne grace: a small drop mid-slide does not break the chain.
+    if (this.out.grounded) this.slideAirTime = 0;
+    else this.slideAirTime += dt;
+
     if (this.slideTime > TUNING.slideMaxTime
       || this.horizontalSpeed() < TUNING.slideMinSpeed
-      || !this.out.grounded
+      || this.slideAirTime > TUNING.slideAirGrace
       || (!this.crouchHeld && this.canStand())) {
       this.exitSlide();
     }
   }
 
-  /** Looks for a ledge in front at a mantle-able height and starts the climb. */
+  /* ----------------------------------------------------------------- mantle */
+
+  /**
+   * Looks for a ledge in front and starts the climb.
+   *
+   * Reach goes to `mantleMaxHeight` = 2.5 × character height, which is the Apex
+   * affordance: almost any roofline in the level is traversable, and the whole
+   * layout of a map reads differently because of it. The climb is a committed,
+   * timed traversal — input is ignored until it finishes — and its kind, height
+   * and duration are published on `out` so the animation layer can pick a clip
+   * and play it at the right rate.
+   */
   private tryMantle(): boolean {
     if (!this.physics) return false;
     const feet = this.position.y - this.currentHeight * 0.5;
@@ -530,7 +1012,13 @@ export class Movement {
     // 1. Is there a wall in front at chest height?
     this._origin.set(this.position.x, feet + 0.9, this.position.z);
     this.physics.raycast(this._origin, this._forward, TUNING.mantleReach, MASK_MOVE, this.hit);
-    if (!this.hit.hit) return false;
+    if (!this.hit.hit) {
+      // Low obstacles have nothing at chest height — look at shin height too, so
+      // a 0.5 m crate is a vault rather than a wall you bump into.
+      this._origin.set(this.position.x, feet + 0.35, this.position.z);
+      this.physics.raycast(this._origin, this._forward, TUNING.mantleReach, MASK_MOVE, this.hit);
+      if (!this.hit.hit) return false;
+    }
     // Only mantle roughly-vertical faces.
     if (Math.abs(this.hit.normal.y) > 0.45) return false;
 
@@ -543,6 +1031,11 @@ export class Movement {
 
     const ledgeHeight = this.hit2.point.y - feet;
     if (ledgeHeight < TUNING.mantleMinHeight || ledgeHeight > TUNING.mantleMaxHeight) return false;
+    // Measured from the ground the player launched from, not from wherever the
+    // jump has carried them to — otherwise the jump silently adds its own apex
+    // to the reach and "2.5 × character height" becomes 2.9 ×. The limit has to
+    // mean something a level designer can build against.
+    if (this.hit2.point.y - this.lastGroundY > TUNING.mantleMaxHeight) return false;
     if (this.hit2.normal.y < 0.6) return false; // not a walkable top
 
     // 3. Headroom check above the landing spot.
@@ -552,19 +1045,39 @@ export class Movement {
     this.physics.raycast(this._origin, this._dir, TUNING.standHeight * 0.9, MASK_MOVE, this.hit);
     if (this.hit.hit) return false;
 
-    const high = ledgeHeight > 1.0;
+    const kind: MantleKind = ledgeHeight <= TUNING.mantleVaultHeight ? 'vault'
+      : ledgeHeight <= TUNING.mantleClimbHeight ? 'mantle' : 'climb';
+
     this.mantleStart.copy(this.position);
     this.mantleEnd.copy(this.hit2.point).addScaledVector(this._forward, 0.34);
     this.mantleEnd.y += this.currentHeight * 0.5 + 0.02;
-    // Arc through a point above the ledge lip so the body clears the edge.
+    // Arc through a point above the ledge lip so the body clears the edge. For a
+    // tall climb the control point sits directly above the start, which is what
+    // makes it read as hauling yourself up a wall rather than floating over it.
     this.mantleMid.copy(this.mantleStart);
-    this.mantleMid.y = this.mantleEnd.y + (high ? 0.18 : 0.06);
+    this.mantleMid.y = this.mantleEnd.y + (kind === 'vault' ? 0.06 : 0.18);
 
+    // Duration scales with the climb: a knee-high vault is over before you
+    // notice, a two-storey climb is a real commitment.
+    const t = THREE.MathUtils.clamp(
+      (ledgeHeight - TUNING.mantleMinHeight) / (TUNING.mantleMaxHeight - TUNING.mantleMinHeight),
+      0, 1,
+    );
+    this.mantleDuration = TUNING.mantleDurationLow
+      + (TUNING.mantleDurationHigh - TUNING.mantleDurationLow) * t;
     this.mantleT = 0;
-    this.mantleDuration = high ? TUNING.mantleDurationHigh : TUNING.mantleDurationLow;
+    this.mantleHeight = ledgeHeight;
+    this.mantleKind = kind;
     this.state = 'mantle';
     this.velocity.set(0, 0, 0);
+
     this.out.mantleStarted = true;
+    this.out.mantleKind = kind;
+    this.out.mantleHeight = ledgeHeight;
+    this.out.mantleDuration = this.mantleDuration;
+    this.out.mantleProgress = 0;
+    this.out.state = this.state;
+    this.mantleCount++;
     if (this.emitEvents) bus.emit('player:mantle', undefined);
     return true;
   }
@@ -579,16 +1092,27 @@ export class Movement {
       it * it * this.mantleStart.y + 2 * it * t * this.mantleMid.y + t * t * this.mantleEnd.y,
       it * it * this.mantleStart.z + 2 * it * t * this.mantleMid.z + t * t * this.mantleEnd.z,
     );
+    this.controller?.teleport?.(this.position);
     this.out.grounded = false;
     this.out.state = this.state = 'mantle';
     this.out.speed01 = 0.4;
+    this.out.speed = 0;
+    this.out.verticalSpeed = 0;
+    this.out.mantleKind = this.mantleKind;
+    this.out.mantleHeight = this.mantleHeight;
+    this.out.mantleDuration = this.mantleDuration;
+    this.out.mantleProgress = t;
     this.out.eyeOffset = this.eye - this.currentHeight * 0.5;
 
     if (t >= 1) {
       this.state = 'idle';
       this.out.grounded = true;
-      // Carry a little forward momentum out of the mantle.
-      this._forward.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw)).multiplyScalar(1.6);
+      this.out.mantleKind = this.mantleKind = 'none';
+      this.out.mantleProgress = 1;
+      this.mantleCooldown = TUNING.mantleCooldown;
+      // Carry forward momentum out of the climb.
+      this._forward.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw))
+        .multiplyScalar(TUNING.mantleExitSpeed);
       this.velocity.set(this._forward.x, 0, this._forward.z);
     }
   }
@@ -654,6 +1178,20 @@ export class Movement {
     out.grounded = this.out.grounded;
     out.groundSurface = this.out.groundSurface;
     out.prevButtons = this.prevButtons;
+
+    // Apex additions. `MovementState` is a shared contract owned elsewhere, so
+    // these ride along as extra own properties — see `ApexMovementState`.
+    const ax = out as ApexMovementState;
+    ax.axPrevMoveY = this.prevMoveY;
+    ax.axTapWindow = this.tapWindow;
+    ax.axWallCooldown = this.wallCooldown;
+    ax.axMantleCooldown = this.mantleCooldown;
+    ax.axMantleHeight = this.mantleHeight;
+    ax.axMantleKind = MANTLE_KINDS.indexOf(this.mantleKind);
+    ax.axGroundY = this.lastGroundY;
+    // `slideAirTime` is folded into the slide timer rather than given a field of
+    // its own: it is only ever non-zero inside a slide that is already about to
+    // end, and the extra field would cost a wire slot for nothing.
     return out;
   }
 
@@ -684,6 +1222,16 @@ export class Movement {
     this.mantleEnd.set(s.mex, s.mey, s.mez);
     this.prevButtons = s.prevButtons;
 
+    const ax = s as ApexMovementState;
+    this.prevMoveY = ax.axPrevMoveY ?? 0;
+    this.tapWindow = ax.axTapWindow ?? 0;
+    this.wallCooldown = ax.axWallCooldown ?? 0;
+    this.mantleCooldown = ax.axMantleCooldown ?? 0;
+    this.mantleHeight = ax.axMantleHeight ?? 0;
+    this.mantleKind = MANTLE_KINDS[ax.axMantleKind ?? 0] ?? 'none';
+    this.lastGroundY = ax.axGroundY ?? (s.py - s.currentHeight * 0.5);
+    this.slideAirTime = 0;
+
     // Derived outputs, so a caller that reads `out` before the next step sees
     // something coherent rather than the state we just threw away.
     this.out.grounded = s.grounded;
@@ -692,9 +1240,19 @@ export class Movement {
     this.out.lean = s.lean;
     this.out.stepPhase = s.stepPhase;
     this.out.eyeOffset = s.eye - s.currentHeight * 0.5;
-    this.out.speed01 = Math.min(1, Math.sqrt(s.vx * s.vx + s.vz * s.vz) / TUNING.tacSprintSpeed);
+    this.out.speed = Math.sqrt(s.vx * s.vx + s.vz * s.vz);
+    this.out.speed01 = Math.min(1, this.out.speed / TUNING.tacSprintSpeed);
+    this.out.verticalSpeed = s.vy;
+    this.out.airTime = s.airTime;
     this.out.landImpact = 0;
     this.out.mantleStarted = false;
+    this.out.wallBounce = false;
+    this.out.tapStrafe = false;
+    this.out.slideJump = false;
+    this.out.mantleKind = this.mantleKind;
+    this.out.mantleHeight = this.mantleHeight;
+    this.out.mantleDuration = this.mantleDuration;
+    this.out.mantleProgress = this.mantleDuration > 0 ? Math.min(1, this.mantleT) : 0;
 
     // The controller keeps internal state we do not snapshot (ground collider,
     // step debt, queued height shift). Teleporting first puts it in a known
@@ -707,9 +1265,30 @@ export class Movement {
   /** Convenience for callers that want a fresh state object of the right shape. */
   static createState(): MovementState { return createMovementState(); }
 
-  /** Copies a state without touching the simulation. */
+  /**
+   * Copies a state without touching the simulation.
+   *
+   * Note for whoever owns `src/player/MovementState.ts`: the six `ax*` fields
+   * this class writes in `capture` are not declared there, so
+   * `copyMovementState` does not carry them and a state that arrives over the
+   * wire has none. Local prediction and replay are exact (they always go through
+   * `capture`/`restore`), but a *host correction* will reset a tap-strafe window
+   * or a wall-bounce cooldown. Declaring `axPrevMoveY`, `axTapWindow`,
+   * `axWallCooldown`, `axMantleCooldown`, `axMantleHeight`, `axMantleKind` and
+   * `axGroundY` as numbers in `MovementState` + `copyMovementState` closes that
+   * gap; nothing else needs to change.
+   */
   static copyState(dst: MovementState, src: MovementState): MovementState {
-    return copyMovementState(dst, src);
+    copyMovementState(dst, src);
+    const a = src as ApexMovementState, b = dst as ApexMovementState;
+    b.axPrevMoveY = a.axPrevMoveY ?? 0;
+    b.axTapWindow = a.axTapWindow ?? 0;
+    b.axWallCooldown = a.axWallCooldown ?? 0;
+    b.axMantleCooldown = a.axMantleCooldown ?? 0;
+    b.axMantleHeight = a.axMantleHeight ?? 0;
+    b.axMantleKind = a.axMantleKind ?? 0;
+    b.axGroundY = a.axGroundY ?? 0;
+    return dst;
   }
 
   /** Reads the surface under the feet for footstep audio when the controller

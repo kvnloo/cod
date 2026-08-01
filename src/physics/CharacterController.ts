@@ -47,6 +47,51 @@ const GROUND_PROBE = 0.14;
 const GROUND_EPS = SKIN + 0.035;
 /** Assumed character mass when shoving dynamic props out of the way. */
 const CHARACTER_MASS = 82;
+/**
+ * Minimum height a step-up onto a genuine obstacle must gain. Below this there
+ * is nothing to step onto, and hopping the capsule in place costs a visible
+ * hitch for no traversal.
+ */
+const STEP_MIN_GAIN = 0.02;
+/**
+ * A blocking plane whose normal is this close to the normal of the surface we
+ * are already standing on is that same surface, seen through the edge cone of a
+ * grazing shape cast — not an obstacle.
+ *
+ * The separation is wide and was measured, not guessed: over a full lab run the
+ * phantom contacts on a 30°/40° ramp dot at 0.88, while every genuine blocker in
+ * the same run dots at 0.40 or below (a kerb face against flat ground dots at
+ * 0.00). 0.80 sits in the gap — 37° of daylight — and no real obstacle worth
+ * stepping onto is within 37° of the floor it stands on.
+ */
+const SAME_SURFACE_DOT = 0.80;
+
+/**
+ * Additive fields the solver fills in when the caller supplies them.
+ *
+ * `CharacterMoveResult` (src/physics/types.ts) is a shared contract this module
+ * does not own, so the two extra facts the Apex movement model needs are passed
+ * as *optional* fields: a caller that allocates them gets them, a caller that
+ * does not is unaffected. Both are strictly outputs.
+ *
+ * They exist because `blocked` alone is ambiguous. It is true both when a wall
+ * genuinely stopped you and when a 150 mm kerb was resolved by a step-up, and a
+ * caller that cannot tell the two apart has no choice but to guess — which is
+ * precisely the bug that launched the player off kerbs (Movement.ts:332 in the
+ * audited build: it rebuilt velocity from the *applied displacement*, whose y
+ * component is the step-up rise).
+ */
+export interface CharacterMoveResultEx extends CharacterMoveResult {
+  /**
+   * Unit normal of the wall that actually stopped horizontal motion, zeroed
+   * when nothing did. Never the normal of a plane a step-up climbed over.
+   */
+  wallNormal?: THREE.Vector3;
+  /** True when the slide phase resolved by stepping up onto something. */
+  stepped?: boolean;
+  /** Height gained by that step-up, metres. */
+  stepRise?: number;
+}
 
 export interface ControllerHost {
   readonly world: RAPIER.World;
@@ -118,6 +163,13 @@ export class CapsuleCharacterController implements CharacterController {
   private mask: number;
   private layer: number;
   private disposed = false;
+  /**
+   * Written as a plain field rather than a constructor parameter property so the
+   * file can be imported by node's type-stripping loader — that is what lets
+   * `tools/g1-movelab.mjs` drive the real controller against a real Rapier world
+   * headlessly, with no browser and no GPU.
+   */
+  private host: ControllerHost;
 
   /** Ground state carried between moves for snapping and platform riding. */
   private groundCollider = -1;
@@ -128,13 +180,18 @@ export class CapsuleCharacterController implements CharacterController {
   /** True when this move's slide phase resolved by stepping onto something. */
   private stepped = false;
   private stepNormal = new THREE.Vector3(0, 1, 0);
+  private stepRise = 0;
+  /** Normal of the wall that stopped horizontal motion, when one did. */
+  private wallHit = false;
+  private wallNormal = new THREE.Vector3();
 
   constructor(
-    private host: ControllerHost,
+    host: ControllerHost,
     radius: number,
     height: number,
     layer: number = LAYER.PLAYER,
   ) {
+    this.host = host;
     this.radius = Math.max(0.05, radius);
     this.height = Math.max(this.radius * 2 + 0.02, height);
     this.layer = layer;
@@ -227,6 +284,9 @@ export class CapsuleCharacterController implements CharacterController {
     vMotion.copy(motion);
 
     this.stepped = false;
+    this.stepRise = 0;
+    this.wallHit = false;
+    this.wallNormal.set(0, 0, 0);
     out.blocked = false;
     out.ceiling = false;
     out.grounded = false;
@@ -372,6 +432,16 @@ export class CapsuleCharacterController implements CharacterController {
     if (out.platformDelta) vTmp.add(out.platformDelta);
     out.impactSpeed = dt > 0 ? vTmp.length() / dt : 0;
 
+    // Optional extras — see `CharacterMoveResultEx`. Only written when the
+    // caller allocated somewhere to put them.
+    const ex = out as CharacterMoveResultEx;
+    if (ex.wallNormal) {
+      if (this.wallHit) ex.wallNormal.copy(this.wallNormal);
+      else ex.wallNormal.set(0, 0, 0);
+    }
+    if (ex.stepped !== undefined) ex.stepped = this.stepped;
+    if (ex.stepRise !== undefined) ex.stepRise = this.stepRise;
+
     // Keep the physical proxy in step so props and bullets see the character.
     rp.x = vPos.x; rp.y = vPos.y; rp.z = vPos.z;
     this.proxyBody.setNextKinematicTranslation(rp);
@@ -428,8 +498,15 @@ export class CapsuleCharacterController implements CharacterController {
         // Step-up: only worth trying from the ground, and only against something
         // that is close to vertical (a 60° slope should slide, not teleport up).
         if ((wasGrounded || this.grounded) && Math.abs(sweepA.normal.y) < 0.6
-          && this.tryStepUp(p, remaining)) {
+          && this.tryStepUp(p, remaining, onGround ? ground.normal : null, sweepA.normal)) {
           continue;
+        }
+        // Only a plane the step-up could NOT climb is a wall. Recorded once —
+        // the first blocker is the one whose normal describes the contact the
+        // caller wants to react to (cancel motion into it, or bounce off it).
+        if (!this.wallHit) {
+          this.wallHit = true;
+          this.wallNormal.copy(sweepA.normal);
         }
       }
 
@@ -480,8 +557,21 @@ export class CapsuleCharacterController implements CharacterController {
    * Lift → advance → drop. Accepted only when the landing is walkable and we
    * actually gained ground, which is what makes stairs feel free rather than
    * sticky.
+   *
+   * `groundNormal` is the surface we are currently standing on, when we are
+   * standing on one. It is used to reject a step that gains no more height than
+   * simply walking along that surface would have: on a ramp, a grazing shape
+   * cast occasionally returns an edge-cone normal steep enough to look like a
+   * wall, and the lift/advance/drop then "succeeds" by landing further up the
+   * same ramp. The player is teleported 90 mm up the slope in one tick and the
+   * borrowed distance is repaid over the next three at half speed — a visible
+   * hitch, once every few seconds of running on a slope, from a step that was
+   * never there.
    */
-  private tryStepUp(p: THREE.Vector3, remaining: THREE.Vector3): boolean {
+  private tryStepUp(
+    p: THREE.Vector3, remaining: THREE.Vector3,
+    groundNormal: THREE.Vector3 | null, hitNormal: THREE.Vector3,
+  ): boolean {
     const dist = remaining.length();
     if (dist < 1e-5) return false;
     vStepStart.copy(p);
@@ -503,8 +593,16 @@ export class CapsuleCharacterController implements CharacterController {
     // why simply clamping this to the frame's motion makes stairs unclimbable.
     // The surplus is booked as debt and repaid over the following frames so the
     // average speed still matches what the caller asked for.
+    //
+    // The surplus is only warranted against a real convex edge. When the plane
+    // that blocked us is the surface we are already standing on — see
+    // `SAME_SURFACE_DOT` — there is no lip to clear, and reaching past it turns
+    // a smooth ramp into a stutter: 111 mm of travel granted in one 8.3 ms tick
+    // (a 15 m/s spike) and then three ticks at half speed paying it back, over
+    // and over, all the way up the slope.
+    const sameSurface = groundNormal !== null && hitNormal.dot(groundNormal) > SAME_SURFACE_DOT;
     const minReach = this.radius * (1 - Math.sin(THREE.MathUtils.degToRad(this.slopeLimit))) + 0.02;
-    const probe = Math.max(dist, minReach);
+    const probe = sameSurface ? dist : Math.max(dist, minReach);
     const forward = this.sweep(vStepPos, vDir, probe, sweepB)
       ? Math.min(probe, Math.max(0, sweepB.toi - SKIN))
       : probe;
@@ -527,11 +625,16 @@ export class CapsuleCharacterController implements CharacterController {
     const gained = vTmp2.length();
     if (gained < 0.004) return false;
 
+    // A step-up that gains nothing vertical is not a step; let the plane clip
+    // handle it so we slide along the wall instead of hopping in place.
+    if (!sameSurface && rise <= STEP_MIN_GAIN) return false;
+
     p.copy(vStepPos);
     if (gained > dist) this.stepDebt = Math.min(0.6, this.stepDebt + (gained - dist));
     remaining.set(0, 0, 0);
     this.grounded = true;
     this.stepped = true;
+    this.stepRise = Math.max(this.stepRise, rise);
     this.stepNormal.copy(sweepC.normal);
     this.groundCollider = sweepC.handle;
     return true;

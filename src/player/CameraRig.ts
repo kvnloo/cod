@@ -40,16 +40,62 @@ export interface CameraShake {
   seed: number;
 }
 
+/**
+ * Hard ceiling on the *transient* recoil offset, radians.
+ *
+ * The transient always decays to zero, so under any sane weapon it settles far
+ * below this (a 720 rpm AR steady-states around 0.6°). The clamp exists so a
+ * pathological rate-of-fire or a scripted burst can never walk the view off the
+ * world before recovery catches up — an unbounded view offset is a bug you only
+ * find in the hands, which is exactly what happened here.
+ */
+const MAX_TRANSIENT = 6 * (Math.PI / 180);
+
+/**
+ * Exponential rate at which the transient returns, 1/s. 9.5 puts 63% of a kick
+ * back in 105 ms and 95% in 315 ms, which is the CoD "the gun settles between
+ * bursts, not between shots" cadence.
+ */
+const RECOIL_RECOVERY_LAMBDA = 9.5;
+
+/** Matches the look clamp — just under 89°, so the view never gimbals. */
+const PITCH_LIMIT = 1.5533;
+
 export class CameraRig {
   /** Look angles, driven by input. */
   yaw = 0;
   pitch = 0;
 
-  /** Recoil the player must fight, applied on top of look and partly recovered. */
+  /**
+   * Recoil, split into the two halves that behave completely differently.
+   *
+   * `recoilPitch` / `recoilYaw` are the *transient*: the part of the kick that
+   * comes back on its own. It decays to zero, so it is bounded by construction
+   * and costs the player nothing.
+   *
+   * The rest — `1 - recoverFraction` of every impulse — is *permanent*, and is
+   * folded straight into `yaw` / `pitch` the moment the shot goes off. That is
+   * the whole point of a recoil pattern: your aim really moves, you really have
+   * to pull down, and because the movement is authored and deterministic it is
+   * learnable. Parking it in an offset that is never folded back (the old
+   * behaviour) gives you the worst of both — the aim drifts, the player cannot
+   * correct for it because the crosshair says otherwise, and it accumulates
+   * without bound across a magazine.
+   */
   private recoilPitch = 0;
   private recoilYaw = 0;
-  private recoilRecoverPitch = 0;
-  private recoilRecoverYaw = 0;
+  /** Running total of the permanent part, for telemetry and tests. Degrees. */
+  private foldedPitchDeg = 0;
+  private foldedYawDeg = 0;
+  /**
+   * Seconds of recoil recovery the fixed step has applied *ahead* of the render
+   * frame. A running ledger, not a per-frame flag: at 540 fps four frames out of
+   * five run no fixed step at all, so a flag that resets every frame lets those
+   * frames decay again on time the fixed step already paid for — measured at
+   * 1.78× the correct recovery rate, which showed up as a 60-round spray peaking
+   * 22% lower at 540 fps than at 120.
+   */
+  private recoilCredit = 0;
 
   private bobPos = new THREE.Vector3();
   private bobRot = new THREE.Vector3();
@@ -96,7 +142,7 @@ export class CameraRig {
 
     // Analog stick contribution (already curve-shaped by Input).
     void dt;
-    this.pitch = THREE.MathUtils.clamp(this.pitch, -1.5533, 1.5533);
+    this.pitch = THREE.MathUtils.clamp(this.pitch, -PITCH_LIMIT, PITCH_LIMIT);
     if (this.yaw > Math.PI) this.yaw -= Math.PI * 2;
     else if (this.yaw < -Math.PI) this.yaw += Math.PI * 2;
   }
@@ -108,15 +154,63 @@ export class CameraRig {
     const rate = g.sensitivity * 3.4 * scale * dt;
     this.yaw -= lx * rate;
     this.pitch -= ly * rate * (g.invertY ? -1 : 1);
-    this.pitch = THREE.MathUtils.clamp(this.pitch, -1.5533, 1.5533);
+    this.pitch = THREE.MathUtils.clamp(this.pitch, -PITCH_LIMIT, PITCH_LIMIT);
   }
 
-  /** Weapon recoil pushes the view; a fraction is automatically recovered. */
+  /**
+   * Weapon recoil. `recoverFraction` of the kick is transient and returns by
+   * itself; the remainder is folded into the actual look angles immediately.
+   *
+   * Called from the weapon system's *fixed* step, so the impulse times are
+   * frame-rate independent and reproducible for a seed.
+   */
   addRecoil(pitch: number, yaw: number, recoverFraction = 0.72): void {
-    this.recoilPitch += pitch;
-    this.recoilYaw += yaw;
-    this.recoilRecoverPitch += pitch * recoverFraction;
-    this.recoilRecoverYaw += yaw * recoverFraction;
+    const recover = THREE.MathUtils.clamp(recoverFraction, 0, 1);
+    const keep = 1 - recover;
+
+    // Permanent half → the player's real aim.
+    if (keep > 0) {
+      const dp = pitch * keep;
+      const dy = yaw * keep;
+      this.pitch = THREE.MathUtils.clamp(this.pitch + dp, -PITCH_LIMIT, PITCH_LIMIT);
+      this.yaw += dy;
+      if (this.yaw > Math.PI) this.yaw -= Math.PI * 2;
+      else if (this.yaw < -Math.PI) this.yaw += Math.PI * 2;
+      this.foldedPitchDeg += dp * (180 / Math.PI);
+      this.foldedYawDeg += dy * (180 / Math.PI);
+    }
+
+    // Transient half → decays back to zero in `stepRecoil`.
+    this.recoilPitch = THREE.MathUtils.clamp(
+      this.recoilPitch + pitch * recover, -MAX_TRANSIENT, MAX_TRANSIENT,
+    );
+    this.recoilYaw = THREE.MathUtils.clamp(
+      this.recoilYaw + yaw * recover, -MAX_TRANSIENT, MAX_TRANSIENT,
+    );
+  }
+
+  /**
+   * Advances recoil recovery by `dt`.
+   *
+   * Driven from the weapon system's fixed step so recovery is identical at 30
+   * and 540 fps; `update` only tops up whatever time the fixed step did not
+   * already cover, so the two can never double-count.
+   */
+  stepRecoil(dt: number): void {
+    // 0.25 s ceiling: the ledger can only ever run a frame or two ahead, and a
+    // clamp means a pathological caller cannot bank credit that suppresses
+    // recovery later.
+    this.recoilCredit = Math.min(0.25, this.recoilCredit + dt);
+    this.decayRecoil(dt);
+  }
+
+  private decayRecoil(dt: number): void {
+    if (dt <= 0) return;
+    const k = Math.exp(-RECOIL_RECOVERY_LAMBDA * dt);
+    this.recoilPitch *= k;
+    this.recoilYaw *= k;
+    if (Math.abs(this.recoilPitch) < 1e-7) this.recoilPitch = 0;
+    if (Math.abs(this.recoilYaw) < 1e-7) this.recoilYaw = 0;
   }
 
   addShake(amplitude: number, frequency = 22, duration = 0.35): void {
@@ -142,16 +236,15 @@ export class CameraRig {
     const g = settings.game;
 
     /* --- recoil recovery ------------------------------------------------- */
-    const recover = 1 - Math.exp(-9.5 * dt);
-    const dp = this.recoilRecoverPitch * recover;
-    const dy = this.recoilRecoverYaw * recover;
-    this.recoilRecoverPitch -= dp;
-    this.recoilRecoverYaw -= dy;
-    this.recoilPitch -= dp;
-    this.recoilYaw -= dy;
-    // The unrecovered part is folded into the actual look angles, so the player
-    // has to pull down — exactly like a real shooter.
-    this.pitch += 0;
+    // The fixed step normally owns this (see `stepRecoil`) and banks credit for
+    // the time it covered; the frame spends that credit first and only decays
+    // the shortfall. At 30 fps four fixed steps pay for the whole frame; at
+    // 540 fps one step's credit pays for the next four-and-a-half frames. Either
+    // way the total decay time equals elapsed time exactly once, which is what
+    // makes recovery frame-rate independent.
+    const rest = dt - this.recoilCredit;
+    if (rest > 0) { this.recoilCredit = 0; this.decayRecoil(rest); }
+    else this.recoilCredit = -rest;
 
     /* --- view bob --------------------------------------------------------- */
     const bobScale = g.weaponBob * (1 - this.adsBlend * 0.72) * mv.speed01;
@@ -243,18 +336,56 @@ export class CameraRig {
     }
   }
 
-  /** Current recoil offset, so the view model can compensate. */
+  /**
+   * The *transient* recoil offset — what the view is carrying right now on top
+   * of the look angles, and what an aim-assist or a test rig should subtract to
+   * find the true aim point. Always decays to zero.
+   */
   get recoil(): { pitch: number; yaw: number } {
     return { pitch: this.recoilPitch, yaw: this.recoilYaw };
   }
+
+  /**
+   * Degrees of recoil permanently folded into the look angles since the last
+   * `reset` / `clearRecoilTelemetry`. This is the half the player has to fight,
+   * and separating it from `recoil` is what makes "recovered vs folded"
+   * measurable instead of a matter of opinion.
+   */
+  get recoilFoldedDeg(): { pitch: number; yaw: number } {
+    return { pitch: this.foldedPitchDeg, yaw: this.foldedYawDeg };
+  }
+
+  clearRecoilTelemetry(): void { this.foldedPitchDeg = 0; this.foldedYawDeg = 0; }
+
+  /**
+   * Re-seeds the shared camera-noise stream.
+   *
+   * Shake and breathing sway ride on a module-level `Rand`, so two otherwise
+   * identical sprays taken in one session compose slightly different camera
+   * orientations — and since a round is aimed from the composed camera, the
+   * bullets differ too. That is correct at runtime (the stream is seeded and a
+   * fresh capture reproduces exactly) but it makes "fire the same spray twice"
+   * impossible to check inside one session. This is the door for that test.
+   */
+  resetNoise(seed: number | string = 'camera-noise'): void { noiseRand.seed(seed); }
 
   reset(yaw: number, pitch = 0): void {
     this.yaw = yaw;
     this.pitch = pitch;
     this.recoilPitch = this.recoilYaw = 0;
-    this.recoilRecoverPitch = this.recoilRecoverYaw = 0;
+    this.recoilCredit = 0;
+    this.foldedPitchDeg = this.foldedYawDeg = 0;
     this.shakes.length = 0;
     this.bobPos.set(0, 0, 0);
+    // Everything that composes the final orientation goes back to a known state,
+    // not just the obvious layers: a reset that leaves the breathing phase or a
+    // half-decayed bob behind is a reset that cannot be verified.
+    this.bobRot.set(0, 0, 0);
+    this.breathT = 0;
+    this.swayYaw = this.swayPitch = 0;
+    this.leanAmount = this.rollAmount = 0;
+    this.shakeOffset.set(0, 0, 0);
+    this.shakeRot.set(0, 0, 0);
     this.landDip.set(0);
     this.externalOffset.set(0, 0, 0);
     this.predictionOffset.set(0, 0, 0);

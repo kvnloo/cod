@@ -12,10 +12,14 @@ import * as THREE from 'three';
 import type { EngineContext, System } from '../core/Engine';
 import { bus } from '../core/EventBus';
 import type { EventKey, GameEvents } from '../core/EventBus';
-import type { PhysicsAPI, RayHit } from '../physics/types';
+import { settings } from '../core/Settings';
+import type { HitZone, PhysicsAPI, RayHit } from '../physics/types';
 import type { RenderAPI } from '../render/types';
 import { Rand } from '../core/Rand';
-import type { ActorAPI, PlayerBridge, WorldBridge } from './types';
+import { ARCHETYPES } from './Archetypes';
+import type {
+  ActorAPI, Archetype, DamageOpts, PlayerBridge, SpawnRequest, WorldBridge,
+} from './types';
 import './events';
 
 export type Emitter = <K extends EventKey>(key: K, payload: GameEvents[K]) => void;
@@ -260,14 +264,513 @@ interface MaybeActors {
   combatantPosition?: unknown; damageCombatant?: unknown;
 }
 
-/** The AI system qualifies only when it implements the full spawn/damage surface. */
-export function asActorAPI(sys: System | undefined): ActorAPI | null {
+/**
+ * Resolves the actor backend.
+ *
+ * Two shapes qualify. A system that already speaks `ActorAPI` natively is used
+ * as-is (the deterministic self-test injects one). Otherwise we look for the
+ * shape of `src/ai/AI.ts` and wrap it — see `AIActorBridge` for why the five
+ * methods live here rather than on `AISystem` itself.
+ */
+export function asActorAPI(sys: System | undefined, emit?: Emitter): ActorAPI | null {
   if (!sys) return null;
   const a = sys as unknown as MaybeActors;
-  if (!isFn(a.spawnCombatant) || !isFn(a.despawnCombatant)) return null;
-  if (!isFn(a.isCombatantAlive) || !isFn(a.combatantPosition) || !isFn(a.damageCombatant)) return null;
-  return sys as unknown as ActorAPI;
+  if (isFn(a.spawnCombatant) && isFn(a.despawnCombatant)
+    && isFn(a.isCombatantAlive) && isFn(a.combatantPosition) && isFn(a.damageCombatant)) {
+    return sys as unknown as ActorAPI;
+  }
+  const ai = asAISystem(sys);
+  return ai ? new AIActorBridge(ai, emit ?? ((k, p) => bus.emit(k, p))) : null;
 }
+
+/* ------------------------------------------------------------- AI bridge -- */
+
+/*
+ * `src/ai/` is a peer module, not a dependency: nothing below `Match.ts` may
+ * import it, and the AI must keep compiling with the whole game layer deleted.
+ * So the bridge describes what it needs structurally and probes for it at
+ * runtime, exactly like `asPlayerBridge` / `asPhysics` above. If the AI module
+ * changes shape, `asAISystem` returns null and the director falls back to
+ * `BotFallback` — the same graceful degradation every other bridge has.
+ */
+
+interface AICombatLike {
+  ammo: number;
+  suppression: number;
+  shotsFired: number;
+  shotsHit: number;
+  lastReaction: number;
+  reactionStartedAt: number;
+  readonly skill: number;
+  setSkill(scale: number): void;
+}
+
+interface AIPerceptionLike {
+  awareness: number;
+  readonly state: string;
+  readonly hasLOS: boolean;
+}
+
+interface AIAgentLike {
+  readonly id: number;
+  readonly entityId: number;
+  readonly bodyYaw: number;
+  readonly alive: boolean;
+  health: number;
+  maxHealth: number;
+  readonly height: number;
+  readonly position: THREE.Vector3;
+  readonly velocity: THREE.Vector3;
+  readonly loadout: Archetype;
+  readonly combat: AICombatLike;
+  readonly perception: AIPerceptionLike;
+  readonly squad: { readonly id: number } | null;
+  character: { object: THREE.Object3D } | null;
+  combatEnabled: boolean;
+  frozen: boolean;
+  applyDamage(
+    amount: number, fromDirection: THREE.Vector3, zone: HitZone, byPlayer: boolean,
+    point?: THREE.Vector3,
+  ): boolean;
+  claimBusEcho(amount: number, killed: boolean): void;
+  setAggression(a: number): void;
+  noticeThreat(position: THREE.Vector3, awareness?: number): void;
+  alertTo(position: THREE.Vector3, confidence?: number): void;
+  dispose(): void;
+}
+
+interface AISystemLike {
+  readonly agents: AIAgentLike[];
+  readonly cover: { readonly points: ReadonlyArray<unknown> };
+  /** `snap` always writes `out`; the boolean says whether it found a nav cell. */
+  readonly nav: { snap(p: THREE.Vector3, out: THREE.Vector3): boolean };
+  readonly squads: { create(): { readonly id: number } };
+  readonly now: number;
+  readonly aliveAgents: number;
+  /** Whatever the AI is currently fighting; null before the player resolves. */
+  readonly target: { readonly position: THREE.Vector3; readonly alive: boolean } | null;
+  physics: PhysicsAPI | null;
+  spawn(opts: Record<string, unknown>): AIAgentLike;
+  byEntity(entityId: number): AIAgentLike | null;
+  clear(): void;
+}
+
+function asAISystem(sys: System | undefined): AISystemLike | null {
+  const a = sys as unknown as Partial<AISystemLike> | undefined;
+  if (!a) return null;
+  if (!Array.isArray(a.agents) || !isFn(a.spawn) || !isFn(a.byEntity) || !isFn(a.clear)) return null;
+  if (!a.cover || !a.nav || !a.squads) return null;
+  return a as AISystemLike;
+}
+
+/** Bodies linger this long before the agent is disposed. Matches `BotFallback`. */
+const CORPSE_LINGER = 14;
+
+/** Concurrent live agents by quality preset — the AI module has no cap of its own. */
+const MAX_AGENTS_BY_PRESET: Record<string, number> = {
+  low: 8, medium: 14, high: 20, ultra: 24, cinematic: 28,
+};
+
+/** Squad size the bridge groups spawns into. Four is a fireteam. */
+const SQUAD_SIZE = 4;
+/** Spawns further apart than this in time or space start a new squad. */
+const SQUAD_WINDOW_SEC = 12;
+const SQUAD_RADIUS_M = 34;
+
+/**
+ * A director-facing handle onto one `Agent`.
+ *
+ * `position` is reported at the **feet**, because that is what every existing
+ * consumer of `combatantPosition` assumes (`Match.explode` adds 0.9 to reach
+ * the chest, markers sit on the ground). `Agent.position` is the capsule
+ * centre, so the getter rebases it. It writes into a per-view scratch vector
+ * and returns it, which keeps the read live and allocation-free.
+ */
+class AIBotView {
+  readonly team = 'hostile' as const;
+  /** Spawn-time accuracy scalar, kept so a later global scale composes with it. */
+  spawnAccuracy = 1;
+  /** Sim time this agent was first observed dead, or -1. */
+  diedAt = -1;
+  private readonly feet = new THREE.Vector3();
+
+  constructor(readonly agent: AIAgentLike) { }
+
+  get id(): number { return this.agent.entityId; }
+  get alive(): boolean { return this.agent.alive; }
+  get health(): number { return this.agent.health; }
+  get maxHealth(): number { return this.agent.maxHealth; }
+  get height(): number { return this.agent.height; }
+  get archetype(): Archetype { return this.agent.loadout; }
+  get char(): { object: THREE.Object3D } | null { return this.agent.character; }
+  get position(): THREE.Vector3 {
+    const a = this.agent;
+    return this.feet.set(a.position.x, a.position.y - a.height * 0.5, a.position.z);
+  }
+}
+
+/**
+ * The five `ActorAPI` methods `AISystem` does not have, implemented against it.
+ *
+ * They live here rather than on `AISystem` for the reason stated at the top of
+ * this file: the dependency arrow points game → ai, never the other way, and
+ * the AI module is meant to compile and run with `src/game/` deleted. Spawning,
+ * despawning, difficulty scalars and damage arbitration are *match* concerns;
+ * perception, cover and fire control are *AI* concerns. This is the seam.
+ *
+ * Everything the director could previously do to `BotFallback` it can do here:
+ * the class deliberately keeps `bots`, `hurt`, `liveCount`, `clear`,
+ * `setFrozen` and `accuracyScale` so the debug scenes and the playtest harness
+ * see the same surface whichever backend is installed.
+ */
+export class AIActorBridge implements ActorAPI {
+  /** Live + recently-dead handles, in spawn order. The harness reads this. */
+  readonly bots: AIBotView[] = [];
+  private readonly byId = new Map<number, AIBotView>();
+  accuracyScale = 1;
+  combatEnabled = true;
+  frozen = false;
+  capacity: number;
+  /** Counted so a refusal shows up in a report instead of vanishing. */
+  refusedFriendly = 0;
+  refusedCapacity = 0;
+
+  private squadId = -1;
+  private squadCount = 0;
+  private squadTag = '';
+  private squadAt = -1e9;
+  private readonly squadAnchor = new THREE.Vector3();
+
+  private readonly _v = new THREE.Vector3();
+  private readonly _d = new THREE.Vector3();
+
+  constructor(readonly ai: AISystemLike, private emit: Emitter) {
+    this.capacity = MAX_AGENTS_BY_PRESET[settings.preset] ?? 20;
+  }
+
+  /* ---------------------------------------------------------- ActorAPI -- */
+
+  spawnCombatant(req: SpawnRequest): number {
+    /*
+     * The AI module has no team model — every agent's target is the player —
+     * so a "friendly" agent would be a squadmate that shoots you. Refusing is
+     * the only honest answer until `AISystem` grows teams; the director treats
+     * -1 as "could not spawn" and carries on.
+     */
+    if (req.team !== 'hostile') {
+      if (this.refusedFriendly === 0) {
+        console.warn('[game] the AI backend has no team model; friendly combatant '
+          + 'spawns are refused rather than fielded as enemies that shoot you');
+      }
+      this.refusedFriendly++;
+      return -1;
+    }
+    if (this.liveCount() >= this.capacity) { this.refusedCapacity++; return -1; }
+
+    const profile = ARCHETYPES[req.archetype];
+    const squad = this.squadFor(req);
+
+    // Drop the spawn onto the navigation grid so nobody starts inside geometry.
+    this._v.copy(req.position);
+    try { this.ai.nav.snap(this._v, this._d); } catch { this._d.copy(this._v); }
+    if (!Number.isFinite(this._d.x)) this._d.copy(this._v);
+
+    let agent: AIAgentLike;
+    try {
+      agent = this.ai.spawn({
+        position: this._d.clone(),
+        yaw: req.yaw,
+        loadout: req.archetype,
+        faction: req.faction === 'player' ? 'militia' : req.faction,
+        squadId: squad,
+        seed: req.seed,
+        health: profile.health * Math.max(0.1, req.health),
+        name: req.tag || profile.name,
+      });
+    } catch (err) {
+      console.warn('[game] ai spawn failed', err);
+      return -1;
+    }
+
+    const view = new AIBotView(agent);
+    view.spawnAccuracy = Math.max(0.05, req.accuracy);
+    agent.combat.setSkill(view.spawnAccuracy * this.accuracyScale);
+    agent.setAggression(req.aggression);
+    agent.combatEnabled = this.combatEnabled;
+    agent.frozen = this.frozen;
+    /*
+     * Point him at the fight. Nothing about the spawn request says which way
+     * the action is, and an agent whose authored yaw happens to face away from
+     * the player can never acquire — see `Agent.noticeThreat`.
+     */
+    const threat = this.ai.target;
+    if (threat && threat.alive) agent.noticeThreat(threat.position);
+
+    this.bots.push(view);
+    this.byId.set(view.id, view);
+    return view.id;
+  }
+
+  despawnCombatant(id: number): void {
+    const v = this.byId.get(id);
+    if (!v) return;
+    this.retire(v);
+  }
+
+  isCombatantAlive(id: number): boolean {
+    return this.byId.get(id)?.alive === true;
+  }
+
+  combatantPosition(id: number, out: THREE.Vector3): boolean {
+    const v = this.byId.get(id);
+    if (!v) return false;
+    out.copy(v.position);
+    return true;
+  }
+
+  damageCombatant(id: number, amount: number, opts: DamageOpts): boolean {
+    const v = this.byId.get(id);
+    if (!v || !v.alive) return false;
+    const killed = this.hurt(v, amount, opts);
+    /*
+     * Ballistics publishes `damage:dealt` for the rounds it resolves; a direct
+     * hit (sentry, airstrike, scripted) has nobody else to publish for it, so
+     * the score and the killfeed would never see it.
+     */
+    this.emit('damage:dealt', {
+      targetId: id, amount, headshot: !!opts.headshot, killed,
+      point: (opts.point ?? v.position).clone(), fromPlayer: opts.fromPlayer !== false,
+    });
+    return killed;
+  }
+
+  setAccuracyScale(scale: number): void {
+    this.accuracyScale = Math.max(0, scale);
+    for (const v of this.bots) {
+      if (v.alive) v.agent.combat.setSkill(v.spawnAccuracy * this.accuracyScale);
+    }
+  }
+
+  setCombatEnabled(on: boolean): void {
+    this.combatEnabled = on;
+    for (const v of this.bots) v.agent.combatEnabled = on;
+  }
+
+  setFrozen(on: boolean): void {
+    this.frozen = on;
+    for (const v of this.bots) v.agent.frozen = on;
+  }
+
+  listCombatants(out: number[]): number {
+    out.length = 0;
+    for (const v of this.bots) if (v.alive) out.push(v.id);
+    return out.length;
+  }
+
+  /* ------------------------------------------------------------- damage -- */
+
+  /**
+   * The single point every enemy health change goes through — the weapon
+   * system's `DamageResolver`, explosions, killstreaks and scripted damage all
+   * land here. `claimBusEcho` then swallows the `damage:dealt` echo so the AI
+   * module's own listener cannot apply the same hit twice; see
+   * `Agent.claimBusEcho`.
+   */
+  hurt(v: AIBotView, amount: number, opts: DamageOpts): boolean {
+    const a = v.agent;
+    if (!a.alive) return false;
+    const applied = Math.max(0, amount);
+    this._d.copy(opts.direction ?? UP_AXIS);
+    if (this._d.lengthSq() < 1e-8) this._d.copy(UP_AXIS);
+    // A caller that resolved a real per-zone collider knows better than the
+    // headshot boolean; fall back to it only when no zone was supplied.
+    const zone = (opts.zone && opts.zone !== 'none')
+      ? opts.zone as HitZone
+      : (opts.headshot ? 'head' : 'chest');
+    const killed = a.applyDamage(applied, this._d, zone, opts.fromPlayer !== false, opts.point);
+    a.claimBusEcho(applied, killed);
+    if (killed && v.diedAt < 0) v.diedAt = this.ai.now;
+    return killed;
+  }
+
+  /** O(1) handle lookup — the damage resolver runs this on every round. */
+  viewOf(id: number): AIBotView | undefined { return this.byId.get(id); }
+
+  /** True when this archetype should read as armoured in the hitmarker. */
+  isArmored(id: number): boolean {
+    return this.byId.get(id)?.archetype === 'juggernaut';
+  }
+
+  /**
+   * Body metrics for one live combatant, so a damage model that does not own
+   * the body can still place hit zones on it.
+   *
+   * The out-param is described structurally rather than imported: this is an
+   * *optional* rendezvous point with whatever combat model the game layer ends
+   * up with, and the bridge must keep compiling whether or not that model
+   * exists yet.
+   */
+  combatantInfo(id: number, out: CombatantInfoLike): boolean {
+    const v = this.byId.get(id);
+    if (!v) return false;
+    const profile = ARCHETYPES[v.archetype];
+    out.archetype = v.archetype;
+    out.team = 'hostile';
+    out.alive = v.alive;
+    out.health = v.health;
+    out.maxHealth = v.maxHealth;
+    out.position.copy(v.position);
+    out.yaw = v.agent.bodyYaw;
+    out.height = v.height;
+    out.radius = profile.radius;
+    return true;
+  }
+
+  /* -------------------------------------------------------------- query -- */
+
+  liveCount(): number {
+    let n = 0;
+    for (const v of this.bots) if (v.alive) n++;
+    return n;
+  }
+
+  hostilesWithin(center: THREE.Vector3, radius: number): number {
+    const r2 = radius * radius;
+    let n = 0;
+    for (const v of this.bots) {
+      if (!v.alive) continue;
+      if (v.position.distanceToSquared(center) <= r2) n++;
+    }
+    return n;
+  }
+
+  nearest(p: THREE.Vector3, team: string, maxDist: number): number {
+    if (team !== 'hostile') return -1;
+    let best = -1;
+    let bestD = maxDist * maxDist;
+    for (const v of this.bots) {
+      if (!v.alive) continue;
+      const d = v.position.distanceToSquared(p);
+      if (d < bestD) { bestD = d; best = v.id; }
+    }
+    return best;
+  }
+
+  /* ------------------------------------------------------------- upkeep -- */
+
+  /**
+   * Retires corpses.
+   *
+   * `AISystem.agents` is append-only — it keeps the dead so their ragdolls
+   * survive — which over a long match turns into an unbounded array walked
+   * every fixed step. The director owns spawn lifetime, so it owns the reaping
+   * too. Called from `GameDirector.fixedUpdate`, i.e. after `ORDER.AI` has
+   * finished iterating the array this step.
+   */
+  reap(): void {
+    const now = this.ai.now;
+    for (let i = this.bots.length - 1; i >= 0; i--) {
+      const v = this.bots[i];
+      if (v.alive) continue;
+      if (v.diedAt < 0) { v.diedAt = now; continue; }
+      if (now - v.diedAt < CORPSE_LINGER) continue;
+      this.retire(v);
+    }
+  }
+
+  private retire(v: AIBotView): void {
+    const i = this.bots.indexOf(v);
+    if (i >= 0) this.bots.splice(i, 1);
+    this.byId.delete(v.id);
+    const list = this.ai.agents;
+    const j = list.indexOf(v.agent);
+    if (j >= 0) list.splice(j, 1);
+    v.agent.character?.object.removeFromParent();
+    try { v.agent.dispose(); } catch { /* a half-built agent must still unlink */ }
+  }
+
+  clear(): void {
+    this.bots.length = 0;
+    this.byId.clear();
+    this.squadId = -1;
+    this.squadCount = 0;
+    this.ai.clear();
+  }
+
+  dispose(): void { this.clear(); }
+
+  /* -------------------------------------------------------------- squads -- */
+
+  /**
+   * Groups spawns into fireteams.
+   *
+   * `SpawnRequest` has no squad field — the director thinks in engagement
+   * points, not formations — so the bridge infers one: consecutive spawns that
+   * share a tag, land within `SQUAD_RADIUS_M` of the first, and arrive inside
+   * `SQUAD_WINDOW_SEC` join the same squad, up to `SQUAD_SIZE`. That is what
+   * turns `src/ai/Squad.ts` on: bounding advances, move-token arbitration and
+   * shared contact reports all key off squad membership.
+   */
+  private squadFor(req: SpawnRequest): number {
+    const now = this.ai.now;
+    const stale = now - this.squadAt > SQUAD_WINDOW_SEC;
+    const far = this.squadAnchor.distanceToSquared(req.position) > SQUAD_RADIUS_M * SQUAD_RADIUS_M;
+    if (this.squadId < 0 || this.squadCount >= SQUAD_SIZE || stale || far || this.squadTag !== req.tag) {
+      this.squadId = this.ai.squads.create().id;
+      this.squadCount = 0;
+      this.squadTag = req.tag;
+      this.squadAnchor.copy(req.position);
+    }
+    this.squadCount++;
+    this.squadAt = now;
+    return this.squadId;
+  }
+
+  /* --------------------------------------------------------------- debug -- */
+
+  /** JSON-serialisable state for scripted verification. */
+  snapshot(): unknown {
+    return {
+      backend: 'ai',
+      live: this.liveCount(),
+      tracked: this.bots.length,
+      capacity: this.capacity,
+      accuracyScale: this.accuracyScale,
+      combatEnabled: this.combatEnabled,
+      coverPoints: this.ai.cover.points.length,
+      refusedFriendly: this.refusedFriendly,
+      refusedCapacity: this.refusedCapacity,
+      agents: this.bots.map((v) => ({
+        id: v.id, agentId: v.agent.id, alive: v.alive,
+        archetype: v.archetype, hp: Math.round(v.health), max: Math.round(v.maxHealth),
+        squad: v.agent.squad ? v.agent.squad.id : -1,
+        state: v.agent.perception.state,
+        awareness: +v.agent.perception.awareness.toFixed(3),
+        hasLOS: v.agent.perception.hasLOS,
+        suppression: +v.agent.combat.suppression.toFixed(2),
+        shots: v.agent.combat.shotsFired, hits: v.agent.combat.shotsHit,
+        reactionMs: Math.round(v.agent.combat.lastReaction * 1000),
+        skill: +v.agent.combat.skill.toFixed(3),
+        pos: [+v.position.x.toFixed(2), +v.position.y.toFixed(2), +v.position.z.toFixed(2)],
+      })),
+    };
+  }
+}
+
+/** Structural view of `CombatantInfo`; see `AIActorBridge.combatantInfo`. */
+interface CombatantInfoLike {
+  archetype: Archetype;
+  team: string;
+  alive: boolean;
+  health: number;
+  maxHealth: number;
+  position: THREE.Vector3;
+  yaw: number;
+  height: number;
+  radius: number;
+}
+
+const UP_AXIS = new THREE.Vector3(0, 1, 0);
 
 export function asWorldBridge(sys: System | undefined): WorldBridge | null {
   if (!sys) return null;
@@ -337,7 +840,7 @@ export function resolveServices(ctx: EngineContext, rng: Rand): GameServices {
     scene: ctx.scene,
     camera: ctx.camera,
     player: asPlayerBridge(e.tryGet('player')),
-    actors: asActorAPI(e.tryGet('ai')),
+    actors: asActorAPI(e.tryGet('ai'), (key, payload) => bus.emit(key, payload)),
     world: asWorldBridge(e.tryGet('world')),
     physics: asPhysics(e.tryGet('physics')),
     render: asRender(e.tryGet('render')),

@@ -31,6 +31,23 @@ export type MatchPhase =
 
 export type Team = 'friendly' | 'hostile';
 
+/* ------------------------------------------------------------- hit zones -- */
+
+/**
+ * Anatomical hit zones. Deliberately identical to `HitZone` in
+ * `src/physics/types.ts` so a `RayHit.zone` coming off a real collider can be
+ * handed straight to the damage model with no mapping — and so the game layer
+ * still compiles with the physics module absent.
+ */
+export type HitZone = 'head' | 'neck' | 'chest' | 'stomach' | 'arm' | 'leg' | 'none';
+
+export const HIT_ZONES: readonly HitZone[] = [
+  'head', 'neck', 'chest', 'stomach', 'arm', 'leg',
+];
+
+/** Per-zone multiplier. Damage, armour and hitbox tables are all this shape. */
+export type ZoneTable = Record<HitZone, number>;
+
 /** Enemy archetypes mirror `CharacterLoadout` so the AI bridge needs no mapping. */
 export type Archetype = CharacterLoadout;
 
@@ -58,6 +75,36 @@ export interface ArchetypeProfile {
   /** Radius of the body capsule, used by the fallback sim and markers. */
   radius: number;
   height: number;
+
+  /* --- combat model (see `Combat.ts`) --------------------------------- */
+
+  /**
+   * Incoming-damage multiplier per hit zone. 1 is bare flesh; a plate carrier
+   * or a juggernaut suit lives here, *not* in a single scalar on the whole
+   * body, so a headshot can still beat armour.
+   */
+  armor: ZoneTable;
+  /**
+   * Authored lethality: damage per second this archetype should land on a
+   * stationary, unarmoured 100 HP player at its preferred range, with line of
+   * sight and no cover.
+   *
+   * This is the design number. Any actor backend — the fallback sim today, the
+   * `src/ai/` tactical stack tomorrow — is expected to reproduce it from
+   * whatever combination of reaction time, burst cadence, spread and
+   * suppression it models. Expressing it here means "how deadly is a rifleman"
+   * is a decision, not an emergent property of a coin flip.
+   */
+  dps: number;
+  /**
+   * Milliseconds between acquiring a target and the first round leaving the
+   * barrel. CoD campaign AI sits around 300-500 ms on Regular; without it an
+   * enemy that walks around a corner is an instant death sentence.
+   */
+  reactionMs: number;
+  /** Rounds per burst, inclusive range. */
+  burstMin: number;
+  burstMax: number;
 }
 
 /* --------------------------------------------------------------- spawning -- */
@@ -107,6 +154,28 @@ export interface ActorAPI {
   setCombatEnabled?(on: boolean): void;
   /** Live combatant ids written into `out`; returns the count. */
   listCombatants?(out: number[]): number;
+  /**
+   * Body metrics for one live combatant, so the combat model can place hit
+   * zones without owning the body. Optional: `Combat.ts` reads the same fields
+   * straight off the actor record when the backend hands one to its damage
+   * funnel, and only needs this when it is asked about a combatant it did not
+   * just resolve a round against.
+   */
+  combatantInfo?(id: number, out: CombatantInfo): boolean;
+}
+
+/** Everything the damage model needs to place hit zones on a body. */
+export interface CombatantInfo {
+  archetype: Archetype;
+  team: Team;
+  alive: boolean;
+  health: number;
+  maxHealth: number;
+  /** Feet position — the origin of the hitbox rig. */
+  position: THREE.Vector3;
+  yaw: number;
+  height: number;
+  radius: number;
 }
 
 export interface DamageOpts {
@@ -116,6 +185,19 @@ export interface DamageOpts {
   fromPlayer?: boolean;
   /** 'sentry' | 'airstrike' | 'explosion' | ... — used for the killfeed. */
   source?: string;
+  /**
+   * Resolved hit zone. When a caller can supply this — because it raycast a
+   * real per-bone collider and got `RayHit.zone` back — the combat model uses
+   * it verbatim. When it is absent the model resolves the zone geometrically
+   * from `point` against the body's hitbox rig, which is what makes headshots
+   * and limb damage work today, before `CharacterController` grows per-zone
+   * colliders.
+   */
+  zone?: HitZone;
+  /** Weapon that fired the round, for the damage-vs-range curve. */
+  weaponId?: string;
+  /** Metres from muzzle to impact. Derived from `point` when omitted. */
+  distance?: number;
 }
 
 /* ----------------------------------------------------------------- player -- */

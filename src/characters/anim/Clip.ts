@@ -7,7 +7,7 @@
  * quaternion tracks with per-key easing, and `Clip.sample` evaluates them with
  * shortest-arc slerp.
  *
- * Two conventions keep the authoring readable:
+ * Three conventions keep the authoring readable:
  *
  *  - Angles are degrees, applied in YXZ order, as a *delta from rest*. Because
  *    the rest pose is identity everywhere, `{ lowerLegL: [70, 0, 0] }` simply
@@ -15,6 +15,19 @@
  *  - A bone omitted from a key is not animated *at that key*; its track only
  *    contains the keys that mention it. That is what lets a walk cycle
  *    interleave a 4-key leg track with a 2-key spine track without padding.
+ *  - An **empty** table — `pose: {}` — is a *rest key*: every bone the clip
+ *    animates anywhere gets an identity key at that time. Performances are
+ *    authored as `{ t: 0, pose: {} } … { t: 1, pose: {} }`, and that bracket is
+ *    the whole reason they blend out of and back into locomotion instead of
+ *    snapping. Distinguishing "omitted" from "empty" is why compilation is two
+ *    passes: the second pass cannot expand a rest key until the first has seen
+ *    every bone in the clip.
+ *
+ * Getting the third rule wrong is not a subtle authoring nit. Before it existed
+ * `coverPeekL` compiled to a *single* key — it teleported to the peek pose on
+ * frame one and never moved — and the three death clips carried one `root` key
+ * apiece, so a corpse snapped flat on the frame it was shot and then twitched
+ * its limbs on the floor for a second.
  */
 
 import { BONE_COUNT, BONE_INDEX } from '../Rig';
@@ -29,6 +42,11 @@ export type OffsetSpec = Partial<Record<BoneName, readonly [number, number, numb
 export interface KeySpec {
   /** Normalised time within the clip, 0..1. */
   t: number;
+  /**
+   * Rotations for the bones this key poses. `{}` means *rest*: every bone the
+   * clip animates gets an identity key here, and — unless the key also carries
+   * its own `offset` — every offset the clip animates returns to zero too.
+   */
   pose?: PoseSpec;
   /** Local translation offsets in metres (hips bob, root motion). */
   offset?: OffsetSpec;
@@ -58,6 +76,25 @@ interface OffsetTrack {
 }
 
 const DEG = Math.PI / 180;
+const REST: readonly [number, number, number] = [0, 0, 0];
+
+/** Entries with an actual triple — `{ hips: undefined }` is not a pose. */
+function countEntries(spec: PoseSpec | OffsetSpec | undefined): number {
+  if (!spec) return 0;
+  let n = 0;
+  for (const name of Object.keys(spec) as BoneName[]) if (spec[name]) n++;
+  return n;
+}
+
+/** Appends the bone indices `spec` names to `into`, without duplicates. */
+function collectBones(spec: PoseSpec | OffsetSpec | undefined, into: number[]): void {
+  if (!spec) return;
+  for (const name of Object.keys(spec) as BoneName[]) {
+    const idx = BONE_INDEX[name];
+    if (idx === undefined || !spec[name]) continue;
+    if (into.indexOf(idx) < 0) into.push(idx);
+  }
+}
 
 function easeFn(e: Ease, t: number): number {
   switch (e) {
@@ -88,27 +125,55 @@ export class Clip {
     const byBone = new Map<number, { t: number; e: readonly [number, number, number]; ease: Ease }[]>();
     const byOffset = new Map<number, { t: number; e: readonly [number, number, number]; ease: Ease }[]>();
 
+    // Pass 1 — the clip's vocabulary. A rest key has to write an identity key
+    // for every bone the clip touches *anywhere*, which is not knowable until
+    // every key has been read.
+    const posedBones: number[] = [];
+    const offsetBones: number[] = [];
     for (const k of keys) {
-      if (k.pose) {
+      collectBones(k.pose, posedBones);
+      collectBones(k.offset, offsetBones);
+    }
+
+    // Pass 2 — emit track keys.
+    const push = (
+      map: Map<number, { t: number; e: readonly [number, number, number]; ease: Ease }[]>,
+      idx: number, t: number, e: readonly [number, number, number], ease: Ease,
+    ): void => {
+      const list = map.get(idx) ?? [];
+      list.push({ t, e, ease });
+      map.set(idx, list);
+    };
+
+    for (const k of keys) {
+      const ease = k.ease ?? 'inOut';
+      const restPose = k.pose !== undefined && countEntries(k.pose) === 0;
+      const restOffset = k.offset !== undefined && countEntries(k.offset) === 0;
+
+      if (restPose) {
+        for (const idx of posedBones) push(byBone, idx, k.t, REST, ease);
+      } else if (k.pose) {
         for (const name of Object.keys(k.pose) as BoneName[]) {
           const idx = BONE_INDEX[name];
           if (idx === undefined) continue;
           const e = k.pose[name];
           if (!e) continue;
-          const list = byBone.get(idx) ?? [];
-          list.push({ t: k.t, e, ease: k.ease ?? 'inOut' });
-          byBone.set(idx, list);
+          push(byBone, idx, k.t, e, ease);
         }
       }
-      if (k.offset) {
+
+      // A rest key with no offset table of its own also returns the hips and
+      // the root to the ground — a performance that opens at rest must open
+      // standing on the floor, not floating at the height of its first offset.
+      if (restOffset || (restPose && k.offset === undefined)) {
+        for (const idx of offsetBones) push(byOffset, idx, k.t, REST, ease);
+      } else if (k.offset) {
         for (const name of Object.keys(k.offset) as BoneName[]) {
           const idx = BONE_INDEX[name];
           if (idx === undefined) continue;
           const e = k.offset[name];
           if (!e) continue;
-          const list = byOffset.get(idx) ?? [];
-          list.push({ t: k.t, e, ease: k.ease ?? 'inOut' });
-          byOffset.set(idx, list);
+          push(byOffset, idx, k.t, e, ease);
         }
       }
     }
@@ -228,6 +293,28 @@ export class Clip {
       out.pos[o + 2] = tr.values[a * 3 + 2] + (tr.values[b * 3 + 2] - tr.values[a * 3 + 2]) * f;
       out.weight[tr.bone] = 1;
     }
+  }
+
+  /**
+   * Compiled track inventory — the shape gates and debug tools assert on.
+   *
+   * A one-shot performance with any track at one key is a clip that *snaps*:
+   * `sample` short-circuits a single-key track to a constant, so the bone is
+   * pinned to that key for the clip's whole duration.
+   */
+  describe(): { bone: number; kind: 'rot' | 'pos'; keys: number; times: number[] }[] {
+    const out: { bone: number; kind: 'rot' | 'pos'; keys: number; times: number[] }[] = [];
+    for (const tr of this.tracks) out.push({ bone: tr.bone, kind: 'rot', keys: tr.times.length, times: [...tr.times] });
+    for (const tr of this.offsets) out.push({ bone: tr.bone, kind: 'pos', keys: tr.times.length, times: [...tr.times] });
+    return out;
+  }
+
+  /** Fewest keys on any compiled track; 0 when the clip animates nothing. */
+  get minTrackKeys(): number {
+    let m = Infinity;
+    for (const tr of this.tracks) m = Math.min(m, tr.times.length);
+    for (const tr of this.offsets) m = Math.min(m, tr.times.length);
+    return m === Infinity ? 0 : m;
   }
 }
 

@@ -24,7 +24,7 @@ import * as THREE from 'three';
 import { bus } from '../core/EventBus';
 import type { Rand } from '../core/Rand';
 import type { PhysicsAPI, RayHit, HitZone } from '../physics/types';
-import { MASK_SIGHT } from '../physics/types';
+import { MASK_BULLET } from '../physics/types';
 import { makeHit, clamp01, damp, raySegmentDistSq, rotateY } from './Util';
 import type { AIWeaponSpec, DifficultyProfile, TargetLike } from './types';
 
@@ -43,7 +43,34 @@ export interface ShotResult {
   hitTarget: boolean;
   damage: number;
   zone: HitZone;
+  /** True when the round was stopped by geometry or a body that is not the target. */
+  blocked: boolean;
 }
+
+/**
+ * Fire-control tuning that sits *on top of* the authored difficulty table.
+ *
+ * `src/ai/types.ts` owns the difficulty curves and is shared; these are the
+ * knobs the match layer turns at runtime, so they live with the controller that
+ * reads them.
+ */
+export const FIRE_CONTROL = {
+  /**
+   * Reaction floor. Nothing — no difficulty, no skill throttle — is allowed to
+   * shoot faster than this after acquiring a target. 220 ms is roughly a human
+   * simple-visual reaction (~200 ms) plus the time to get the muzzle moving; it
+   * is what stops a spawned enemy from deleting you before the callout lands.
+   */
+  reactionFloorSec: 0.22,
+  /** Hard ceiling so a heavily throttled agent still eventually shoots. */
+  reactionCeilSec: 1.60,
+  /**
+   * How far the director's accuracy scalar is allowed to move the aim cone.
+   * `skill` 0.72..1.22 is the range `difficultyScalars()` produces.
+   */
+  skillMin: 0.35,
+  skillMax: 1.6,
+} as const;
 
 export class CombatController {
   ammo: number;
@@ -85,6 +112,22 @@ export class CombatController {
   /** Total rounds this agent has fired; for stats and gizmos. */
   shotsFired = 0;
   shotsHit = 0;
+  /** Rounds this agent put into world geometry or a body that was not the target. */
+  shotsBlocked = 0;
+
+  /**
+   * Director difficulty throttle, 1 = as authored. Below 1 widens the cone and
+   * lengthens the reaction; above 1 tightens both. Never touches health or
+   * damage — see the note at the top of `src/ai/types.ts`.
+   */
+  skill = 1;
+  /**
+   * The reaction actually rolled for the current engagement, in seconds.
+   * Telemetry only — the harness reads this to report the distribution.
+   */
+  lastReaction = 0;
+  /** Sim time the current reaction started, so "did he telegraph" is measurable. */
+  reactionStartedAt = -1e9;
 
   constructor(
     readonly spec: AIWeaponSpec,
@@ -97,6 +140,13 @@ export class CombatController {
 
   setProfile(p: DifficultyProfile): void { this.profile = p; }
 
+  /** Director accuracy scalar → skill, clamped to something survivable. */
+  setSkill(scale: number): void {
+    this.skill = THREE.MathUtils.clamp(
+      Number.isFinite(scale) ? scale : 1, FIRE_CONTROL.skillMin, FIRE_CONTROL.skillMax,
+    );
+  }
+
   get needsReload(): boolean { return this.ammo <= 0; }
   get lowAmmo(): boolean { return this.ammo <= Math.max(2, this.spec.magSize * 0.25); }
 
@@ -106,10 +156,20 @@ export class CombatController {
     this.engagedAt = now;
     this.engagementShots = 0;
     this.ready = false;
-    this.reactionTimer = Math.max(
-      0.05,
-      this.profile.reactionTime + this.rand.signed() * this.profile.reactionJitter,
+    /*
+     * Reaction is the single most important number in this file: it is the gap
+     * between the "Contact!" callout the player hears and the first round, and
+     * it is what makes an opening beat readable instead of a coin flip. A low
+     * skill scalar lengthens it, but the floor is absolute.
+     */
+    const jitter = this.rand.signed() * this.profile.reactionJitter;
+    const slow = 1 + (1 - this.skill) * 0.55;
+    this.reactionTimer = THREE.MathUtils.clamp(
+      (this.profile.reactionTime + jitter) * slow,
+      FIRE_CONTROL.reactionFloorSec, FIRE_CONTROL.reactionCeilSec,
     );
+    this.lastReaction = this.reactionTimer;
+    this.reactionStartedAt = now;
     this.aimError = this.profile.aimErrorStart * (firstContact ? 1 : 0.65);
     this.burstLeft = 0;
     this.nextBurstAt = now;
@@ -171,7 +231,7 @@ export class CombatController {
     const p = this.profile;
     if (hasTarget && this.ready) {
       const k = 1 - Math.exp(-dt / Math.max(0.05, p.aimConverge));
-      this.aimError += (p.aimErrorFloor - this.aimError) * k;
+      this.aimError += (p.aimErrorFloor / this.skill - this.aimError) * k;
     } else {
       this.aimError = Math.min(p.aimErrorStart, this.aimError + dt * 0.05);
     }
@@ -196,9 +256,10 @@ export class CombatController {
   tryFire(
     now: number, muzzle: THREE.Vector3, target: TargetLike, targetDistance: number,
     physics: PhysicsAPI | null, agentId: number, suppressiveOnly: boolean,
-    aimAt: THREE.Vector3, out: ShotResult,
+    aimAt: THREE.Vector3, out: ShotResult, ownerEntity = -1,
   ): ShotResult {
     out.fired = false; out.hitTarget = false; out.damage = 0; out.zone = 'none';
+    out.blocked = false;
     if (!this.canFire(now)) { this.firing = false; return out; }
 
     if (this.burstLeft <= 0) {
@@ -228,20 +289,34 @@ export class CombatController {
       this.nextBurstAt = now + gap;
     }
 
-    this.resolveShot(now, muzzle, target, targetDistance, physics, agentId, suppressiveOnly, aimAt, out);
+    this.resolveShot(
+      now, muzzle, target, targetDistance, physics, agentId, suppressiveOnly, aimAt, out,
+      ownerEntity,
+    );
     out.fired = true;
     return out;
   }
 
   /**
-   * Traces the round. World geometry wins over the target, so a bullet that
-   * clips the corner the agent is peeking around hits the corner — the AI does
-   * not get free shots through cover it is hiding behind.
+   * Traces the round.
+   *
+   * The trace uses `MASK_BULLET` — the *same* collider set the player's own
+   * rounds resolve against — rather than the sight mask, so an AI round is
+   * stopped by exactly what stops a player round: world geometry, glass, a
+   * squadmate's capsule, a ragdoll. There is no probability anywhere in this
+   * function; whether you are hit is decided by where the barrel was pointing.
+   *
+   * The analytic capsule solve is kept alongside it for two reasons: it is the
+   * only path available when physics is not up (headless tests, the AI debug
+   * scene's synthetic target), and while a live character still owns a single
+   * `chest` proxy collider it is the only thing that can tell a head shot from
+   * a leg shot. The moment the character grows real per-zone colliders the
+   * collider's own zone wins — see `zoneFor`.
    */
   private resolveShot(
     now: number, muzzle: THREE.Vector3, target: TargetLike, distance: number,
     physics: PhysicsAPI | null, agentId: number, suppressiveOnly: boolean,
-    aimAt: THREE.Vector3, out: ShotResult,
+    aimAt: THREE.Vector3, out: ShotResult, ownerEntity: number,
   ): void {
     const spec = this.spec;
 
@@ -280,34 +355,53 @@ export class CombatController {
 
     bus.emit('ai:fire', { id: agentId, origin: muzzle.clone(), direction: _dir.clone() });
 
-    // --- trace ------------------------------------------------------------
     const maxRange = spec.rangeMax;
-    let worldDist = maxRange;
-    let worldHit = false;
-    if (physics && physics.ready) {
-      physics.raycast(muzzle, _dir, maxRange, MASK_SIGHT, _hit, -1);
-      if (_hit.hit) { worldDist = _hit.distance; worldHit = true; }
-    }
 
-    // Target capsule: feet-to-head segment, shrunk while crouched.
+    // --- analytic capsule: feet-to-head segment, shrunk while crouched -----
     const h = target.height * (1 - target.crouch * 0.35);
     const r = target.radius;
     const base = target.position.y - target.height * 0.5;
     _capA.set(target.position.x, base + r, target.position.z);
     _capB.set(target.position.x, base + h - r, target.position.z);
-    const d2 = raySegmentDistSq(muzzle, _dir, Math.min(worldDist, maxRange), _capA, _capB, _closest);
+    const d2 = raySegmentDistSq(muzzle, _dir, maxRange, _capA, _capB, _closest);
+    const capsuleHit = target.alive && d2 <= r * r;
+    const capsuleT = capsuleHit ? _closest.t : Infinity;
 
-    if (target.alive && d2 <= r * r && _closest.t < worldDist) {
-      // Which part of him did it catch?
-      const y = muzzle.y + _dir.y * _closest.t;
-      const frac = clamp01((y - base) / Math.max(0.4, h));
-      let zone: HitZone = 'chest';
-      let mult = 1;
-      if (frac > 0.88) { zone = 'head'; mult = spec.headshotMult; }
-      else if (frac > 0.72) { zone = 'neck'; mult = spec.headshotMult * 0.8; }
-      else if (frac > 0.48) { zone = 'chest'; mult = 1; }
-      else if (frac > 0.34) { zone = 'stomach'; mult = 0.9; }
-      else { zone = 'leg'; mult = 0.7; }
+    // --- physics trace against real colliders -----------------------------
+    let worldDist = maxRange;
+    let worldHit = false;
+    let colliderIsTarget = false;
+    let colliderZone: HitZone = 'none';
+    if (physics && physics.ready) {
+      physics.raycast(muzzle, _dir, maxRange, MASK_BULLET, _hit, ownerEntity);
+      if (_hit.hit) {
+        worldHit = true;
+        worldDist = _hit.distance;
+        colliderZone = _hit.zone;
+        /*
+         * Was the first solid thing the target? Two ways to know: the collider
+         * carries the target's entity id (agents tag their capsules), or it is
+         * an untagged *character* proxy — zone is only ever non-'none' on a
+         * body — sitting where the capsule solve says the target is. The
+         * player's own controller does not tag itself, which is why the second
+         * test exists.
+         */
+        colliderIsTarget = (_hit.entityId >= 0 && _hit.entityId === target.entityId)
+          || (_hit.entityId < 0 && _hit.zone !== 'none'
+            && capsuleHit && Math.abs(_hit.distance - capsuleT) <= 0.9);
+      }
+    }
+
+    const hitTarget = colliderIsTarget || (!worldHit && capsuleHit)
+      || (capsuleHit && capsuleT < worldDist);
+
+    if (hitTarget) {
+      const t = colliderIsTarget ? _hit.distance : capsuleT;
+      const zone = this.zoneFor(muzzle, _dir, t, base, h, colliderIsTarget ? colliderZone : 'none');
+      const mult = zone === 'head' ? spec.headshotMult
+        : zone === 'neck' ? spec.headshotMult * 0.8
+          : zone === 'stomach' ? 0.9
+            : zone === 'leg' || zone === 'arm' ? 0.7 : 1;
 
       const falloffScale = distance <= spec.rangeIdeal
         ? 1
@@ -319,7 +413,7 @@ export class CombatController {
       out.zone = zone;
       this.shotsHit++;
 
-      _v2.copy(muzzle).addScaledVector(_dir, _closest.t);
+      _v2.copy(muzzle).addScaledVector(_dir, t);
       bus.emit('bullet:impact', {
         point: _v2.clone(),
         normal: _dir.clone().negate(),
@@ -340,6 +434,8 @@ export class CombatController {
         });
       }
     } else if (worldHit) {
+      out.blocked = true;
+      this.shotsBlocked++;
       bus.emit('bullet:impact', {
         point: _hit.point.clone(),
         normal: _hit.normal.clone(),
@@ -352,6 +448,28 @@ export class CombatController {
     void now;
   }
 
+  /**
+   * Which part of the body the round caught.
+   *
+   * A collider zone more specific than the torso proxy is believed outright —
+   * that is a real hitbox and it knows better than any band table. Otherwise
+   * the vertical band of the capsule decides, which is the only way head shots
+   * exist at all while a live character owns one `chest` capsule.
+   */
+  private zoneFor(
+    muzzle: THREE.Vector3, dir: THREE.Vector3, t: number,
+    base: number, height: number, colliderZone: HitZone,
+  ): HitZone {
+    if (colliderZone !== 'none' && colliderZone !== 'chest') return colliderZone;
+    const y = muzzle.y + dir.y * t;
+    const frac = clamp01((y - base) / Math.max(0.4, height));
+    if (frac > 0.88) return 'head';
+    if (frac > 0.72) return 'neck';
+    if (frac > 0.48) return 'chest';
+    if (frac > 0.34) return 'stomach';
+    return 'leg';
+  }
+
   /** Accuracy so far, for debug readouts. */
   get accuracy(): number {
     return this.shotsFired > 0 ? this.shotsHit / this.shotsFired : 0;
@@ -359,5 +477,5 @@ export class CombatController {
 }
 
 export function makeShotResult(): ShotResult {
-  return { fired: false, hitTarget: false, damage: 0, zone: 'none' };
+  return { fired: false, hitTarget: false, damage: 0, zone: 'none', blocked: false };
 }

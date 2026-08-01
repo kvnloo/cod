@@ -1,28 +1,36 @@
+// ultracode-wave — Grok-side Claude ultracode for Operation Blackout
+//
+// SOURCE OF TRUTH: prompt.md (and docs/PLAYTEST.md, docs/VISUAL-BAR.md).
+// Agents must read_file those files. Do NOT restate gates/modes/categories here.
+//
+// Effort: children = LOW (token-min). Session/orchestrator = high.
+// Launch: /workflow ultracode-wave {...}  agent_budget 512
+// Watch:  /workflows
+
 let meta = #{
     name: "ultracode-wave",
-    description: "Grok ultracode for cod: orchestrate prompt.md wave loops (measure, audit, package, fix, critique) until hard playtest gates pass",
-    when_to_use: "After Claude handoff or any time prompt.md quality loop should run with the main thread only orchestrating",
+    description: "Ultracode wave loop for cod: read prompt.md, fan out categories A-J, measure with playtest, fix, critique",
+    when_to_use: "Continue prompt.md quality loop; main thread only orchestrates",
     phases: [
-        #{ title: "Measure", detail: "playtest hard gates on real GPU; report failures" },
-        #{ title: "Audit", detail: "parallel domain auditors (read-only), visual and non-visual" },
-        #{ title: "Synthesize", detail: "merge findings into disjoint file-ownership packages" },
-        #{ title: "Fix", detail: "one agent per package, numeric acceptance gates" },
-        #{ title: "Land", detail: "typecheck + re-measure; commit only if gates improve" },
-        #{ title: "Critique", detail: "independent critics re-measure; refuse self-grade" },
-        #{ title: "Loop", detail: "repeat on remaining hard fails until pass or max rounds" },
+        #{ title: "Measure", detail: "playtest (+ perf); report hard gates from docs/PLAYTEST.md" },
+        #{ title: "Audit", detail: "one low-effort agent per prompt.md category A-J" },
+        #{ title: "Synthesize", detail: "disjoint packages from findings; size to finish" },
+        #{ title: "Fix", detail: "one agent per package; verify with the mode prompt.md requires" },
+        #{ title: "Land", detail: "typecheck + re-measure; optional commit" },
+        #{ title: "Critique", detail: "independent re-measure per doctrine; no self-grade" },
+        #{ title: "Loop", detail: "repeat until hard gates pass or max_rounds" },
     ],
 };
 
-// --- schemas ----------------------------------------------------------------
+// --- schemas (shape only; content rules live in prompt.md) ---
 
 let measure_schema = #{
     "type": "object",
-    "required": ["pass", "hard_failed", "report_path", "notes"],
+    "required": ["pass", "hard_failed", "report_path", "modes_used", "notes"],
     "properties": #{
         "pass": #{ "type": "boolean" },
         "hard_failed": #{
-            "type": "array",
-            "maxItems": 20,
+            "type": "array", "maxItems": 20,
             "items": #{
                 "type": "object",
                 "required": ["id", "measured", "target"],
@@ -33,24 +41,24 @@ let measure_schema = #{
                 },
             },
         },
-        "advisory_failed": #{
-            "type": "array",
-            "maxItems": 12,
-            "items": #{ "type": "string" },
-        },
+        "advisory_failed": #{ "type": "array", "maxItems": 12, "items": #{ "type": "string" } },
         "report_path": #{ "type": "string" },
+        "modes_used": #{
+            "type": "array", "maxItems": 7, "items": #{ "type": "number" },
+            "description": "prompt.md verification mode numbers 1-7 actually used this measure",
+        },
         "notes": #{ "type": "string" },
     },
 };
 
 let findings_schema = #{
     "type": "object",
-    "required": ["domain", "findings"],
+    "required": ["category", "findings", "modes_used"],
     "properties": #{
-        "domain": #{ "type": "string" },
+        "category": #{ "type": "string" },
+        "modes_used": #{ "type": "array", "maxItems": 7, "items": #{ "type": "number" } },
         "findings": #{
-            "type": "array",
-            "maxItems": 10,
+            "type": "array", "maxItems": 10,
             "items": #{
                 "type": "object",
                 "required": ["file", "line", "severity", "issue", "mode"],
@@ -59,7 +67,7 @@ let findings_schema = #{
                     "line": #{ "type": "number" },
                     "severity": #{ "type": "string" },
                     "issue": #{ "type": "string" },
-                    "mode": #{ "type": "string" },
+                    "mode": #{ "type": "number" },
                     "fix_hint": #{ "type": "string" },
                 },
             },
@@ -72,82 +80,55 @@ let packages_schema = #{
     "required": ["packages", "deferred", "rationale"],
     "properties": #{
         "packages": #{
-            "type": "array",
-            "maxItems": 6,
+            "type": "array", "maxItems": 6,
             "items": #{
                 "type": "object",
-                "required": ["id", "title", "owned_files", "findings", "acceptance"],
+                "required": ["id", "title", "owned_files", "findings", "acceptance", "categories"],
                 "properties": #{
                     "id": #{ "type": "string" },
                     "title": #{ "type": "string" },
-                    "owned_files": #{
-                        "type": "array",
-                        "maxItems": 24,
-                        "items": #{ "type": "string" },
-                    },
-                    "findings": #{
-                        "type": "array",
-                        "maxItems": 12,
-                        "items": #{ "type": "string" },
-                    },
+                    "owned_files": #{ "type": "array", "maxItems": 24, "items": #{ "type": "string" } },
+                    "findings": #{ "type": "array", "maxItems": 12, "items": #{ "type": "string" } },
                     "acceptance": #{ "type": "string" },
                     "verify_cmd": #{ "type": "string" },
+                    "categories": #{ "type": "array", "maxItems": 10, "items": #{ "type": "string" } },
                 },
             },
         },
-        "deferred": #{
-            "type": "array",
-            "maxItems": 20,
-            "items": #{ "type": "string" },
-        },
+        "deferred": #{ "type": "array", "maxItems": 20, "items": #{ "type": "string" } },
         "rationale": #{ "type": "string" },
     },
 };
 
 let fix_schema = #{
     "type": "object",
-    "required": ["id", "changed", "files_touched", "summary", "self_check"],
+    "required": ["id", "changed", "files_touched", "summary", "self_check", "modes_used"],
     "properties": #{
         "id": #{ "type": "string" },
         "changed": #{ "type": "boolean" },
-        "files_touched": #{
-            "type": "array",
-            "maxItems": 24,
-            "items": #{ "type": "string" },
-        },
+        "files_touched": #{ "type": "array", "maxItems": 24, "items": #{ "type": "string" } },
         "summary": #{ "type": "string" },
         "self_check": #{ "type": "string" },
+        "modes_used": #{ "type": "array", "maxItems": 7, "items": #{ "type": "number" } },
         "blocked": #{ "type": "string" },
     },
 };
 
 let critique_schema = #{
     "type": "object",
-    "required": ["verdict", "still_failing", "now_at_bar", "evidence"],
+    "required": ["category", "verdict", "still_failing", "now_at_bar", "evidence", "modes_used"],
     "properties": #{
+        "category": #{ "type": "string" },
         "verdict": #{ "type": "string" },
-        "still_failing": #{
-            "type": "array",
-            "maxItems": 16,
-            "items": #{ "type": "string" },
-        },
-        "now_at_bar": #{
-            "type": "array",
-            "maxItems": 16,
-            "items": #{ "type": "string" },
-        },
+        "still_failing": #{ "type": "array", "maxItems": 12, "items": #{ "type": "string" } },
+        "now_at_bar": #{ "type": "array", "maxItems": 12, "items": #{ "type": "string" } },
         "evidence": #{ "type": "string" },
+        "modes_used": #{ "type": "array", "maxItems": 7, "items": #{ "type": "number" } },
         "next_wave_priority": #{ "type": "string" },
     },
 };
 
-// --- args -------------------------------------------------------------------
-// max_rounds: wave iterations (default 4)
-// max_packages: packages per wave (default 4)
-// dry_run: measure+audit+synthesize only
-// skip_measure: reuse latest playtest report without re-running
-// no_commit: land phase typechecks but does not git commit
-
+// --- args ---
 let max_rounds = 4;
 let max_packages = 4;
 let dry_run = false;
@@ -161,22 +142,27 @@ if args != () {
     if args.skip_measure == true { skip_measure = true; }
     if args.no_commit == true { no_commit = true; }
 }
-
 if max_rounds < 1 { max_rounds = 1; }
 if max_rounds > 12 { max_rounds = 12; }
 if max_packages < 1 { max_packages = 1; }
 if max_packages > 6 { max_packages = 6; }
 
-// Fixed audit domains — always cover visual AND non-visual (prompt.md doctrine).
-// Order is stable; contents of each prompt adapt to hard_failed from measure.
-let audit_domains = [
-    "combat-hitboxes-ttk",
-    "perf-frame-shadows",
-    "gunfeel-feedback-juice",
-    "movement-skill-expression",
-    "ai-lethality-pacing",
-    "animation-death-av-sync",
-];
+// prompt.md check categories — fan out one agent each. Text is in the file.
+let categories = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"];
+
+// Low-effort worker preamble (session stays high; children save tokens)
+let low = "";
+low += "REASONING EFFORT: low. TOKEN-MIN. Tools > talk. Return schema only; no essays.\n";
+low += "You are a worker, not the orchestrator. Do not invent multi-wave plans.\n";
+
+// Doctrine pointer — always read the file; never rely on this summary alone
+let doctrine = "";
+doctrine += "LAW: read_file prompt.md (verification doctrine: modes 1-7 + categories A-J + how to run a wave).\n";
+doctrine += "Also read_file docs/PLAYTEST.md for hard/advisory playtest gates and instruments.\n";
+doctrine += "Also read_file docs/VISUAL-BAR.md only when using mode 1 (still frame).\n";
+doctrine += "RULE from prompt.md: no quality claim without the method that would expose its failure.\n";
+doctrine += "Git history: Claude already shipped ~2 days (foundation→7B→gameplay 1d521e1). Do not redo polish waves.\n";
+doctrine += "git status / git diff first — finish uncommitted WIP rather than thrashing it.\n";
 
 let history = [];
 let round = 0;
@@ -184,32 +170,9 @@ let all_hard_pass = false;
 let last_failed_fp = "";
 let stall_streak = 0;
 
-// Two days of Claude ultracode already shipped (2026-07-29 → 07-31). Do not redo it.
-let claude_arc = "";
-claude_arc += "CLAUDE CODE ALREADY RAN ~2 DAYS OF ULTRACODE ON THIS REPO (commit history is the source of truth).\n";
-claude_arc += "Timeline (oldest → newest):\n";
-claude_arc += "- Jul 29 foundation: engine spine, capture harness, player/movement, shots/rubric, smoke tests\n";
-claude_arc += "- Jul 29 Wave A/B: renderer/post/materials/physics; integrate world/weapons/characters/fx/audio/ui/ai/modes\n";
-claude_arc += "- Jul 29-30 Waves 3-5: polish materials/world/HUD/viewmodel; lighting/geometry; netcode contracts; nexus index\n";
-claude_arc += "- Jul 31: docs/site/CI; GPU harness hard-fail without real GPU; Wave 7A sun+shadows+shading; verification doctrine in prompt.md\n";
-claude_arc += "- Jul 31 Wave 7B: falsify tonemap hypothesis, fix real flatteners\n";
-claude_arc += "- Jul 31 Gameplay wave 1d521e1: FIRST wave verified by PLAYING — Apex movement, real combat, AI bridge, death clips,\n";
-claude_arc += "  fixed-step fire, quality presets, playtest.mjs + perf-session.mjs; PARTIAL PASS (still stutters; movement skill gap)\n";
-claude_arc += "- Jul 31 handoff 30e0515 GROK IS TAKING OVER; 90b6967 ultracode-wave workflow\n";
-claude_arc += "Open hard gates at last measured handoff: frame-p99, frame-spikes, hitbox-zones, ttk-lethal.\n";
-claude_arc += "Working tree may already contain uncommitted WIP toward those (CharacterController multi-zone, Hitboxes, Movement,\n";
-claude_arc += "Ballistics, Weapons, AI, playtest harness). git status/diff first — finish or verify that WIP, do not thrash it.\n";
-claude_arc += "Design target unchanged: Apex movement + CoD gunfeel/healing + higher TTK. Verification: playtest not stills.\n";
+log("ultracode-wave: children=LOW effort; doctrine=prompt.md categories A-J; max_rounds="
+    + max_rounds.to_string() + " max_packages=" + max_packages.to_string());
 
-log("ultracode-wave start: max_rounds=" + max_rounds.to_string()
-    + " max_packages=" + max_packages.to_string()
-    + " dry_run=" + if dry_run { "true" } else { "false" }
-    + " — GROK ultracode; Claude already shipped foundation→wave7→gameplay (~2 days)");
-log(claude_arc);
-
-// ---------------------------------------------------------------------------
-// OUTER WAVE LOOP
-// ---------------------------------------------------------------------------
 while round < max_rounds {
     round += 1;
     let round_s = round.to_string();
@@ -217,30 +180,23 @@ while round < max_rounds {
 
     // ---- MEASURE -----------------------------------------------------------
     phase("Measure");
-    let measure_prompt = "";
-    measure_prompt += "You are the MEASURE agent for Operation Blackout (repo: current cwd).\n";
-    measure_prompt += "Doctrine lives in prompt.md and docs/PLAYTEST.md. Screenshots are NOT sufficient.\n\n";
-    measure_prompt += claude_arc + "\n";
-    measure_prompt += "HARD RULES:\n";
-    measure_prompt += "1) Use shell tools. Do not invent gate numbers. Run git status and git diff --stat first.\n";
-    measure_prompt += "2) Read any existing report first for context:\n";
-    measure_prompt += "   - shots/gpc-combat/playtest-default.json (post-gameplay critic)\n";
-    measure_prompt += "   - shots/playtest/report.json\n";
-    measure_prompt += "3) ";
+    let mp = "";
+    mp += low;
+    mp += doctrine;
+    mp += "TASK: MEASURE wave " + round_s + ".\n";
+    mp += "1) git status && git diff --stat\n";
+    mp += "2) Read prompt.md how-to-run-a-wave + docs/PLAYTEST.md gates.\n";
     if skip_measure {
-        measure_prompt += "SKIP_MEASURE is set: do NOT re-run playtest. Parse the newest existing report only.\n";
+        mp += "3) SKIP_MEASURE: parse newest shots/playtest/*.json and shots/gpc-combat/playtest-default.json only.\n";
     } else {
-        measure_prompt += "Run a fresh playtest on the real GPU against CURRENT tree (including uncommitted WIP):\n";
-        measure_prompt += "   npx tsc --noEmit  (fix type errors from WIP before building if possible)\n";
-        measure_prompt += "   node tools/playtest.mjs --json shots/playtest/report-wave" + round_s + ".json\n";
-        measure_prompt += "   Prefer FULL build on round 1 so WIP is in the bundle. GPU must be real NVIDIA not llvmpipe.\n";
+        mp += "3) Run mode 3 instrument: node tools/playtest.mjs --json shots/playtest/report-wave" + round_s + ".json\n";
+        mp += "   Prefer full build if src dirty. GPU must be real NVIDIA (not llvmpipe) per prompt.md category J.\n";
+        mp += "4) If time: mode 4 tools/perf-session.mjs --no-build --presets high (or read existing shots/gpc-combat/perf*.json).\n";
     }
-    measure_prompt += "4) List EVERY hard gate that fails with measured vs target.\n";
-    measure_prompt += "5) Prior open hard fails at handoff: frame-p99, frame-spikes, hitbox-zones, ttk-lethal — re-measure; WIP may have moved them.\n";
-    measure_prompt += "6) report_path must be a real path you read.\n";
-    measure_prompt += "7) notes: what the numbers mean next; call out if uncommitted WIP already improved a gate.\n";
+    mp += "5) List every HARD gate fail with measured vs target from docs/PLAYTEST.md.\n";
+    mp += "6) modes_used = which prompt.md mode numbers (1-7) you actually used.\n";
 
-    let measure = agent(measure_prompt, #{
+    let measure = agent(mp, #{
         label: "measure-w" + round_s,
         capability_mode: "execute",
         output_schema: measure_schema,
@@ -250,123 +206,73 @@ while round < max_rounds {
     let report_path = "shots/playtest/report.json";
     let measure_notes = "";
     let wave_pass = false;
+    let modes_used = [];
 
     if measure != () && measure.success && measure.output != () {
         wave_pass = measure.output.pass == true;
-        if measure.output.hard_failed != () {
-            hard_failed = measure.output.hard_failed;
-        }
-        if measure.output.report_path != () {
-            report_path = measure.output.report_path;
-        }
-        if measure.output.notes != () {
-            measure_notes = measure.output.notes;
-        }
+        if measure.output.hard_failed != () { hard_failed = measure.output.hard_failed; }
+        if measure.output.report_path != () { report_path = measure.output.report_path; }
+        if measure.output.notes != () { measure_notes = measure.output.notes; }
+        if measure.output.modes_used != () { modes_used = measure.output.modes_used; }
     } else {
-        log("Measure agent failed or returned unusable output — treating as all-critical fail and continuing with known open gates");
-        hard_failed = [
-            #{ id: "frame-p99", measured: "unknown", target: "<=16.7" },
-            #{ id: "frame-spikes", measured: "unknown", target: "==0" },
-            #{ id: "hitbox-zones", measured: "unknown", target: ">=3" },
-            #{ id: "ttk-lethal", measured: "unknown", target: "==0" },
-        ];
-        measure_notes = "measure failed; using handoff open gates";
+        log("Measure failed — continuing with empty fail list forces full A-J audit");
+        measure_notes = "measure agent failed";
     }
 
     let fail_ids = [];
     for g in hard_failed {
-        if g.id != () {
-            fail_ids.push(g.id);
-        }
+        if g.id != () { fail_ids.push(g.id); }
     }
     let fail_blob = json_encode(hard_failed);
     let fail_fp = fingerprint(fail_blob);
-    log("Wave " + round_s + " measure: pass=" + if wave_pass { "true" } else { "false" }
+    log("Measure pass=" + if wave_pass { "true" } else { "false" }
         + " hard_failed=" + fail_ids.len().to_string()
+        + " modes=" + json_encode(modes_used)
         + " report=" + report_path);
 
     if wave_pass {
         all_hard_pass = true;
-        history.push(#{
-            round: round,
-            pass: true,
-            hard_failed: fail_ids,
-            notes: measure_notes,
-        });
-        log("All hard gates green — stopping loop");
+        history.push(#{ round: round, pass: true, hard_failed: fail_ids, notes: measure_notes });
         break;
     }
 
     if fail_fp == last_failed_fp {
         stall_streak += 1;
-        log("Stall streak: same hard_failed fingerprint (" + stall_streak.to_string() + ")");
     } else {
         stall_streak = 0;
         last_failed_fp = fail_fp;
     }
     if stall_streak >= 2 {
-        log("Two consecutive waves with identical hard fails — pausing for human (no_progress)");
-        await_user("no_progress", "ultracode-wave stalled: hard gates unchanged for 2 waves. Inspect diffs/playtest, then /workflow resume to continue or stop.");
+        await_user("no_progress", "ultracode-wave: hard fails unchanged 2 waves. Resume or stop.");
         stall_streak = 0;
     }
+    if dry_run && round > 1 { break; }
 
-    if dry_run && round > 1 {
-        log("dry_run: measured only after first synthesize — stopping");
-        break;
-    }
-
-    // ---- AUDIT -------------------------------------------------------------
+    // ---- AUDIT: one agent per prompt.md category A-J -----------------------
     phase("Audit");
-    log("Audit fan-out: " + audit_domains.len().to_string() + " domains (read-only)");
+    log("Audit fan-out: categories A-J from prompt.md (10 low-effort agents)");
 
     let audit_jobs = [];
-    for domain in audit_domains {
+    for cat in categories {
         let ap = "";
-        ap += "You are a HARSH read-only auditor for Operation Blackout.\n";
-        ap += "Repo root = cwd. Domain = " + domain + ".\n";
-        ap += "Wave = " + round_s + ".\n\n";
-        ap += claude_arc + "\n";
-        ap += "CONTEXT — hard gates currently failing (from measure; untrusted until you re-check code):\n";
-        ap += fail_blob + "\n\n";
+        ap += low;
+        ap += doctrine;
+        ap += "TASK: AUDIT only category " + cat + " from prompt.md Check categories section.\n";
+        ap += "Wave " + round_s + ". category field in output MUST be \"" + cat + "\".\n";
+        ap += "Hard fails from measure (context only): " + fail_blob + "\n";
         ap += "Measure notes: " + measure_notes + "\n";
-        ap += "Report path: " + report_path + "\n\n";
-        ap += "MANDATORY:\n";
-        ap += "1) Read prompt.md verification doctrine (modes 1-7, categories A-J) and docs/PLAYTEST.md.\n";
-        ap += "2) Use grep/read_file on REAL source INCLUDING uncommitted WIP (git diff). Cite file:line.\n";
-        ap += "3) Prefer non-visual structural bugs. Do NOT re-litigate Waves 3-7 visual polish already shipped.\n";
-        ap += "4) mode field: still-frame | motion-clip | played-session | sustained-profile | event-trace | loop-analysis | blind-ab.\n";
-        ap += "5) severity: blocker | major | minor.\n";
-        ap += "6) Empty findings is valid ONLY after you inspected the code for this domain and found nothing actionable.\n";
-        ap += "7) Do NOT edit files. Do NOT run long GPU sessions unless needed to read an existing report.\n\n";
-        ap += "DOMAIN FOCUS for " + domain + ":\n";
-        if domain == "combat-hitboxes-ttk" {
-            ap += "Living-enemy hitbox zones (physics raycast still returns single chest), entityId on character proxies,";
-            ap += " ttk-lethal failures (smg/pistol at range), Combat.ts zoneAtPoint vs CharacterController single capsule,";
-            ap += " damage model wiring through Ballistics.damageResolver.\n";
-        }
-        if domain == "perf-frame-shadows" {
-            ap += "frame-p99 / frame-spikes. Shadow atlas cost (70% draw calls historically). Shadows.ts cascade audit API.";
-            ap += " Quality presets, capture=1 exposure flush lie, tools/perf-session.mjs / gpc-perf*.mjs evidence.\n";
-        }
-        if domain == "gunfeel-feedback-juice" {
-            ap += "Hitmarkers, hitstop, camera kick, kill confirm, muzzle/brass placement, damage indicators,";
-            ap += " input-to-response <=50ms claims, tools/g2-gunfeel.mjs and gpc-feel.mjs.\n";
-        }
-        if domain == "movement-skill-expression" {
-            ap += "Apex movement exists but holding W still wins down a corridor. Skill gap: optimal vs naive path times.";
-            ap += " Slide-jump chaining payoff, air-strafe value, mantle usefulness, wall-bounce.\n";
-        }
-        if domain == "ai-lethality-pacing" {
-            ap += "AI stack vs BotFallback, time-to-first-contact, engagement frequency, suppression self-hits,";
-            ap += " tools/g4-aiprobe.mjs / gpc-combat.mjs evidence.\n";
-        }
-        if domain == "animation-death-av-sync" {
-            ap += "Death clip compile, footsliding, AV sync on impacts/reload, last-stand loop, tools/gpc-death.mjs.\n";
-        }
+        ap += "Report: " + report_path + "\n";
+        ap += "STEPS:\n";
+        ap += "1) read_file prompt.md — your category's bullets and its required verification mode.\n";
+        ap += "2) Use the instrument that would expose failure (mode 1-7 table in prompt.md). Prefer existing tools/reports over new long runs when sufficient.\n";
+        ap += "3) grep/read_file real src + git diff. Cite file:line.\n";
+        ap += "4) findings[].mode = mode number 1-7 you used for that finding.\n";
+        ap += "5) modes_used = list of mode numbers you used. Empty findings OK only after real inspection of category " + cat + ".\n";
+        ap += "6) Do not edit files. Do not audit other categories.\n";
 
         audit_jobs.push(#{
             prompt: ap,
-            label: "audit:" + domain + ":w" + round_s,
+            label: "audit-" + cat + "-w" + round_s,
             capability_mode: "read-only",
             output_schema: findings_schema,
         });
@@ -375,163 +281,121 @@ while round < max_rounds {
     let audit_results = parallel(audit_jobs);
     let all_findings = [];
     let audits_ok = 0;
+    let covered = [];
     let di = 0;
     for r in audit_results {
-        if r != () && r.success && r.output != () && r.output.findings != () {
+        let cat_fallback = categories[di];
+        if r != () && r.success && r.output != () {
             audits_ok += 1;
-            for f in r.output.findings {
-                let row = f;
-                // stamp domain for synthesizer
-                if r.output.domain != () {
-                    // cannot add fields freely if schema-locked on child; pack into issue prefix via string in synth input
+            let cat = if r.output.category != () { r.output.category } else { cat_fallback };
+            covered.push(cat);
+            if r.output.findings != () {
+                for f in r.output.findings {
+                    all_findings.push(#{
+                        category: cat,
+                        file: if f.file != () { f.file } else { "" },
+                        line: if f.line != () { f.line } else { 0 },
+                        severity: if f.severity != () { f.severity } else { "major" },
+                        issue: if f.issue != () { f.issue } else { "" },
+                        mode: if f.mode != () { f.mode } else { 0 },
+                        fix_hint: if f.fix_hint != () { f.fix_hint } else { "" },
+                    });
                 }
-                all_findings.push(#{
-                    domain: if r.output.domain != () { r.output.domain } else { audit_domains[di] },
-                    file: if f.file != () { f.file } else { "" },
-                    line: if f.line != () { f.line } else { 0 },
-                    severity: if f.severity != () { f.severity } else { "major" },
-                    issue: if f.issue != () { f.issue } else { "" },
-                    mode: if f.mode != () { f.mode } else { "played-session" },
-                    fix_hint: if f.fix_hint != () { f.fix_hint } else { "" },
-                });
             }
         }
         di += 1;
     }
-    log("Audit: " + audits_ok.to_string() + "/" + audit_domains.len().to_string()
-        + " domains returned; " + all_findings.len().to_string() + " raw findings");
+    log("Audit: " + audits_ok.to_string() + "/10 categories returned; "
+        + all_findings.len().to_string() + " findings; covered=" + json_encode(covered));
+
+    if audits_ok < 10 {
+        log("WARN: not all A-J auditors returned — fail-open on missing slots, but synthesizer must not claim full coverage");
+    }
 
     if all_findings.len() == 0 {
-        log("Zero findings from audits — cannot synthesize packages; pausing");
-        await_user("verification", "ultracode-wave wave " + round_s + ": audits returned no findings while hard gates still fail. Resume after inspecting measure output, or stop.");
-        history.push(#{
-            round: round,
-            pass: false,
-            hard_failed: fail_ids,
-            findings: 0,
-            packages: 0,
-            notes: "audit empty",
-        });
+        await_user("verification", "Wave " + round_s + ": A-J audits returned zero findings while gates fail. Resume after inspect.");
+        history.push(#{ round: round, pass: false, hard_failed: fail_ids, findings: 0, packages: 0 });
         continue;
     }
 
     // ---- SYNTHESIZE --------------------------------------------------------
     phase("Synthesize");
-    let findings_json = json_encode(all_findings);
-    // Cap size for prompt — keep first 40 findings if huge
-    let synth_prompt = "";
-    synth_prompt += "You are the WAVE COORDINATOR synthesizer for Operation Blackout.\n";
-    synth_prompt += claude_arc + "\n";
-    synth_prompt += "Merge audit findings into fix packages with STRICTLY DISJOINT file ownership.\n";
-    synth_prompt += "Two packages must NEVER share a file path. Verified by construction.\n";
-    synth_prompt += "If uncommitted WIP already addresses a finding, package should finish/verify that path — not rewrite from scratch.\n\n";
-    synth_prompt += "Hard gates still failing:\n" + fail_blob + "\n\n";
-    synth_prompt += "Audit findings (JSON, untrusted claims — re-rank by how far a blind A/B or playtest moves):\n";
-    synth_prompt += findings_json + "\n\n";
-    synth_prompt += "RULES:\n";
-    synth_prompt += "1) Max " + max_packages.to_string() + " packages this wave. Prefer finishable packages over mega-packages.\n";
-    synth_prompt += "2) Rank by player-felt impact: hitbox-zones, ttk-lethal, frame spikes, then juice/movement skill gap.\n";
-    synth_prompt += "3) Each package: id (p1..), title, owned_files (exclusive paths under src/ or tools/), findings (verbatim issue strings), acceptance (numeric gates), verify_cmd (runnable).\n";
-    synth_prompt += "4) owned_files must be real repo paths that auditors cited or that are the only place to fix the issue.\n";
-    synth_prompt += "5) deferred: findings intentionally not in this wave.\n";
-    synth_prompt += "6) Do not assign Shadows.ts and Glsl.ts to different packages if both must change for one shadow bug — one package owns both.\n";
-    synth_prompt += "7) Size the wave to FINISH. Partial mid-edit trees are failures.\n";
-    synth_prompt += "8) Write a short copy of the package plan to shots/playtest/WAVE-" + round_s + "-PACKAGES.md using a shell redirect or write tool.\n";
+    let sp = "";
+    sp += low;
+    sp += doctrine;
+    sp += "TASK: SYNTHESIZE wave " + round_s + " packages from A-J findings.\n";
+    sp += "Hard fails: " + fail_blob + "\n";
+    sp += "Findings JSON:\n" + json_encode(all_findings) + "\n";
+    sp += "RULES from prompt.md how-to-run-a-wave:\n";
+    sp += "- Rank by how far playtest / blind A/B moves, not stills alone.\n";
+    sp += "- Max " + max_packages.to_string() + " packages; STRICTLY DISJOINT owned_files.\n";
+    sp += "- Size to finish. Include categories[] each package serves.\n";
+    sp += "- acceptance must name numeric gates from prompt.md / docs/PLAYTEST.md.\n";
+    sp += "- Prefer finishing uncommitted WIP that already targets a finding.\n";
+    sp += "- Write shots/playtest/WAVE-" + round_s + "-PACKAGES.md briefly.\n";
 
-    let synth = agent(synth_prompt, #{
-        label: "synthesize-w" + round_s,
+    let synth = agent(sp, #{
+        label: "synth-w" + round_s,
         capability_mode: "read-write",
         output_schema: packages_schema,
     });
 
     let packages = [];
     if synth != () && synth.success && synth.output != () && synth.output.packages != () {
-        // Enforce max_packages and basic disjointness in script
         let claimed = [];
-        let dropped_overlap = 0;
         for p in synth.output.packages {
-            if packages.len() >= max_packages {
-                break;
-            }
-            if p.owned_files == () || p.id == () {
-                continue;
-            }
+            if packages.len() >= max_packages { break; }
+            if p.owned_files == () || p.id == () { continue; }
             let overlap = false;
             for f in p.owned_files {
                 for c in claimed {
                     if f == c { overlap = true; }
                 }
             }
-            if overlap {
-                dropped_overlap += 1;
-            } else {
+            if !overlap {
                 for f in p.owned_files { claimed.push(f); }
                 packages.push(p);
             }
         }
-        if dropped_overlap > 0 {
-            log("Dropped " + dropped_overlap.to_string() + " package(s) for file-ownership overlap");
-        }
     }
+    log("Packages admitted: " + packages.len().to_string());
 
-    log("Synthesize: " + packages.len().to_string() + " packages admitted");
     if packages.len() == 0 {
-        log("No packages — pausing");
-        await_user("verification", "ultracode-wave wave " + round_s + ": synthesizer produced no usable disjoint packages. Resume to retry or stop.");
-        history.push(#{
-            round: round,
-            pass: false,
-            hard_failed: fail_ids,
-            findings: all_findings.len(),
-            packages: 0,
-            notes: "no packages",
-        });
+        await_user("verification", "Wave " + round_s + ": no disjoint packages. Resume or stop.");
+        history.push(#{ round: round, pass: false, hard_failed: fail_ids, findings: all_findings.len(), packages: 0 });
         continue;
     }
-
     if dry_run {
-        log("dry_run: stopping after synthesize");
-        history.push(#{
-            round: round,
-            pass: false,
-            hard_failed: fail_ids,
-            findings: all_findings.len(),
-            packages: packages.len(),
-            notes: "dry_run",
-        });
+        history.push(#{ round: round, pass: false, hard_failed: fail_ids, findings: all_findings.len(), packages: packages.len(), notes: "dry_run" });
         break;
     }
 
-    // ---- FIX (parallel, disjoint ownership — no worktree isolation) --------
+    // ---- FIX ---------------------------------------------------------------
     phase("Fix");
     let fix_jobs = [];
     for p in packages {
         let owned = if p.owned_files != () { json_encode(p.owned_files) } else { "[]" };
         let findings_s = if p.findings != () { json_encode(p.findings) } else { "[]" };
+        let cats = if p.categories != () { json_encode(p.categories) } else { "[]" };
         let title = if p.title != () { p.title } else { p.id };
-        let acceptance = if p.acceptance != () { p.acceptance } else { "typecheck clean; relevant playtest gate moves" };
+        let acceptance = if p.acceptance != () { p.acceptance } else { "see prompt.md gates" };
         let verify_cmd = if p.verify_cmd != () { p.verify_cmd } else { "npx tsc --noEmit" };
 
         let fp = "";
-        fp += "You are a FIX agent for Operation Blackout wave " + round_s + " package " + p.id + ".\n";
-        fp += "Title: " + title + "\n\n";
-        fp += "YOU OWN THESE FILES EXCLUSIVELY (edit ONLY these paths; do not touch others):\n";
-        fp += owned + "\n\n";
-        fp += "Findings to fix (verbatim):\n" + findings_s + "\n\n";
-        fp += "Acceptance criteria (numeric where possible):\n" + acceptance + "\n\n";
-        fp += "Verify command to run yourself before finishing:\n" + verify_cmd + "\n\n";
-        fp += "ALSO run: npx tsc --noEmit  (must be clean for your touched files / project).\n\n";
-        fp += "RULES:\n";
-        fp += "1) Read every owned file before editing. Use the mode that would expose the failure (play/session/profile — not stills alone).\n";
-        fp += "2) Prefer minimal surgical fixes. No drive-by refactors outside owned_files.\n";
-        fp += "3) Do not git commit. Land agent commits.\n";
-        fp += "4) If blocked (need a file you do not own), set changed=false and blocked=reason.\n";
-        fp += "5) self_check must quote command output / numbers, not vibes.\n";
-        fp += "6) Design target: Apex movement, CoD gunfeel/healing, higher TTK; no Apex medkits.\n";
+        fp += low;
+        fp += doctrine;
+        fp += "TASK: FIX package " + p.id + " (" + title + ") wave " + round_s + ".\n";
+        fp += "Categories: " + cats + "\n";
+        fp += "OWNED FILES ONLY:\n" + owned + "\n";
+        fp += "Findings:\n" + findings_s + "\n";
+        fp += "Acceptance:\n" + acceptance + "\n";
+        fp += "Verify: " + verify_cmd + " && npx tsc --noEmit\n";
+        fp += "Use the verification mode(s) prompt.md requires for these categories — not stills alone.\n";
+        fp += "Do not git commit. modes_used = mode numbers you actually ran.\n";
 
         fix_jobs.push(#{
             prompt: fp,
-            label: "fix:" + p.id + ":w" + round_s,
+            label: "fix-" + p.id + "-w" + round_s,
             capability_mode: "execute",
             output_schema: fix_schema,
         });
@@ -544,52 +408,41 @@ while round < max_rounds {
     for fr in fix_results {
         let pid = if fi < packages.len() { packages[fi].id } else { "p?" };
         if fr != () && fr.success && fr.output != () {
-            if fr.output.changed == true {
-                fixes_changed += 1;
-            }
+            if fr.output.changed == true { fixes_changed += 1; }
             fix_summaries.push(#{
                 id: if fr.output.id != () { fr.output.id } else { pid },
                 changed: fr.output.changed == true,
                 summary: if fr.output.summary != () { fr.output.summary } else { "" },
                 self_check: if fr.output.self_check != () { fr.output.self_check } else { "" },
+                modes_used: if fr.output.modes_used != () { fr.output.modes_used } else { [] },
                 blocked: if fr.output.blocked != () { fr.output.blocked } else { "" },
             });
         } else {
-            fix_summaries.push(#{
-                id: pid,
-                changed: false,
-                summary: "fix agent failed",
-                self_check: "",
-                blocked: "agent failure",
-            });
+            fix_summaries.push(#{ id: pid, changed: false, summary: "agent failed", self_check: "", modes_used: [], blocked: "fail" });
         }
         fi += 1;
     }
-    log("Fix: " + fixes_changed.to_string() + " package(s) reported changes");
+    log("Fixes changed: " + fixes_changed.to_string());
 
     // ---- LAND --------------------------------------------------------------
     phase("Land");
-    let land_prompt = "";
-    land_prompt += "You are the LAND agent for Operation Blackout wave " + round_s + ".\n";
-    land_prompt += "Fix package results (JSON):\n" + json_encode(fix_summaries) + "\n\n";
-    land_prompt += "Steps (use shell):\n";
-    land_prompt += "1) git status && git diff --stat\n";
-    land_prompt += "2) npx tsc --noEmit — MUST be clean. If not, fix ONLY trivial type errors you can attribute to this wave, or report failure.\n";
-    land_prompt += "3) Re-run playtest:\n";
-    land_prompt += "   node tools/playtest.mjs --json shots/playtest/report-wave" + round_s + "-post.json\n";
-    land_prompt += "   (use --no-build only if you just built; prefer rebuild if src changed)\n";
-    land_prompt += "4) Compare hard gates to pre-wave fails: " + fail_blob + "\n";
-    land_prompt += "5) ";
+    let lp = "";
+    lp += low;
+    lp += doctrine;
+    lp += "TASK: LAND wave " + round_s + ".\n";
+    lp += "Fix results: " + json_encode(fix_summaries) + "\n";
+    lp += "1) git status && git diff --stat\n";
+    lp += "2) npx tsc --noEmit\n";
+    lp += "3) node tools/playtest.mjs --json shots/playtest/report-wave" + round_s + "-post.json\n";
+    lp += "4) Compare hard gates to: " + fail_blob + "\n";
     if no_commit {
-        land_prompt += "NO_COMMIT set: do not git commit. Leave working tree dirty if needed.\n";
+        lp += "5) NO_COMMIT — do not git commit.\n";
     } else {
-        land_prompt += "If typecheck clean AND at least one hard gate improved or a clear structural fix landed,\n";
-        land_prompt += "create ONE git commit with message starting: 'Wave " + round_s + " ultracode:' and listing gate deltas.\n";
-        land_prompt += "Do NOT push. Do NOT commit if nothing meaningful changed.\n";
+        lp += "5) If meaningful gate/structural progress: one commit 'Wave " + round_s + " ultracode: …'. No push.\n";
     }
-    land_prompt += "6) Return measure schema: pass, hard_failed, report_path, notes summarizing gate deltas.\n";
+    lp += "6) modes_used for this land measure. Return measure schema.\n";
 
-    let land = agent(land_prompt, #{
+    let land = agent(lp, #{
         label: "land-w" + round_s,
         capability_mode: "execute",
         output_schema: measure_schema,
@@ -606,47 +459,66 @@ while round < max_rounds {
         if land.output.report_path != () { post_report = land.output.report_path; }
     }
 
-    // ---- CRITIQUE ----------------------------------------------------------
+    // ---- CRITIQUE: re-check categories that had findings (cap 6) ------------
     phase("Critique");
     let post_blob = json_encode(post_failed);
+    let crit_cats = [];
+    for p in packages {
+        if p.categories != () {
+            for c in p.categories {
+                let seen = false;
+                for e in crit_cats {
+                    if e == c { seen = true; }
+                }
+                if !seen && crit_cats.len() < 6 { crit_cats.push(c); }
+            }
+        }
+    }
+    // Always include E and H (combat + perf) if room
+    for must in ["E", "H"] {
+        let seen = false;
+        for e in crit_cats {
+            if e == must { seen = true; }
+        }
+        if !seen && crit_cats.len() < 6 { crit_cats.push(must); }
+    }
+    if crit_cats.len() == 0 {
+        crit_cats = ["E", "H", "B"];
+    }
+
     let critique_jobs = [];
+    for cat in crit_cats {
+        let cp = "";
+        cp += low;
+        cp += doctrine;
+        cp += "TASK: independent CRITIC for category " + cat + " only. Do not trust fix agents.\n";
+        cp += "Wave " + round_s + ". category=\"" + cat + "\".\n";
+        cp += "Pre fails: " + fail_blob + "\nPost claims: " + post_blob + "\n";
+        cp += "Report: " + post_report + "\n";
+        cp += "1) read_file prompt.md category " + cat + " gates.\n";
+        cp += "2) Re-measure with the mode that would expose failure (playtest/perf tools as needed).\n";
+        cp += "3) verdict PASS|PARTIAL|FAIL. evidence = numbers. modes_used required.\n";
+        cp += "4) now_at_bar only what you re-measured green. still_failing for the rest.\n";
 
-    let c1 = "";
-    c1 += "You are an independent PLAYTEST CRITIC. Do not trust fix agents.\n";
-    c1 += "Wave " + round_s + ". Read " + post_report + " and/or re-run:\n";
-    c1 += "  node tools/playtest.mjs --no-build --json shots/playtest/report-wave" + round_s + "-critic.json\n";
-    c1 += "Pre-wave fails: " + fail_blob + "\nPost-land claims: " + post_blob + "\n";
-    c1 += "Verdict: PASS | PARTIAL | FAIL. still_failing / now_at_bar from HARD gates only.\n";
-    c1 += "evidence must quote measured numbers. next_wave_priority = single top priority.\n";
-    critique_jobs.push(#{
-        prompt: c1,
-        label: "critic-playtest-w" + round_s,
-        capability_mode: "execute",
-        output_schema: critique_schema,
-    });
-
-    let c2 = "";
-    c2 += "You are an independent HARSH PRODUCT CRITIC for a CoD-feel FPS with Apex movement.\n";
-    c2 += "Wave " + round_s + ". Read git diff against previous commit and playtest reports under shots/playtest/.\n";
-    c2 += "Focus on: does it PLAY better? Hitboxes? Lethality? Stutter? Does movement skill pay off?\n";
-    c2 += "Do not praise lighting stills. verdict PASS|PARTIAL|FAIL. Quote evidence.\n";
-    critique_jobs.push(#{
-        prompt: c2,
-        label: "critic-product-w" + round_s,
-        capability_mode: "execute",
-        output_schema: critique_schema,
-    });
+        critique_jobs.push(#{
+            prompt: cp,
+            label: "critic-" + cat + "-w" + round_s,
+            capability_mode: "execute",
+            output_schema: critique_schema,
+        });
+    }
 
     let critiques = parallel(critique_jobs);
     let critique_notes = [];
     for cr in critiques {
         if cr != () && cr.success && cr.output != () {
             critique_notes.push(#{
+                category: if cr.output.category != () { cr.output.category } else { "?" },
                 verdict: if cr.output.verdict != () { cr.output.verdict } else { "FAIL" },
                 still_failing: if cr.output.still_failing != () { cr.output.still_failing } else { [] },
                 now_at_bar: if cr.output.now_at_bar != () { cr.output.now_at_bar } else { [] },
                 evidence: if cr.output.evidence != () { cr.output.evidence } else { "" },
-                next_wave_priority: if cr.output.next_wave_priority != () { cr.output.next_wave_priority } else { "" },
+                modes_used: if cr.output.modes_used != () { cr.output.modes_used } else { [] },
             });
         }
     }
@@ -661,52 +533,31 @@ while round < max_rounds {
         fixes_changed: fixes_changed,
         notes: post_notes,
         critiques: critique_notes,
+        categories_audited: covered,
     });
 
     if post_pass {
         all_hard_pass = true;
-        log("Post-land measure reports all hard gates pass");
         break;
     }
-
-    // Update fail fingerprint from post state for stall detection next iter
-    let post_fp = fingerprint(json_encode(post_failed));
-    if post_fp == fail_fp {
-        // no improvement in fail set
-        log("Wave " + round_s + " did not clear any hard-fail identity");
-    }
-
     phase("Loop");
-    log("Wave " + round_s + " complete — remaining hard fails: " + json_encode(post_failed));
-    // feed post fails into next measure by continuing loop (measure will re-run)
+    log("Wave " + round_s + " done; remaining: " + json_encode(post_failed));
 }
 
-// ---- FINAL REPORT ----------------------------------------------------------
 phase("Loop");
 let report = "";
-report += "# ultracode-wave final report\n\n";
-report += "Claude shipped ~2 days of waves (foundation through gameplay 1d521e1).\n";
-report += "Grok handoff: 30e0515 GROK IS TAKING OVER FROM CLAUDE CODE.\n";
+report += "# ultracode-wave\n\n";
+report += "Doctrine: prompt.md (modes 1-7, categories A-J). Children low-effort.\n";
 report += "all_hard_pass: " + if all_hard_pass { "true" } else { "false" } + "\n";
-report += "rounds_run: " + round.to_string() + " / " + max_rounds.to_string() + "\n\n";
-report += "## History\n\n";
+report += "rounds: " + round.to_string() + "/" + max_rounds.to_string() + "\n\n";
 report += "```json\n" + json_encode(history) + "\n```\n";
-report += "\n## Doctrine\n";
-report += "Main thread orchestrates only. Children measure with playtest (not stills),\n";
-report += "audit in parallel, fix under disjoint ownership, critics re-measure.\n";
-report += "Do not re-do Claude visual polish waves; attack remaining hard playtest gates.\n";
 
 let report_path_out = write_scratch_file("ultracode-wave-report.md", report);
-
-let summary = "ultracode-wave finished rounds=" + round.to_string()
-    + " hard_pass=" + if all_hard_pass { "true" } else { "false" }
-    + " — see scratch report";
-
 complete(#{
-    summary: summary,
+    summary: "ultracode-wave rounds=" + round.to_string()
+        + " hard_pass=" + if all_hard_pass { "true" } else { "false" },
     all_hard_pass: all_hard_pass,
     rounds: round,
-    max_rounds: max_rounds,
     history: history,
     report_path: report_path_out,
 });

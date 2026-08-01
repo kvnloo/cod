@@ -128,26 +128,29 @@ const LADDER: Rung[] = [
     },
   },
 
-  // 5 — volumetrics out, shorter TAA, particles/decals halved (pool caps only).
+  // 5 — last allocation-free rung: volumetrics out, shorter TAA, atlas 8 Hz.
+  // Do NOT touch maxParticles/maxDecals here — those reallocate GPU pools and
+  // were measured as the 50–80 ms hitch that kept frame-spikes red after p99
+  // was already green.
   {
-    name: 'volumetrics-off+particles-50%+shadows-8hz',
+    name: 'volumetrics-off+taa-8+shadows-8hz',
     apply: (g, b) => {
       g.volumetrics = false;
       g.taaSamples = Math.min(b.taaSamples, 8);
-      g.maxParticles = Math.round(b.maxParticles * 0.5);
-      g.maxDecals = Math.round(b.maxDecals * 0.5);
       g.shadowUpdateHz = slowTo(g.shadowUpdateHz, 8);
       g.shadowDistance = b.shadowDistance * 0.5;
+      g.pcssSoftness = Math.min(g.pcssSoftness, 0.35);
     },
   },
 
-  // 6 — first G-buffer reallocation. Deliberately last free-ish step; long dwell.
+  // 6 — first real reallocation (G-buffer + particle/decal pools). Long dwell.
   {
-    name: 'REALLOC scale-85%+cascades-min',
+    name: 'REALLOC scale-85%+pools-50%',
     apply: (g, b) => {
       g.shadowCascades = 2;
       g.renderScale = b.renderScale * 0.85;
-      g.maxParticles = Math.round(b.maxParticles * 0.4);
+      g.maxParticles = Math.round(b.maxParticles * 0.5);
+      g.maxDecals = Math.round(b.maxDecals * 0.5);
       g.shadowMapSize = Math.max(512, Math.min(g.shadowMapSize, 1024));
     },
   },
@@ -192,6 +195,7 @@ const LADDER_KEYS: (keyof GfxSettings)[] = [
   'shadowUpdateHz', 'exposureUpdateHz', 'contactShadows', 'depthPrepass',
   'dof', 'motionBlur', 'shadowDistance', 'ssr', 'volumetrics', 'shadowCascades',
   'ssao', 'taaSamples', 'renderScale', 'maxParticles', 'lensDirt', 'shadowMapSize',
+  'pcssSoftness',
   'maxDecals',
 ];
 
@@ -437,7 +441,7 @@ export class FrameBudget {
     this.cursor = 0;
     this.overFor = 0;
     this.underFor = 0;
-    this.settle = 0.55;
+    this.settle = 1.0;
     this.applyHook?.();
   }
 

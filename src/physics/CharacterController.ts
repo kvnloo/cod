@@ -226,8 +226,8 @@ export class CapsuleCharacterController implements CharacterController {
     this.proxyCollider = host.world.createCollider(colDesc, this.proxyBody);
 
     // Default living surface is flesh (not armor plating). Once multi-zone
-    // hitboxes are installed the solid capsule moves to CLIP and stops taking
-    // bullet rays; until then a single chest/flesh proxy remains hittable.
+    // hitboxes are installed the solid capsule moves to CLIP (walk only) and
+    // sensor volumes own MASK_BULLET; until then this chest proxy is hittable.
     host.registry.add({
       handle: this.proxyCollider.handle,
       bodyId: -1,
@@ -263,14 +263,8 @@ export class CapsuleCharacterController implements CharacterController {
   /**
    * Install multi-zone living hitboxes. Each volume is a sensor box on the
    * character's combat layer (PLAYER/ENEMY) so MASK_BULLET resolves zone +
-   * surface correctly.
-   *
-   * The solid movement capsule stays on the combat layer as a full-body
-   * `chest` fallback. Multi-zone sensors are deepened past the capsule
-   * radius so they win the ray TOI on their bands; any seam falls through
-   * to the capsule instead of ghosting the round. Retargeting the capsule
-   * to CLIP without a broadphase flush made post-spawn probes see empty
-   * air, and a forced world.step() here poisoned AI→player damage.
+   * surface correctly; the solid movement capsule is retargeted to CLIP so it
+   * still blocks walking but never absorbs a round as a fake all-chest hit.
    */
   setHitboxes(boxes: readonly CharacterHitboxDesc[]): void {
     this.clearHitboxes();
@@ -282,28 +276,22 @@ export class CapsuleCharacterController implements CharacterController {
     }));
     this.hitboxRefHeight = this.height;
 
-    // Solid proxy remains a hittable combat capsule (chest fallback).
-    this.proxyCollider.setCollisionGroups(groups(this.hitLayer, defaultMask(this.hitLayer)));
+    // Movement capsule → CLIP: collides with walkers, invisible to bullets.
+    this.proxyCollider.setCollisionGroups(groups(LAYER.CLIP, defaultMask(LAYER.CLIP)));
     const proxyRec = this.host.registry.get(this.proxyCollider.handle);
     if (proxyRec) {
-      proxyRec.layer = this.hitLayer;
+      proxyRec.layer = LAYER.CLIP;
       proxyRec.surface = 'flesh';
-      proxyRec.zone = 'chest';
+      proxyRec.zone = 'none';
       proxyRec.entityId = this.entityId;
       proxyRec.object = this.entityObject;
     }
 
-    // Sensors must reach past the capsule silhouette or the solid proxy always
-    // wins the TOI and every band collapses to anonymous chest.
-    const minDepth = this.radius * 1.06;
     const hitMask = defaultMask(this.hitLayer) | LAYER.PROJECTILE;
     for (const b of this.hitboxDescs) {
       const surface: SurfaceType = b.surface
         ?? (b.zone === 'head' ? 'helmet' : 'flesh');
-      const halfX = Math.max(b.half[0], this.radius * 0.35);
-      const halfY = b.half[1];
-      const halfZ = Math.max(b.half[2], minDepth);
-      const desc = RAPIER.ColliderDesc.cuboid(halfX, halfY, halfZ)
+      const desc = RAPIER.ColliderDesc.cuboid(b.half[0], b.half[1], b.half[2])
         .setTranslation(b.offset[0], b.offset[1], b.offset[2])
         .setSensor(true)
         .setFriction(0)
@@ -325,6 +313,7 @@ export class CapsuleCharacterController implements CharacterController {
         debris: false,
       });
     }
+    this.flushKinematicQueries();
   }
 
   private clearHitboxes(): void {
@@ -335,6 +324,32 @@ export class CapsuleCharacterController implements CharacterController {
     this.hitColliders.length = 0;
     this.hitboxDescs.length = 0;
     this.hitboxRefHeight = 0;
+  }
+
+  /**
+   * Publish freshly created kinematic colliders into the query broadphase.
+   *
+   * Rapier only inserts kinematicPositionBased colliders on `world.step()`.
+   * Spawn-time zone probes run before the next fixed step, so without a flush
+   * every living-enemy band reads as empty air. A near-zero dt step with a
+   * throwaway EventQueue inserts the volumes without advancing gameplay time
+   * or leaving the Physics system's event queue half-drained.
+   */
+  private flushKinematicQueries(): void {
+    const w = this.host.world;
+    const prev = w.timestep;
+    // Tiny positive dt — pure 0 has left the solver in a state where AI→player
+    // rays stopped dealing damage for the rest of the session.
+    w.timestep = 1e-4;
+    const eq = new RAPIER.EventQueue(true);
+    try {
+      w.step(eq);
+      eq.drainCollisionEvents(() => {});
+      eq.drainContactForceEvents(() => {});
+    } finally {
+      w.timestep = prev;
+      eq.free();
+    }
   }
 
   /** Re-scale hitbox local transforms when the capsule crouches / stands. */

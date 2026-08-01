@@ -243,9 +243,9 @@ export const PRESETS: Record<QualityPreset, GfxSettings> = {
    * 1080p / live firefight). The shadow atlas is ~70% of draw calls and the
    * single largest CPU cost: high therefore does **not** inherit ultra's 4
    * cascades, 140 m range, contact shadows or depth prepass. It keeps a 40 Hz
-   * atlas cadence so the adaptive ladder's first real step (30 Hz + contact +
-   * prepass off) is still a concession, and leaves cascade cuts for the
-   * governor when a machine still cannot hold the tier.
+   * atlas cadence so the adaptive ladder can still step further (12/10/8 Hz)
+   * without a no-op first rung, and leaves free post cuts for the governor
+   * when a machine still cannot hold the tier.
    *
    * Wave-1 live firefight on the previous high (4×1536 @ 40 Hz, contact on)
    * measured frame-p99 25–29 ms with shadowMs max 15–16 ms alone. That is why
@@ -266,9 +266,9 @@ export const PRESETS: Record<QualityPreset, GfxSettings> = {
     ssrSteps: 20, volumetricSteps: 24, taaSamples: 8,
     ssaoQuality: 0.55, maxParticles: 16000, lensDirt: 0.25, dofQuality: 0.5,
     pcssSoftness: 0.6,
-    // 24 Hz leaves the ladder room to step to 16/12 Hz without a no-op first rung.
+    // 16 Hz: rebuilds fit the 60 fps claim; ladder steps further to 12/10/8 Hz.
     // Motion blur off: a post pass that does not define the gunfight feel.
-    shadowUpdateHz: 24, exposureUpdateHz: 20, motionBlur: false,
+    shadowUpdateHz: 16, exposureUpdateHz: 20, motionBlur: false,
     adaptive: true, targetFrameMs: 16.7,
   }),
 

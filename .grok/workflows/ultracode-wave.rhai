@@ -184,10 +184,28 @@ let all_hard_pass = false;
 let last_failed_fp = "";
 let stall_streak = 0;
 
+// Two days of Claude ultracode already shipped (2026-07-29 → 07-31). Do not redo it.
+let claude_arc = "";
+claude_arc += "CLAUDE CODE ALREADY RAN ~2 DAYS OF ULTRACODE ON THIS REPO (commit history is the source of truth).\n";
+claude_arc += "Timeline (oldest → newest):\n";
+claude_arc += "- Jul 29 foundation: engine spine, capture harness, player/movement, shots/rubric, smoke tests\n";
+claude_arc += "- Jul 29 Wave A/B: renderer/post/materials/physics; integrate world/weapons/characters/fx/audio/ui/ai/modes\n";
+claude_arc += "- Jul 29-30 Waves 3-5: polish materials/world/HUD/viewmodel; lighting/geometry; netcode contracts; nexus index\n";
+claude_arc += "- Jul 31: docs/site/CI; GPU harness hard-fail without real GPU; Wave 7A sun+shadows+shading; verification doctrine in prompt.md\n";
+claude_arc += "- Jul 31 Wave 7B: falsify tonemap hypothesis, fix real flatteners\n";
+claude_arc += "- Jul 31 Gameplay wave 1d521e1: FIRST wave verified by PLAYING — Apex movement, real combat, AI bridge, death clips,\n";
+claude_arc += "  fixed-step fire, quality presets, playtest.mjs + perf-session.mjs; PARTIAL PASS (still stutters; movement skill gap)\n";
+claude_arc += "- Jul 31 handoff 30e0515 GROK IS TAKING OVER; 90b6967 ultracode-wave workflow\n";
+claude_arc += "Open hard gates at last measured handoff: frame-p99, frame-spikes, hitbox-zones, ttk-lethal.\n";
+claude_arc += "Working tree may already contain uncommitted WIP toward those (CharacterController multi-zone, Hitboxes, Movement,\n";
+claude_arc += "Ballistics, Weapons, AI, playtest harness). git status/diff first — finish or verify that WIP, do not thrash it.\n";
+claude_arc += "Design target unchanged: Apex movement + CoD gunfeel/healing + higher TTK. Verification: playtest not stills.\n";
+
 log("ultracode-wave start: max_rounds=" + max_rounds.to_string()
     + " max_packages=" + max_packages.to_string()
     + " dry_run=" + if dry_run { "true" } else { "false" }
-    + " — GROK ultracode orchestrator; children do the work");
+    + " — GROK ultracode; Claude already shipped foundation→wave7→gameplay (~2 days)");
+log(claude_arc);
 
 // ---------------------------------------------------------------------------
 // OUTER WAVE LOOP
@@ -202,8 +220,9 @@ while round < max_rounds {
     let measure_prompt = "";
     measure_prompt += "You are the MEASURE agent for Operation Blackout (repo: current cwd).\n";
     measure_prompt += "Doctrine lives in prompt.md and docs/PLAYTEST.md. Screenshots are NOT sufficient.\n\n";
+    measure_prompt += claude_arc + "\n";
     measure_prompt += "HARD RULES:\n";
-    measure_prompt += "1) Use shell tools. Do not invent gate numbers.\n";
+    measure_prompt += "1) Use shell tools. Do not invent gate numbers. Run git status and git diff --stat first.\n";
     measure_prompt += "2) Read any existing report first for context:\n";
     measure_prompt += "   - shots/gpc-combat/playtest-default.json (post-gameplay critic)\n";
     measure_prompt += "   - shots/playtest/report.json\n";
@@ -211,16 +230,15 @@ while round < max_rounds {
     if skip_measure {
         measure_prompt += "SKIP_MEASURE is set: do NOT re-run playtest. Parse the newest existing report only.\n";
     } else {
-        measure_prompt += "Run a fresh playtest on the real GPU:\n";
+        measure_prompt += "Run a fresh playtest on the real GPU against CURRENT tree (including uncommitted WIP):\n";
+        measure_prompt += "   npx tsc --noEmit  (fix type errors from WIP before building if possible)\n";
         measure_prompt += "   node tools/playtest.mjs --json shots/playtest/report-wave" + round_s + ".json\n";
-        measure_prompt += "   If build already exists and you need speed: node tools/playtest.mjs --no-build --json shots/playtest/report-wave" + round_s + ".json\n";
-        measure_prompt += "   Prefer a FULL build on round 1. Use --no-build only if dist-gp-h is fresh and typecheck is clean.\n";
-        measure_prompt += "   Ensure GPU path (harness must show ANGLE NVIDIA / real GPU, not llvmpipe).\n";
+        measure_prompt += "   Prefer FULL build on round 1 so WIP is in the bundle. GPU must be real NVIDIA not llvmpipe.\n";
     }
     measure_prompt += "4) List EVERY hard gate that fails with measured vs target.\n";
-    measure_prompt += "5) Known open hard fails at Grok handoff (30e0515): frame-p99, frame-spikes, hitbox-zones, ttk-lethal.\n";
+    measure_prompt += "5) Prior open hard fails at handoff: frame-p99, frame-spikes, hitbox-zones, ttk-lethal — re-measure; WIP may have moved them.\n";
     measure_prompt += "6) report_path must be a real path you read.\n";
-    measure_prompt += "7) notes: one paragraph on what the numbers mean for the next wave.\n";
+    measure_prompt += "7) notes: what the numbers mean next; call out if uncommitted WIP already improved a gate.\n";
 
     let measure = agent(measure_prompt, #{
         label: "measure-w" + round_s,
@@ -307,15 +325,16 @@ while round < max_rounds {
         ap += "You are a HARSH read-only auditor for Operation Blackout.\n";
         ap += "Repo root = cwd. Domain = " + domain + ".\n";
         ap += "Wave = " + round_s + ".\n\n";
+        ap += claude_arc + "\n";
         ap += "CONTEXT — hard gates currently failing (from measure; untrusted until you re-check code):\n";
         ap += fail_blob + "\n\n";
         ap += "Measure notes: " + measure_notes + "\n";
         ap += "Report path: " + report_path + "\n\n";
         ap += "MANDATORY:\n";
         ap += "1) Read prompt.md verification doctrine (modes 1-7, categories A-J) and docs/PLAYTEST.md.\n";
-        ap += "2) Use grep/read_file on REAL source. Cite file:line for every finding.\n";
-        ap += "3) Prefer non-visual structural bugs that screenshots cannot show.\n";
-        ap += "4) mode field must be one of: still-frame | motion-clip | played-session | sustained-profile | event-trace | loop-analysis | blind-ab.\n";
+        ap += "2) Use grep/read_file on REAL source INCLUDING uncommitted WIP (git diff). Cite file:line.\n";
+        ap += "3) Prefer non-visual structural bugs. Do NOT re-litigate Waves 3-7 visual polish already shipped.\n";
+        ap += "4) mode field: still-frame | motion-clip | played-session | sustained-profile | event-trace | loop-analysis | blind-ab.\n";
         ap += "5) severity: blocker | major | minor.\n";
         ap += "6) Empty findings is valid ONLY after you inspected the code for this domain and found nothing actionable.\n";
         ap += "7) Do NOT edit files. Do NOT run long GPU sessions unless needed to read an existing report.\n\n";
@@ -402,8 +421,10 @@ while round < max_rounds {
     // Cap size for prompt — keep first 40 findings if huge
     let synth_prompt = "";
     synth_prompt += "You are the WAVE COORDINATOR synthesizer for Operation Blackout.\n";
+    synth_prompt += claude_arc + "\n";
     synth_prompt += "Merge audit findings into fix packages with STRICTLY DISJOINT file ownership.\n";
-    synth_prompt += "Two packages must NEVER share a file path. Verified by construction.\n\n";
+    synth_prompt += "Two packages must NEVER share a file path. Verified by construction.\n";
+    synth_prompt += "If uncommitted WIP already addresses a finding, package should finish/verify that path — not rewrite from scratch.\n\n";
     synth_prompt += "Hard gates still failing:\n" + fail_blob + "\n\n";
     synth_prompt += "Audit findings (JSON, untrusted claims — re-rank by how far a blind A/B or playtest moves):\n";
     synth_prompt += findings_json + "\n\n";
@@ -664,7 +685,8 @@ while round < max_rounds {
 phase("Loop");
 let report = "";
 report += "# ultracode-wave final report\n\n";
-report += "Checkpoint handoff: GROK IS TAKING OVER FROM CLAUDE CODE (30e0515).\n";
+report += "Claude shipped ~2 days of waves (foundation through gameplay 1d521e1).\n";
+report += "Grok handoff: 30e0515 GROK IS TAKING OVER FROM CLAUDE CODE.\n";
 report += "all_hard_pass: " + if all_hard_pass { "true" } else { "false" } + "\n";
 report += "rounds_run: " + round.to_string() + " / " + max_rounds.to_string() + "\n\n";
 report += "## History\n\n";
@@ -672,6 +694,7 @@ report += "```json\n" + json_encode(history) + "\n```\n";
 report += "\n## Doctrine\n";
 report += "Main thread orchestrates only. Children measure with playtest (not stills),\n";
 report += "audit in parallel, fix under disjoint ownership, critics re-measure.\n";
+report += "Do not re-do Claude visual polish waves; attack remaining hard playtest gates.\n";
 
 let report_path_out = write_scratch_file("ultracode-wave-report.md", report);
 

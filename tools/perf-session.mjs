@@ -32,7 +32,7 @@
 import { openSession, ensureServer, stopServer, ROOT } from './harness.mjs';
 // Single source of truth for the in-page probe: `session.exec` ships a function
 // as source text, so these are forwarded by value, not imported into the page.
-import { runLive, ensureScratchTmp, INSTALL_PROBE, INSTALL_INPUT_BRIDGE } from './playtest.mjs';
+import { runLive, ensureScratchTmp, INSTALL_PROBE, INSTALL_INPUT_BRIDGE, classifyDisplay, readHostLoad } from './playtest.mjs';
 import { spawnSync } from 'node:child_process';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -141,15 +141,20 @@ async function main() {
 
   for (const preset of CFG.presets) {
     console.log(`${stamp()} ── preset "${preset}" ${'─'.repeat(60)}`);
-    const url = `${base}/?capture=1&quality=${preset}&mode=${CFG.mode}&seed=${CFG.seed}`;
+    const url = `${base}/?capture=0&quality=${preset}&mode=${CFG.mode}&seed=${CFG.seed}`;
     const session = await openSession({
-      url, width: CFG.width, height: CFG.height, quality: preset, seed: CFG.seed,
+      url, width: CFG.width, height: CFG.height, quality: preset, seed: CFG.seed, capture: 0,
     });
     gpuName = session.renderer;
     try {
       await session.exec(INSTALL_INPUT_BRIDGE);
       const boot = await session.exec(INSTALL_PROBE);
       if (!boot.ok) throw new Error('probe install failed');
+      // Honest wall clocks require capture=0. capture=1 pays ~7 ms/frame sync
+      // readback and freezes FrameBudget — hard-fail if the instrument lied.
+      if (boot.captureSync === true) {
+        throw new Error(`captureSync===true under capture=0 (${preset}) — instrument is measuring itself`);
+      }
 
       // Settle the match: past warm-up, first wave on the field, so every
       // preset profiles the same populated level rather than an empty one.
@@ -164,6 +169,9 @@ async function main() {
       const live = await runLive(session, CFG.ms, CFG.warmupMs, COMBAT_TIMELINE);
       const f = live.frame;
       const budget = budgets[preset] ?? 16.7;
+      if (f.captureSync === true) {
+        throw new Error(`live captureSync===true (${preset}) — capture=0 contract broken`);
+      }
       const row = {
         preset, budgetMs: budget,
         width: CFG.width, height: CFG.height,
@@ -178,7 +186,8 @@ async function main() {
         worst1pctMeanMs: f.worst1pctMeanMs,
         worst1pct: f.worst1pct,
         enemiesAtStart: pre.live,
-        pass: f.p99 <= budget && f.over50 === 0,
+        captureSync: f.captureSync === false ? false : f.captureSync,
+        pass: f.p99 <= budget && f.over50 === 0 && f.captureSync === false,
       };
       results.push(row);
 
@@ -223,12 +232,25 @@ async function main() {
 
   /* ------------------------------------------------------------- summary -- */
 
+  const host = readHostLoad();
+  const display = classifyDisplay(gpuName, host);
   const report = {
-    tool: 'perf-session', version: '1.0.0',
+    tool: 'perf-session', version: '1.1.0',
     meta: {
       gpu: gpuName, width: CFG.width, height: CFG.height, seed: CFG.seed, mode: CFG.mode,
       sessionMs: CFG.ms, warmupMs: CFG.warmupMs, dist: CFG.dist,
       startedAt: new Date().toISOString(), budgets,
+      // Category J honesty
+      capture: 0,
+      captureSync: results.every((r) => r.captureSync === false) ? false
+        : results.some((r) => r.captureSync === true) ? true : null,
+      gpuPath: display.gpuPath,
+      displayPath: display.displayPath,
+      presentationPath: display.presentationPath,
+      softwareGL: display.softwareGL,
+      loadavg1: display.loadavg1,
+      cpus: display.cpus,
+      contamination: display.contamination.slice(),
     },
     presets: results,
   };
@@ -253,7 +275,16 @@ async function main() {
   console.log('-'.repeat(112));
 
   const fails = [];
+  if (display.softwareGL) {
+    fails.push(`gpuPath=software (${gpuName}) — software GL cannot pass frame gates`);
+  }
+  if (report.meta.captureSync === true) {
+    fails.push('captureSync===true — wall-clock sample paid capture-mode GPU sync flush');
+  }
   for (const r of results) {
+    if (r.captureSync === true) {
+      fails.push(`${r.preset}: captureSync===true (must be false under capture=0)`);
+    }
     if (r.p99 > r.budgetMs) {
       fails.push(`${r.preset}: p99 ${r.p99.toFixed(2)} ms exceeds the ${r.budgetMs} ms budget `
         + `(${(r.budgetMs / r.p99 * 100).toFixed(0)}% of target — the game runs at ${r.meanFps.toFixed(0)} fps here)`);
@@ -262,6 +293,9 @@ async function main() {
       fails.push(`${r.preset}: ${r.over50} frame(s) over 50 ms after warm-up (worst ${r.worstMs.toFixed(1)} ms)`);
     }
   }
+  console.log(`meta  gpuPath=${display.gpuPath} presentationPath=${display.presentationPath} `
+    + `capture=0 captureSync=${report.meta.captureSync} contamination=[${display.contamination.join(',')}] `
+    + `loadavg1=${display.loadavg1}`);
   for (const f of fails) console.log(`FAIL  ${f}`);
   if (!fails.length) console.log('PASS  every preset held its budget.');
 

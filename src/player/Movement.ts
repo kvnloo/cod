@@ -61,6 +61,7 @@ import * as THREE from 'three';
 import { bus } from '../core/EventBus';
 import { readSurface, type SurfaceType } from '../core/Surfaces';
 import { MASK_MOVE, type CharacterController, type PhysicsAPI, type RayHit } from '../physics/types';
+import { livingHitboxLayout } from '../characters/Hitboxes';
 import type { CharacterMoveResultEx } from '../physics/CharacterController';
 import { BTN, type MoveCommand } from './MoveCommand';
 import { copyMovementState, createMovementState, type MovementState } from './MovementState';
@@ -401,10 +402,11 @@ export class Movement {
     // Player.entityId is 1. Without this the registry keeps entityId=-1 zone=chest
     // and ignoreEntity/ownerEntity=1 cannot filter the capsule — camera-origin
     // rays (zoneScan, early ballistics) report anonymous chest on the local body.
-    // Do NOT install multi-zone solid hitboxes on the local walker: solid cuboids
-    // parented to the kinematic proxy interfere with the character controller
-    // (and with pure-movement lab races). Tagging is enough for exclude=1.
+    // Multi-zone *sensor* hitboxes (MASK_BULLET) so AI rounds resolve head/chest/
+    // limb the same way player rounds do. The solid capsule moves to CLIP and
+    // no longer absorbs bullets as a fake all-chest hit.
     this.controller.setEntity?.(entityId);
+    this.controller.setHitboxes?.(livingHitboxLayout(TUNING.standHeight, 0.34));
   }
 
   teleport(p: THREE.Vector3, yaw: number): void {

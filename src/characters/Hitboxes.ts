@@ -115,6 +115,35 @@ export function hitboxDebug(rig: RigInstance, boxes: readonly HitBox[]): THREE.G
 const _scale = new THREE.Vector3();
 const _off = new THREE.Vector3();
 
+/** Per-zone surface tags for living combat hitboxes. */
+export interface LivingHitboxOpts {
+  /**
+   * Head surface is metal helmet when true. Default false — bare heads are
+   * flesh so impact FX / audio do not spark on every skull.
+   */
+  helmet?: boolean;
+  /**
+   * Zones protected by plating (armor multi < 1). Chest/stomach get surface
+   * `armor` (metal family); a plated head uses `helmet`.
+   */
+  armoredZones?: ReadonlyArray<HitZone>;
+}
+
+/**
+ * Surface for one living zone given presentation / armour opts.
+ * Bare flesh is the default; only explicitly armoured zones leave it.
+ */
+export function surfaceForLivingZone(zone: HitZone, opts?: LivingHitboxOpts): SurfaceType {
+  const armored = opts?.armoredZones?.includes(zone) ?? false;
+  if (zone === 'head' || zone === 'neck') {
+    if (opts?.helmet || armored) return 'helmet';
+    return 'flesh';
+  }
+  if (armored && (zone === 'chest' || zone === 'stomach' || zone === 'arm' || zone === 'leg')) {
+    return 'armor';
+  }
+  return 'flesh';
+}
 
 /**
  * Capsule-local multi-zone volumes for a living soldier.
@@ -124,17 +153,29 @@ const _off = new THREE.Vector3();
  * chest / limb height resolves a real zone without waiting on a posed rig.
  * Offsets are from the capsule centre (y-up, facing +Z). Height scales the
  * whole set so crouch re-layout is a free multiply.
+ *
+ * Lateral layout mirrors `HITBOX_RIG` in `game/Combat.ts`: torso occupies the
+ * inner ~0.55 R, arms the outer ring past the torso edge. A centre-mass ray at
+ * arm height still hits chest (correct); a lateral aim into the outer band
+ * resolves arm — the previous layout let chest cuboids swallow that ring.
  */
-export function livingHitboxLayout(height: number, radius: number): CharacterHitboxDesc[] {
+export function livingHitboxLayout(
+  height: number,
+  radius: number,
+  opts?: LivingHitboxOpts,
+): CharacterHitboxDesc[] {
   const h = Math.max(0.9, height);
   const r = Math.max(0.2, radius);
   // Reference is a 1.80 m soldier; scale linear dimensions with height.
   const s = h / 1.80;
-  // Prior solid capsule was diameter ~2r (0.72 m). Keep torso nearly that wide so
-  // bloomed rounds still land; leave a thin outer ring for arm grazes.
-  const torsoW = Math.min(r * 0.88, 0.32 * s);
-  const torsoD = Math.min(r * 0.80, 0.28 * s);
-  const limbR = Math.min(r * 0.42, 0.11 * s);
+  // Match geometric rig: chest x1 ≈ 0.55–0.62 R so the outer capsule ring is
+  // available for arm grazes (prior 0.88 R torso left almost no exclusive arm).
+  const torsoW = Math.min(r * 0.55, 0.20 * s);
+  const torsoD = Math.min(r * 0.72, 0.25 * s);
+  const limbR = Math.min(r * 0.40, 0.125 * s);
+  // Arm centres sit just outside the torso edge so side rays resolve arm, not
+  // a chest volume that overlapped the limb.
+  const armOx = torsoW + limbR * 0.95;
 
   const box = (
     zone: HitZone,
@@ -145,7 +186,7 @@ export function livingHitboxLayout(height: number, radius: number): CharacterHit
     zone,
     half,
     offset,
-    surface: surface ?? (zone === 'head' ? 'helmet' : 'flesh'),
+    surface: surface ?? surfaceForLivingZone(zone, opts),
   });
 
   /**
@@ -169,20 +210,44 @@ export function livingHitboxLayout(height: number, radius: number): CharacterHit
   };
 
   return [
-    // Playtest head band sits at 0.94 h; cover chin → crown.
-    band('head', 0.870, 1.015, 0.11 * s, 0.11 * s, 0, 'helmet'),
+    // Playtest head band sits at 0.94 h; cover chin → crown. Flesh unless helmet.
+    band('head', 0.870, 1.015, 0.11 * s, 0.11 * s, 0),
     band('neck', 0.810, 0.885, 0.07 * s, 0.07 * s),
     // Chest covers playtest 0.72; overlaps neck above and stomach below.
     band('chest', 0.555, 0.825, torsoW, torsoD),
     // Stomach covers playtest 0.52; overlaps legs.
     band('stomach', 0.395, 0.575, torsoW * 0.95, torsoD * 0.92),
-    // Arms: outer capsule ring at torso height (side grazes, not centre-mass).
-    band('arm', 0.480, 0.820, limbR, limbR, r * 0.92),
-    band('arm', 0.480, 0.820, limbR, limbR, -r * 0.92),
+    // Arms: exclusive outer ring at torso height (side grazes / aimed arm band).
+    band('arm', 0.480, 0.820, limbR, limbR, armOx),
+    band('arm', 0.480, 0.820, limbR, limbR, -armOx),
     // Legs cover playtest 0.22 and reach into the lower stomach band.
-    band('leg', 0.000, 0.430, limbR * 1.25, limbR * 1.15, r * 0.24),
-    band('leg', 0.000, 0.430, limbR * 1.25, limbR * 1.15, -r * 0.24),
+    band('leg', 0.000, 0.430, limbR * 1.25, limbR * 1.15, r * 0.22),
+    band('leg', 0.000, 0.430, limbR * 1.25, limbR * 1.15, -r * 0.22),
   ];
+}
+
+/**
+ * Build living hitboxes from a per-zone armour table (multi < 1 → plated).
+ * Helmet surface when head/neck multi is reduced or `helmet` is forced.
+ */
+export function livingHitboxLayoutFromArmor(
+  height: number,
+  radius: number,
+  armor: Partial<Record<HitZone, number>> | null | undefined,
+  helmet = false,
+): CharacterHitboxDesc[] {
+  const armoredZones: HitZone[] = [];
+  if (armor) {
+    for (const z of ['head', 'neck', 'chest', 'stomach', 'arm', 'leg'] as HitZone[]) {
+      const m = armor[z];
+      if (typeof m === 'number' && m < 1 - 1e-6) armoredZones.push(z);
+    }
+  }
+  const headPlated = armoredZones.includes('head') || armoredZones.includes('neck');
+  return livingHitboxLayout(height, radius, {
+    helmet: helmet || headPlated,
+    armoredZones,
+  });
 }
 
 /** Convert authored per-bone hitboxes into capsule-local descs using live bones. */
@@ -191,6 +256,7 @@ export function hitboxesToProxyDesc(
   boxes: readonly HitBox[],
   capsuleCentre: THREE.Vector3,
   bodyYaw = 0,
+  opts?: LivingHitboxOpts,
 ): CharacterHitboxDesc[] {
   const out: CharacterHitboxDesc[] = [];
   const invYaw = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -bodyYaw);
@@ -201,7 +267,7 @@ export function hitboxesToProxyDesc(
       zone: box.zone,
       half: [box.half[0], box.half[1], box.half[2]],
       offset: [_pos.x, _pos.y, _pos.z],
-      surface: box.zone === 'head' ? 'helmet' : 'flesh',
+      surface: surfaceForLivingZone(box.zone, opts),
     });
   }
   return out;

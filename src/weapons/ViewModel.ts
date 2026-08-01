@@ -272,6 +272,21 @@ export class ViewModel {
 
   cancelAction(): void { this.action.kind = 'none'; }
 
+  /**
+   * Advances gameplay action clocks (reload / draw / holster / inspect / melee)
+   * on the fixed 120 Hz step only. Display `update()` must never call this.
+   */
+  advanceAction(dt: number): void {
+    if (this.action.kind === 'none') return;
+    this.action.t += dt;
+    if (this.action.t >= this.action.duration && this.action.kind !== 'reloadShell') {
+      this.action.kind = 'none';
+    }
+  }
+
+  /** True once the reload addAmmo beat has fired (cancel window opens at 0 ms). */
+  get ammoCommitted(): boolean { return this.action.committed; }
+
   startReload(empty: boolean, duration: number): void {
     this.startAction('reload', duration, empty);
   }
@@ -442,15 +457,14 @@ export class ViewModel {
     this.kickRot.step(ZERO, dt);
     this.impulsePos.step(ZERO, dt);
 
-    /* --- action layer --------------------------------------------------- */
+    /* --- action layer (pose only — clock advances in fixedUpdate) -------- */
     this._add.set(0, 0, 0);
     this._addRot.set(0, 0, 0);
     if (this.action.kind !== 'none') {
-      this.action.t += dt;
+      // action.t is owned by fixedUpdate via advanceAction(); here we only
+      // re-evaluate the pose for the current sim time so display framerate
+      // cannot stretch reload/draw/melee clocks.
       this.evaluateAction(this.action.t / this.action.duration, s);
-      if (this.action.t >= this.action.duration && this.action.kind !== 'reloadShell') {
-        this.action.kind = 'none';
-      }
     }
     this.applyParts(dt, s);
 

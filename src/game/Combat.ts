@@ -407,6 +407,44 @@ export function resolveHit(
   return out;
 }
 
+/** True when this zone carries plating (multi < 1) on the given armour table. */
+export function zoneArmored(armor: ZoneTable | null | undefined, zone: HitZone): boolean {
+  if (!armor) return false;
+  const z: HitZone = zone === 'none' ? 'chest' : zone;
+  return armor[z] < 1 - 1e-6;
+}
+
+/**
+ * Price an AI (or any non-catalogue) round through the *same* zone multiplier
+ * table the player path uses. Base damage and range falloff stay with the
+ * caller's weapon spec; zone multi comes from `ZONE_MULTIPLIERS`.
+ */
+export function priceAiHit(
+  weaponClass: WeaponClass,
+  baseDamage: number,
+  metres: number,
+  zone: HitZone,
+  rangeIdeal: number,
+  rangeMax: number,
+  damageScale = 1,
+  armor: ZoneTable | null = null,
+): { damage: number; zone: HitZone; headshot: boolean; zoneMultiplier: number; armorMultiplier: number } {
+  const z: HitZone = zone === 'none' ? 'chest' : zone;
+  const zm = ZONE_MULTIPLIERS[weaponClass][z];
+  const am = armor ? armor[z] : 1;
+  const falloff = metres <= rangeIdeal
+    ? 1
+    : 1 - 0.6 * Math.min(1, Math.max(0, (metres - rangeIdeal) / Math.max(1, rangeMax - rangeIdeal)));
+  return {
+    damage: baseDamage * zm * am * falloff * damageScale,
+    zone: z,
+    headshot: z === 'head' || z === 'neck',
+    zoneMultiplier: zm,
+    armorMultiplier: am,
+  };
+}
+
+
 /* ==========================================================================
  * 3. TIME TO KILL
  * ======================================================================= */

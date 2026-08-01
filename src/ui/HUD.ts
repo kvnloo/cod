@@ -105,6 +105,9 @@ export class HUDSystem implements System {
   private wasScoreboardHeld = false;
   /** Non-null forces the scoreboard state, overriding the Tab hold. */
   private scoreboardForce: boolean | null = null;
+  /** First-match click-to-look until pointer lock. */
+  private controlsLookHint = false;
+  private controlsShownThisSession = false;
 
   /* ------------------------------------------------------------- init -- */
 
@@ -262,6 +265,15 @@ export class HUDSystem implements System {
 
     const menuOpen = this.menus.isOpen;
     this.model.menuOpen = menuOpen;
+
+    if (this.controlsLookHint) {
+      if (input.locked || menuOpen) {
+        this.controlsLookHint = false;
+        this.banners.setLookHint(false);
+      } else {
+        this.banners.setLookHint(true);
+      }
+    }
 
     // `CaptureAPI.setHUD(false)` hides #ui-root; the blend plate lives outside
     // it, so mirror the state explicitly.
@@ -429,21 +441,27 @@ export class HUDSystem implements System {
    * Once per browser profile via localStorage.
    */
   private showFirstMatchControls(): void {
+    if (this.controlsShownThisSession) return;
     const key = 'ob-seen-controls-v1';
     try {
-      if (localStorage.getItem(key) === '1') return;
+      if (localStorage.getItem(key) === '1') {
+        // Still prompt click-to-look every cold boot until lock once.
+        this.controlsLookHint = true;
+        this.banners.setLookHint(true);
+        return;
+      }
       localStorage.setItem(key, '1');
     } catch { /* private mode — still show once this session */ }
-    // Stagger slightly so it does not collide with the mode open banner.
-    window.setTimeout(() => {
-      // 5.5 s sits in the 3–8 s first-match card window (category G).
-      this.banners.banner(
-        'CONTROLS',
-        'WASD MOVE · MOUSE LOOK · LMB FIRE · RMB ADS · SPACE JUMP · C CROUCH · SHIFT SPRINT · R RELOAD',
-        'objective',
-        5.5,
-      );
-    }, 900);
+    this.controlsShownThisSession = true;
+    // Immediate strip (not queued behind the ~3.6 s mode banner). Acceptance:
+    // control strip not blocked >1 s by mode banner.
+    this.banners.showControlStrip('CONTROLS', [
+      'WASD MOVE  ·  MOUSE LOOK  ·  LMB FIRE  ·  RMB ADS',
+      'SPACE JUMP  ·  C / CTRL CROUCH  ·  SHIFT SPRINT  ·  R RELOAD',
+      'V MELEE  ·  G GRENADE  ·  1/2 WEAPON  ·  TAB SCORE  ·  ESC PAUSE',
+    ], 6.5);
+    this.controlsLookHint = true;
+    this.banners.setLookHint(true);
   }
 
   /** Full-width objective banner. */

@@ -32,7 +32,8 @@
 import { openSession, ensureServer, stopServer, ROOT, sleep, percentile } from './harness.mjs';
 import { spawnSync } from 'node:child_process';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { mkdirSync, statfsSync } from 'node:fs';
+import { mkdirSync, statfsSync, readFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 /**
@@ -94,18 +95,54 @@ const CFG = {
 };
 
 
-/** Classify UNMASKED_RENDERER_WEBGL into a display path + contamination reasons. */
-function classifyDisplay(renderer) {
+/**
+ * Classify UNMASKED_RENDERER_WEBGL into:
+ *   gpuPath          — GL class: hardware vs software rasteriser
+ *   presentationPath — how frames reach the eye (headless rAF has no vblank)
+ * Plus host contamination (loadavg / busy peers).
+ *
+ * `displayPath` is kept as an alias of gpuPath for older report readers, but
+ * it is NOT a presentation/vblank path — that is presentationPath.
+ */
+function classifyDisplay(renderer, hostHints = {}) {
   const r = String(renderer || '');
   const software = /llvmpipe|SwiftShader|Softpipe|Software|Microsoft Basic Render/i.test(r)
     || !/^ANGLE \((NVIDIA|AMD|Intel)/i.test(r);
   const reasons = [];
   if (software) reasons.push('software-gl');
+  // Headless Chromium has no compositor vblank; wall frame times are free-running rAF.
+  const presentationPath = hostHints.headless !== false ? 'headless-raf-no-vblank' : 'compositor-vblank';
+  if (presentationPath === 'headless-raf-no-vblank') reasons.push('no-vblank');
+  const loadavg1 = hostHints.loadavg1;
+  const cpus = hostHints.cpus || 1;
+  if (Number.isFinite(loadavg1) && loadavg1 > Math.max(2, cpus * 0.35)) {
+    reasons.push('busy-host');
+  }
+  if (Array.isArray(hostHints.extraContamination)) {
+    for (const x of hostHints.extraContamination) if (x && !reasons.includes(x)) reasons.push(x);
+  }
   return {
+    gpuPath: software ? 'software' : 'hardware',
+    // Legacy alias — GL class only, never presentation.
     displayPath: software ? 'software' : 'hardware',
+    presentationPath,
     softwareGL: software,
     contamination: reasons,
+    loadavg1: Number.isFinite(loadavg1) ? loadavg1 : null,
+    cpus,
   };
+}
+
+/** Read /proc/loadavg + nproc for busy-host contamination. */
+function readHostLoad() {
+  let loadavg1 = null;
+  let cpus = 1;
+  try {
+    cpus = os.cpus()?.length || 1;
+    const la = readFileSync('/proc/loadavg', 'utf8').trim().split(/\s+/);
+    loadavg1 = parseFloat(la[0]);
+  } catch { /* non-linux */ }
+  return { loadavg1, cpus, headless: true };
 }
 
 /* --------------------------------------------------------------- gate spec -- */
@@ -153,7 +190,8 @@ const GATES = [
     target: `<= ${CFG.p99Budget} on hardware GL`,
     read: (r) => r.frame.p99,
     ok: (v, r) => {
-      if (r && r.meta && r.meta.displayPath === 'software') return false;
+      const path = r && r.meta && (r.meta.gpuPath || r.meta.displayPath);
+      if (path === 'software') return false;
       return Number.isFinite(v) && v <= CFG.p99Budget;
     },
     why: '16.7 ms is the 60 fps budget. p99 rather than mean, because the framerate '
@@ -166,7 +204,8 @@ const GATES = [
     target: '== 0 on hardware GL',
     read: (r) => r.frame.over50,
     ok: (v, r) => {
-      if (r && r.meta && r.meta.displayPath === 'software') return false;
+      const path = r && r.meta && (r.meta.gpuPath || r.meta.displayPath);
+      if (path === 'software') return false;
       return v === 0;
     },
     why: 'A 50 ms frame is a visible hitch. After warm-up there is no excuse for one. '
@@ -174,12 +213,13 @@ const GATES = [
   },
   {
     id: 'display-path-hardware', hard: true,
-    what: 'wall-clock / visual gates require a hardware GL display path',
-    target: "displayPath === 'hardware'",
-    read: (r) => r.meta.displayPath,
+    what: 'wall-clock / visual gates require a hardware GL gpuPath',
+    target: "gpuPath === 'hardware'",
+    read: (r) => r.meta.gpuPath || r.meta.displayPath,
     ok: (v) => v === 'hardware',
     why: 'A software rasteriser (llvmpipe/SwiftShader) is not evidence about shipping '
-      + 'frame times or visuals. meta.contamination lists why.',
+      + 'frame times or visuals. meta.contamination lists why. presentationPath is '
+      + 'separate (headless rAF has no vblank) and does not pass this gate.',
   },
   {
     id: 'frame-capture-sync', hard: true,
@@ -1515,15 +1555,22 @@ async function main() {
   });
   log(`${stamp()} GPU ${session.renderer}`);
 
-  const display = classifyDisplay(session.renderer);
+  const host = readHostLoad();
+  const display = classifyDisplay(session.renderer, host);
   const report = {
     tool: 'playtest', version: '1.0.0',
     meta: {
       gpu: session.renderer, quality: CFG.quality, width: CFG.width, height: CFG.height,
       seed: CFG.seed, mode: CFG.mode, dist: CFG.dist, port: CFG.port,
       startedAt: new Date().toISOString(), errors: [],
-      displayPath: display.displayPath,
+      // Honesty fields (category J)
+      capture: 0,
+      gpuPath: display.gpuPath,
+      displayPath: display.displayPath, // legacy alias of gpuPath (GL class)
+      presentationPath: display.presentationPath,
       softwareGL: display.softwareGL,
+      loadavg1: display.loadavg1,
+      cpus: display.cpus,
       contamination: display.contamination.slice(),
     },
     frame: {}, enemies: {}, combat: {}, deaths: {}, movement: {}, recoil: {},
@@ -1531,6 +1578,10 @@ async function main() {
   if (display.softwareGL) {
     log(`${stamp()} WARNING: software GL — frame/visual gates will hard-fail (${session.renderer})`);
   }
+  if (display.contamination.length) {
+    log(`${stamp()} contamination: ${display.contamination.join(', ')}  loadavg1=${display.loadavg1} cpus=${display.cpus}`);
+  }
+  log(`${stamp()} gpuPath=${display.gpuPath} presentationPath=${display.presentationPath}`);
 
   try {
     await session.exec(INSTALL_INPUT_BRIDGE);
@@ -1753,7 +1804,7 @@ function wrap(s, n) {
   return out;
 }
 
-export { INSTALL_PROBE, INSTALL_INPUT_BRIDGE, runLive, stats, classify, avg, GATES };
+export { INSTALL_PROBE, INSTALL_INPUT_BRIDGE, runLive, stats, classify, avg, GATES, classifyDisplay, readHostLoad };
 
 if (process.argv[1] && process.argv[1].endsWith('playtest.mjs')) {
   main().catch(async (e) => {

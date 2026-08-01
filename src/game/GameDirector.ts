@@ -50,11 +50,16 @@ function paramActors(): string {
 }
 
 /** True when the archetype table puts plates or a suit over at least one zone. */
-function profileHasArmor(archetype: string): boolean {
+/**
+ * Armour hitmarker is zone-local: only light when the *resolved* zone has a
+ * multi below 1 (plate on chest, suit on limbs, visor on head). An armoured
+ * archetype hit in bare flesh must not flash the metal marker.
+ */
+function zoneHasArmor(archetype: string, zone: import('./types').HitZone | undefined): boolean {
   const p = ARCHETYPES[archetype as Archetype];
   if (!p) return false;
-  const a = p.armor;
-  return a.chest < 1 || a.stomach < 1 || a.head < 1 || a.neck < 1 || a.arm < 1 || a.leg < 1;
+  const z = zone && zone !== 'none' ? zone : 'chest';
+  return p.armor[z] < 1 - 1e-6;
 }
 
 function paramSeed(): number {
@@ -197,9 +202,9 @@ export class GameDirector implements System, DirectorAPI {
         source: fromPlayer ? 'player' : 'ai',
         zone: resolvedZone,
       });
-      // Any profile with a sub-1 zone multi (plate carrier, breacher kit,
-      // juggernaut suit) must light the armour hitmarker — not only the suit.
-      return { killed, applied: amount, armor: profileHasArmor(view.archetype) };
+      // Per resolved zone: plate torso / visor / suit limb, not archetype-wide.
+      const markZone = resolvedZone ?? (headshot ? 'head' as const : 'chest' as const);
+      return { killed, applied: amount, armor: zoneHasArmor(view.archetype, markZone) };
     });
   }
 

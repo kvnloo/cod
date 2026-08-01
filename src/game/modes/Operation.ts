@@ -24,7 +24,7 @@ import type { KillContext } from '../Scoring';
 
 const TOTAL_WAVES = 12;
 const WARMUP = 8;
-const INTERMISSION = 8;
+const INTERMISSION = 6;
 const LIVES = 3;
 
 type Stage = 'warmup' | 'wave' | 'cleared' | 'intermission' | 'extract' | 'over';
@@ -156,7 +156,7 @@ export class OperationMode extends GameMode {
 
     if (remaining <= 0 && objectiveDone) {
       this.stage = 'cleared';
-      this.stageTimer = 2.6;
+      this.stageTimer = 0.9;
       director.enabled = false;
       const bonus = 250 + this.wave * 120;
       host.scoring.addScore(bonus, `Wave ${this.wave} Cleared`);
@@ -170,6 +170,8 @@ export class OperationMode extends GameMode {
 
   private stepCleared(dt: number, host: MatchHost): void {
     this.stageTimer -= dt;
+    // Skip the post-clear beat once it has registered (~0.4 s).
+    if (this.stageTimer < 0.5 && input.held('jump')) this.stageTimer = 0;
     if (this.stageTimer > 0) return;
     if (this.wave >= TOTAL_WAVES) { this.beginExtract(host); return; }
     this.beginIntermission(host);
@@ -189,8 +191,9 @@ export class OperationMode extends GameMode {
 
   private stepIntermission(dt: number, host: MatchHost): void {
     this.stageTimer -= dt;
-    // Space (jump) after 1.2 s skips the buy stretch — CoD-like tempo (cat F).
-    if (this.stageTimer < INTERMISSION - 1.2 && input.held('jump')) {
+    // Space (jump) after 0.5 s skips the buy stretch — longest *forced* non-combat
+    // is cleared(0.9)+0.5 ≈ 1.4 s; full intermission is 6 s and skippable (cat F).
+    if (this.stageTimer < INTERMISSION - 0.5 && input.held('jump')) {
       this.stageTimer = 0;
     }
     host.countdown(Math.max(0, this.stageTimer), `WAVE ${this.wave + 1}`);
@@ -231,8 +234,8 @@ export class OperationMode extends GameMode {
         id: 'ammo', name: 'Ammo Resupply', detail: 'Refill reserve ammunition', cost: 250,
         kind: 'ammo', affordable: false,
         apply: (h) => {
-          h.emit('notify', { text: 'AMMUNITION RESUPPLIED', kind: 'reward' });
-          h.emit('weapon:reload:end', { weaponId: 'resupply' });
+          h.emit('weapon:resupply', undefined);
+          h.banner('AMMO RESTOCKED', 'Magazines and reserves refilled', 'reward', 1.8);
         },
       },
       {
@@ -258,12 +261,18 @@ export class OperationMode extends GameMode {
       {
         id: 'atc_reflex', name: 'Reflex Sight', detail: 'Faster target acquisition', cost: 800,
         kind: 'attachment', affordable: false,
-        apply: (h) => h.emit('notify', { text: 'REFLEX SIGHT FITTED', kind: 'reward' }),
+        apply: (h) => {
+          h.emit('weapon:attach', { attachmentId: 'optic_reddot' });
+          h.banner('REFLEX SIGHT FITTED', 'Optic mounted — ADS handling updated', 'reward', 1.8);
+        },
       },
       {
         id: 'atc_extmag', name: 'Extended Magazine', detail: '+50% magazine capacity', cost: 950,
         kind: 'attachment', affordable: false,
-        apply: (h) => h.emit('notify', { text: 'EXTENDED MAGAZINE FITTED', kind: 'reward' }),
+        apply: (h) => {
+          h.emit('weapon:attach', { attachmentId: 'mag_extended' });
+          h.banner('EXTENDED MAGAZINE FITTED', 'Capacity +50%', 'reward', 1.8);
+        },
       },
     ];
 

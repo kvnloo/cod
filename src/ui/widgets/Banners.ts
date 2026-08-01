@@ -50,6 +50,10 @@ export class Banners implements Widget {
   private current: Banner | null = null;
   private flourishes: Flourish[] = [];
   private toasts: Toast[] = [];
+  /** Independent of the mode-banner queue so NPE is not blocked >1 s. */
+  private controlStrip: { age: number; life: number; title: string; lines: string[] } | null = null;
+  /** Shown until pointer lock engages. */
+  private lookHint = false;
   private readonly off: Array<() => void> = [];
 
   constructor(private pal: () => Palette) {
@@ -101,11 +105,25 @@ export class Banners implements Widget {
     if (this.flourishes.length > 3) this.flourishes.shift();
   }
 
+  /**
+   * First-match control strip — does NOT enter the centre banner queue, so a
+   * 3.6 s mode open banner cannot bury it past the first second of play.
+   */
+  showControlStrip(title: string, lines: string[], life = 6.5): void {
+    this.controlStrip = { age: 0, life: motionTime(life), title, lines };
+  }
+
+  setLookHint(on: boolean): void {
+    this.lookHint = on;
+  }
+
   clear(): void {
     this.queue.length = 0;
     this.current = null;
     this.flourishes.length = 0;
     this.toasts.length = 0;
+    this.controlStrip = null;
+    this.lookHint = false;
   }
 
   update(dt: number, _m: HudModel): void {
@@ -113,6 +131,10 @@ export class Banners implements Widget {
     if (this.current) {
       this.current.age += dt;
       if (this.current.age >= this.current.life) this.current = null;
+    }
+    if (this.controlStrip) {
+      this.controlStrip.age += dt;
+      if (this.controlStrip.age >= this.controlStrip.life) this.controlStrip = null;
     }
     for (let i = this.flourishes.length - 1; i >= 0; i--) {
       const f = this.flourishes[i];
@@ -128,6 +150,8 @@ export class Banners implements Widget {
 
   draw(d: DrawCtx, m: HudModel): void {
     this.drawBanner(d);
+    this.drawControlStrip(d);
+    this.drawLookHint(d);
     this.drawFlourishes(d, m);
     this.drawToasts(d);
   }
@@ -304,6 +328,66 @@ export class Banners implements Widget {
         color: rgba(tint, 0.95), shadow: Math.max(1, 1.2 * s),
       });
     }
+    c.restore();
+  }
+
+
+  /* ---------------------------------------------------- control strip --- */
+
+  private drawControlStrip(d: DrawCtx): void {
+    const strip = this.controlStrip;
+    if (!strip) return;
+    const p = this.pal();
+    const c = d.c;
+    const s = d.s;
+    const tNorm = strip.age / strip.life;
+    const inT = clamp01(strip.age / motionTime(0.28));
+    const outT = clamp01((strip.age - (strip.life - motionTime(0.45))) / motionTime(0.45));
+    const a = Ease.outQuart(inT) * (1 - Ease.inCubic(outT)) * d.alpha;
+    if (a <= 0.005) return;
+
+    // Lower-third card — never competes with the centre mode banner.
+    const cx = d.w / 2;
+    const cy = d.h * 0.78;
+    const lineH = 16 * s;
+    const boxH = (28 + strip.lines.length * 16) * s;
+    const boxW = Math.min(d.w * 0.72, 720 * s);
+
+    c.save();
+    c.globalAlpha = a;
+    if (!d.cheap) wash(c, cx, cy, boxW * 0.55, boxH * 0.9, 0.55);
+    text(c, strip.title, cx, cy - boxH * 0.35, {
+      size: 13 * s, weight: 700, family: 'cond', tracking: 4 * s, align: 'center',
+      color: rgba(lift(p.accent, 0.15), 0.95), shadow: Math.max(1, 1.2 * s),
+    });
+    for (let i = 0; i < strip.lines.length; i++) {
+      text(c, strip.lines[i], cx, cy - boxH * 0.05 + i * lineH, {
+        size: 12 * s, weight: 600, family: 'cond', tracking: 2.4 * s, align: 'center',
+        color: rgba(p.ink, 0.92), shadow: Math.max(1, 1.1 * s),
+      });
+    }
+    c.restore();
+    void tNorm;
+  }
+
+  private drawLookHint(d: DrawCtx): void {
+    if (!this.lookHint) return;
+    const p = this.pal();
+    const c = d.c;
+    const s = d.s;
+    const pulse = 0.55 + 0.45 * Math.sin(d.t * 4.2);
+    const a = pulse * d.alpha;
+    if (a <= 0.01) return;
+    const cx = d.w / 2;
+    const cy = d.h * 0.58;
+    c.save();
+    c.globalAlpha = a;
+    if (!d.cheap) wash(c, cx, cy, 160 * s, 28 * s, 0.5);
+    text(c, 'CLICK TO LOOK', cx, cy, {
+      size: 15 * s, weight: 700, family: 'cond', tracking: 5 * s, align: 'center',
+      color: rgba(lift(p.ink, 0.25), 1), shadow: Math.max(1.2, 1.6 * s),
+      glow: 10 * s, glowColor: rgba(p.accent, 0.35),
+    });
     c.restore();
   }
 

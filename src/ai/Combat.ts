@@ -27,6 +27,9 @@ import type { PhysicsAPI, RayHit, HitZone } from '../physics/types';
 import { MASK_BULLET } from '../physics/types';
 import { makeHit, clamp01, damp, raySegmentDistSq, rotateY } from './Util';
 import type { AIWeaponSpec, DifficultyProfile, TargetLike } from './types';
+import { priceAiHit } from '../game/Combat';
+import type { WeaponClass } from '../weapons/types';
+import type { SurfaceType } from '../core/Surfaces';
 
 const _v0 = new THREE.Vector3();
 const _v1 = new THREE.Vector3();
@@ -71,6 +74,16 @@ export const FIRE_CONTROL = {
   skillMin: 0.35,
   skillMax: 1.6,
 } as const;
+
+/** Map an AI weapon id onto the shared zone-multiplier weapon class. */
+function aiWeaponClass(spec: AIWeaponSpec): WeaponClass {
+  const id = spec.id;
+  if (id.includes('smg')) return 'smg';
+  if (id.includes('shotgun')) return 'shotgun';
+  if (id.includes('dmr') || id.includes('sniper')) return 'marksman';
+  if (id.includes('lmg') || id.includes('jug')) return 'lmg';
+  return 'assault';
+}
 
 export class CombatController {
   ammo: number;
@@ -400,26 +413,36 @@ export class CombatController {
     if (hitTarget) {
       const t = colliderIsTarget ? _hit.distance : capsuleT;
       const zone = this.zoneFor(muzzle, _dir, t, base, h, colliderIsTarget ? colliderZone : 'none');
-      const mult = zone === 'head' ? spec.headshotMult
-        : zone === 'neck' ? spec.headshotMult * 0.8
-          : zone === 'stomach' ? 0.9
-            : zone === 'leg' || zone === 'arm' ? 0.7 : 1;
-
-      const falloffScale = distance <= spec.rangeIdeal
-        ? 1
-        : 1 - 0.6 * clamp01((distance - spec.rangeIdeal) / Math.max(1, spec.rangeMax - spec.rangeIdeal));
-      const dmg = spec.damage * mult * falloffScale * this.profile.damageScale;
+      // Shared zone table + falloff shape with the player ballistics path.
+      // Base damage stays on the AI weapon spec (authored lethality / dps).
+      const priced = priceAiHit(
+        aiWeaponClass(spec),
+        spec.damage,
+        distance,
+        zone,
+        spec.rangeIdeal,
+        spec.rangeMax,
+        this.profile.damageScale,
+        null,
+      );
+      const dmg = priced.damage;
 
       out.hitTarget = true;
       out.damage = dmg;
-      out.zone = zone;
+      out.zone = priced.zone;
       this.shotsHit++;
+
+      // Prefer the collider surface (flesh / armor / helmet) when MASK_BULLET
+      // resolved a living volume; otherwise flesh (never invent a helmet).
+      const impactSurface: SurfaceType = colliderIsTarget && _hit.surface
+        ? _hit.surface
+        : 'flesh';
 
       _v2.copy(muzzle).addScaledVector(_dir, t);
       bus.emit('bullet:impact', {
         point: _v2.clone(),
         normal: _dir.clone().negate(),
-        surface: zone === 'head' ? 'helmet' : 'flesh',
+        surface: impactSurface,
         incoming: _dir.clone(),
         energy: dmg * 22,
         penetrated: false,
@@ -431,7 +454,7 @@ export class CombatController {
         });
       } else {
         bus.emit('damage:dealt', {
-          targetId: target.entityId, amount: dmg, headshot: zone === 'head',
+          targetId: target.entityId, amount: dmg, headshot: priced.headshot,
           killed: false, point: _v2.clone(), fromPlayer: false,
         });
       }

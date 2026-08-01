@@ -89,6 +89,8 @@ export class Killstreaks {
   private used = 0;
   private viewBuf: KillstreakView[] = [];
   private viewPool: KillstreakView[] = [];
+  /** Loadout-selected earn track (max 3). Empty → full default EARN_ORDER. */
+  private loadoutTrack: KillstreakId[] = [];
 
   private viewRow(i: number): KillstreakView {
     while (this.viewPool.length <= i) {
@@ -130,6 +132,45 @@ export class Killstreaks {
     this.contacts.length = 0;
     this.used = 0;
     this.clearDeployed();
+    this.syncLoadoutTrack();
+  }
+
+  /**
+   * Reads the player's selected killstreaks (max 3) from the loadout bridge.
+   * Falls back to the full default ladder when none are installed.
+   */
+  syncLoadoutTrack(): void {
+    this.loadoutTrack.length = 0;
+    const meta = this.services.meta?.loadout;
+    if (!meta) return;
+    const playerId = this.services.player?.entityId ?? 1;
+    const active = meta.activeFor(playerId) as { killstreaks?: Array<{ id: string; cost?: number } | string> } | null;
+    const raw = active?.killstreaks;
+    if (!Array.isArray(raw) || raw.length === 0) return;
+    for (const entry of raw) {
+      const id = (typeof entry === 'string' ? entry : entry?.id) as KillstreakId;
+      if (!id || !(id in KILLSTREAK_DEFS)) continue;
+      if (this.loadoutTrack.includes(id)) continue;
+      this.loadoutTrack.push(id);
+      if (this.loadoutTrack.length >= MAX_SLOTS) break;
+    }
+  }
+
+  /** Earn order: loadout selection (≤3) or the default full ladder. */
+  private earnOrder(): readonly KillstreakId[] {
+    return this.loadoutTrack.length > 0 ? this.loadoutTrack : EARN_ORDER;
+  }
+
+  /** Per-id cost, honouring loadout hardline-adjusted costs when present. */
+  private costOf(id: KillstreakId): number {
+    const meta = this.services.meta?.loadout;
+    if (meta) {
+      const playerId = this.services.player?.entityId ?? 1;
+      const active = meta.activeFor(playerId) as { killstreaks?: Array<{ id: string; cost: number }> } | null;
+      const hit = active?.killstreaks?.find((k) => k.id === id);
+      if (hit && typeof hit.cost === 'number') return hit.cost;
+    }
+    return KILLSTREAK_DEFS[id].cost;
   }
 
   /** Wipes earned-but-unused rewards; called when the player dies. */
@@ -143,16 +184,19 @@ export class Killstreaks {
    * Returns the ids granted this call so the caller can announce them.
    */
   onStreak(streak: number): KillstreakId[] {
+    // Re-sync in case the class was swapped mid-match (rare but legal).
+    if (this.loadoutTrack.length === 0) this.syncLoadoutTrack();
     const granted: KillstreakId[] = [];
-    for (const id of EARN_ORDER) {
+    for (const id of this.earnOrder()) {
       const def = KILLSTREAK_DEFS[id];
-      if (streak < def.cost || this.awarded.has(id)) continue;
+      const cost = this.costOf(id);
+      if (streak < cost || this.awarded.has(id)) continue;
       this.awarded.add(id);
       if (this.slots.length >= MAX_SLOTS) continue;
       this.slots.push(id);
       granted.push(id);
       this.services.emit('killstreak:ready', { id, name: def.name, slot: this.slots.length - 1 });
-      bus.emit('killstreak:earned', { name: def.name, count: def.cost });
+      bus.emit('killstreak:earned', { name: def.name, count: cost });
       this.services.emit('hud:banner', {
         title: def.name.toUpperCase(), subtitle: 'READY — [T] to deploy', kind: 'reward', ttl: 2.8,
       });
@@ -162,9 +206,10 @@ export class Killstreaks {
 
   /** The next reward the player is working toward. */
   nextReward(streak: number): { id: KillstreakId | null; needed: number } {
-    for (const id of EARN_ORDER) {
+    if (this.loadoutTrack.length === 0) this.syncLoadoutTrack();
+    for (const id of this.earnOrder()) {
       if (this.awarded.has(id)) continue;
-      return { id, needed: Math.max(0, KILLSTREAK_DEFS[id].cost - streak) };
+      return { id, needed: Math.max(0, this.costOf(id) - streak) };
     }
     return { id: null, needed: 0 };
   }

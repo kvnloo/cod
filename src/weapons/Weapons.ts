@@ -30,7 +30,7 @@ import type { RenderAPI } from '../render/types';
 import type { PlayerSystem } from '../player/Player';
 
 import { DEFAULT_LOADOUT, WEAPONS, damageAt, weaponDef } from './Catalog';
-import { resolveLoadout, resolveStats, type ResolvedStats } from './Attachments';
+import { ATTACHMENTS, resolveLoadout, resolveStats, type ResolvedStats } from './Attachments';
 import type {
   AttachmentDef, FireMode, WeaponDef, WeaponRuntime, WeaponSnapshot, WeaponState,
 } from './types';
@@ -44,6 +44,15 @@ import { GRENADES, GrenadeSystem, type GrenadeDef, type GrenadeKind, type Projec
 import { getPresentScale } from '../game/Lifecycle';
 
 export type { WeaponRuntime, WeaponSnapshot } from './types';
+
+/* Shop / field events — declaration merge so Operation can mutate combat. */
+declare module '../core/EventBus' {
+  interface GameEvents {
+    'weapon:resupply': void;
+    'weapon:attach': { attachmentId: string };
+  }
+}
+
 
 interface RenderExtras extends RenderAPI {
   viewModelScene: THREE.Scene;
@@ -220,6 +229,9 @@ export class WeaponSystem implements System {
     bus.on('player:land', (e) => this.viewModel.land(e.force));
     bus.on('player:mantle', () => this.viewModel.mantle());
     bus.on('player:spawn', () => this.onSpawn());
+    // Operation buy phase: combat-mutating shop events (declaration-merged).
+    bus.on('weapon:resupply', () => { this.resupplyAmmo(); });
+    bus.on('weapon:attach', (e) => { this.addAttachment(e.attachmentId); });
     // `weapon:ads` was write-only: this system announced it and nobody could
     // ask for it. Scripted sequences — capture shots, cinematics, the HUD's own
     // sight-picture stills — need to pose the view model down its sights
@@ -300,6 +312,34 @@ export class WeaponSystem implements System {
     slot.runtime.magSize = stats.magSize;
     slot.runtime.ammo = Math.min(stats.magSize, Math.round(stats.magSize * ratio));
     this.equip(this.index, true);
+  }
+
+  /**
+   * Merges one attachment into the current weapon's loadout (shop / field pickup).
+   * Replaces any existing attachment in the same slot; combat stats mutate immediately.
+   */
+  addAttachment(id: string): void {
+    const slot = this.slots[this.index];
+    if (!slot) return;
+    const next = [...slot.runtime.attachments.filter((a) => {
+      // Drop any existing attachment in the same slot as `id`.
+      const cur = ATTACHMENTS.find((d) => d.id === a);
+      const neu = ATTACHMENTS.find((d) => d.id === id);
+      if (!cur || !neu) return true;
+      return cur.slot !== neu.slot;
+    }), id];
+    this.setAttachments(next);
+  }
+
+  /** Full reserve + mag top-off for every carried weapon (Operation resupply). */
+  resupplyAmmo(): void {
+    for (const s of this.slots) {
+      s.runtime.reserve = s.runtime.def.startReserve;
+      s.runtime.ammo = s.runtime.magSize;
+      s.runtime.heat = 0;
+    }
+    this.grenades.resupply();
+    bus.emit('notify', { text: 'AMMUNITION RESUPPLIED', kind: 'reward' });
   }
 
   private equip(index: number, immediate = false): void {
@@ -444,6 +484,9 @@ export class WeaponSystem implements System {
     this.updateAds();
     this.updateAdsBlend(dt, slot.stats);
     this.syncSpreadCtx(slot.stats);
+    // Action clocks (reload/draw/holster/inspect/melee) advance on the fixed
+    // step only — ViewModel.update is pose presentation and never ticks action.t.
+    this.viewModel.advanceAction(dt);
     this.updateActions();
     this.updateFiring();
     this.updateGrenades();
@@ -625,8 +668,16 @@ export class WeaponSystem implements System {
     if (w.reloading) {
       if (shellReload) this.tickShellReload();
       else this.tickMagReload();
-      // Sprinting cancels a reload; on a shell reload so does the trigger.
-      if (this.stanceSprinting || (shellReload && input.pressed('fire') && w.ammo > 0)) {
+      // Cancel windows (cat A):
+      // - Sprint always cancels (any progress).
+      // - Shell: fire cancels once at least one shell is chambered.
+      // - Mag: fire/ADS cancel only after addAmmo commits — window is 0 ms from
+      //   that fixed step (same-step cancel then fire is legal once reloading=false).
+      const magCancelReady = !shellReload && this.viewModel.ammoCommitted
+        && (input.held('fire') || input.held('ads') || input.pressed('fire') || input.pressed('ads'));
+      if (this.stanceSprinting
+        || (shellReload && input.pressed('fire') && w.ammo > 0)
+        || magCancelReady) {
         this.finishReload(false);
       }
     }

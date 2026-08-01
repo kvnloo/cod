@@ -616,9 +616,48 @@ function PHASE_JUICE() {
     inputSamples.push({
       wallMs: present ? +(present.wallMs - t0).toFixed(3) : null,
       kind: present ? present.kind : null,
+      action: 'fire',
     });
     for (let i = 0; i < 8; i++) e.stepFrame(1 / 120);
   }
+
+  /* --- other actions: first sim-visible response (not fire-only) ------- */
+  // Finding A: g2-gunfeel only stamped the fire present path. Measure ADS,
+  // jump and reload by the first state change on the next fixed step.
+  function measureActionPresent(action, probe) {
+    const samples = [];
+    for (let n = 0; n < 8; n++) {
+      G.goHome();
+      G.settle(30);
+      G.refill();
+      const t0 = performance.now();
+      globalThis.__G2_HOLD__([], [action]);
+      e.stepFrame(1 / 60);
+      globalThis.__G2_HOLD__([action], []);
+      let hit = null;
+      for (let i = 0; i < 30; i++) {
+        e.stepFrame(1 / 60);
+        if (probe()) { hit = +(performance.now() - t0).toFixed(3); break; }
+      }
+      globalThis.__G2_HOLD__([], []);
+      samples.push({ wallMs: hit, kind: 'state', action });
+      for (let i = 0; i < 8; i++) e.stepFrame(1 / 120);
+    }
+    return samples;
+  }
+  const adsSamples = measureActionPresent('ads', () => {
+    const w = weapons.current;
+    return !!(w && (w.adsProgress > 0.02 || w.adsing || w.ads));
+  });
+  const jumpSamples = measureActionPresent('jump', () => {
+    const st = player.state;
+    return st === 'jump' || st === 'air' || st === 'fall' || !player.movement?.grounded;
+  });
+  const reloadSamples = measureActionPresent('reload', () => {
+    const w = weapons.current;
+    return !!(w && (w.reloading || w.reloadT > 0 || w.phase === 'reload'));
+  });
+  inputSamples.push(...adsSamples, ...jumpSamples, ...reloadSamples);
 
   /* --- hitstop pulse does not scale authoritative Time.scale ---------- */
   const life = g && g.match ? g.match.lifecycle : null;
@@ -694,13 +733,36 @@ function PHASE_JUICE() {
     flashAtMuzzleXY: !!(flash && flash.xyMatch),
     inputToPresentMs: inputSamples,
     inputToPresentP99Ms: (function () {
-      const arr = inputSamples.map((s) => s.wallMs).filter((v) => v != null).sort((a, b) => a - b);
+      // Fire path only for the legacy ≤50 ms gate (juice present stamp).
+      const arr = inputSamples.filter((s) => s.action === 'fire' || !s.action)
+        .map((s) => s.wallMs).filter((v) => v != null).sort((a, b) => a - b);
       if (!arr.length) return null;
       return +arr[Math.min(arr.length - 1, Math.ceil(0.99 * arr.length) - 1)].toFixed(3);
     })(),
     inputToPresentMaxMs: (function () {
-      const arr = inputSamples.map((s) => s.wallMs).filter((v) => v != null);
+      const arr = inputSamples.filter((s) => s.action === 'fire' || !s.action)
+        .map((s) => s.wallMs).filter((v) => v != null);
       return arr.length ? Math.max(...arr) : null;
+    })(),
+    inputByAction: (function () {
+      const by = {};
+      for (const s of inputSamples) {
+        const k = s.action || 'fire';
+        (by[k] ||= []).push(s.wallMs);
+      }
+      const out = {};
+      for (const [k, vals] of Object.entries(by)) {
+        const arr = vals.filter((v) => v != null).sort((a, b) => a - b);
+        out[k] = {
+          n: vals.length,
+          nulls: vals.length - arr.length,
+          p99: arr.length
+            ? +arr[Math.min(arr.length - 1, Math.ceil(0.99 * arr.length) - 1)].toFixed(3)
+            : null,
+          max: arr.length ? Math.max(...arr) : null,
+        };
+      }
+      return out;
     })(),
     hitstop,
     damageIndicatorMs: dmgMs,
@@ -779,6 +841,11 @@ async function main() {
       const j = report.juice;
       console.log(`  brass separation ${j.brassSeparationM} m  flashXY ${j.flashAtMuzzleXY}`);
       console.log(`  input→present p99 ${j.inputToPresentP99Ms} ms  max ${j.inputToPresentMaxMs} ms`);
+      if (j.inputByAction) {
+        for (const [k, v] of Object.entries(j.inputByAction)) {
+          console.log(`    ${k}: p99 ${v.p99} ms  n=${v.n}  (nulls ${v.nulls})`);
+        }
+      }
       console.log(`  hitmarker after impact ${j.hitmarkerAfterImpactMs} ms  kill-confirm ${j.killConfirmMs} ms`);
       console.log(`  damage-indicator ${j.damageIndicatorMs} ms  hitstop ${JSON.stringify(j.hitstop)}`);
       console.log(`  chain ${JSON.stringify(j.chainKinds)}`);

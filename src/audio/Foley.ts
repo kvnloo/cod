@@ -15,6 +15,7 @@ import type { SfxContext } from './Context';
 import type { Gait } from './types';
 import { footstepBankFor } from './Bank';
 import { profileFor, type WeaponFamily } from './WeaponSounds';
+import { weaponDef } from '../weapons/Catalog';
 import {
   SPEED_OF_SOUND, arLin, clamp, clamp01, filterNode, gainNode, lerp,
   noiseVoice, startNoise, sweep,
@@ -428,14 +429,53 @@ export interface ReloadHandle {
  * cloth between them, which is what makes reloads read as choreography rather
  * than as a sound effect.
  */
+/**
+ * Build reload stage times from the weapon's ReloadProfile so audio beats land
+ * on the same fractions the view-model animates (cat C AV sync).
+ */
+function stagesFromReloadProfile(
+  weaponId: string, tactical: boolean, family: WeaponFamily,
+): { seconds: number; stages: ReloadStage[] } {
+  const table = RELOAD_STAGES[family];
+  let def: ReturnType<typeof weaponDef> | null = null;
+  try { def = weaponDef(weaponId); } catch { def = null; }
+  if (!def?.reload) {
+    return { seconds: table.seconds, stages: tactical ? table.tactical : table.empty };
+  }
+  const r = def.reload;
+  const seconds = tactical ? r.tactical : r.empty;
+  // Per-shell guns still use the family loop choreography.
+  if (r.perShell !== undefined || seconds <= 0) {
+    return { seconds: table.seconds, stages: tactical ? table.tactical : table.empty };
+  }
+  const stages: ReloadStage[] = [
+    { at: Math.max(0.02, r.magOut * 0.55), kind: 'latch', gain: 0.55, rate: 1.1, cloth: 0.4 },
+    { at: r.magOut, kind: 'heavy', gain: 0.55, rate: 1.0 },
+    { at: r.magIn, kind: 'heavy', gain: 0.72, rate: 0.95, cloth: 0.55 },
+    { at: r.magSeat, kind: 'latch', gain: 0.5, rate: 1.05 },
+  ];
+  if (!tactical && r.boltRelease > 0) {
+    stages.push({ at: r.boltRelease, kind: 'bolt', gain: 0.85, rate: 0.95 });
+    stages.push({
+      at: Math.min(0.97, r.boltRelease + 0.08),
+      kind: 'spring', gain: 0.4, rate: 1.1,
+    });
+  } else {
+    stages.push({
+      at: Math.min(0.95, Math.max(r.magSeat + 0.06, r.addAmmoAt + 0.05)),
+      kind: 'light', gain: 0.35, rate: 1.15,
+    });
+  }
+  return { seconds: Math.max(0.2, seconds), stages };
+}
+
 export function playReload(
   sfx: SfxContext, weaponId: string, tactical: boolean, firstPerson: boolean,
   x = 0, y = 0, z = 0,
 ): ReloadHandle {
   const { ctx, pool, bank } = sfx;
   const p = profileFor(weaponId);
-  const table = RELOAD_STAGES[p.family];
-  const stages = tactical ? table.tactical : table.empty;
+  const { seconds: total, stages } = stagesFromReloadProfile(weaponId, tactical, p.family);
   const rand = new Rand(`reload:${weaponId}:${cursor++}`);
 
   const voice = pool.acquire({
@@ -446,7 +486,6 @@ export function playReload(
   if (!voice) return { cancel: () => { /* culled */ }, endsAt: 0 };
 
   const t0 = sfx.now();
-  const total = table.seconds;
   const sources: AudioScheduledSourceNode[] = [];
   let end = t0;
 

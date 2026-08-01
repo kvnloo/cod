@@ -48,6 +48,54 @@ import { SOFT_ARCHETYPES } from './recipes/soft';
 import { MISC_ARCHETYPES } from './recipes/misc';
 
 export type { MaterialOptions } from './types';
+
+/**
+ * Palette-level overrides that only the material module understands.
+ *
+ * `MaterialOptions` in `types.ts` is a shared contract other modules compile
+ * against, so surface-authoring knobs that exist purely between the palette and
+ * the shader extension live here instead. Anything typed `MaterialOptions`
+ * still satisfies this, so no caller has to change.
+ */
+export interface SurfaceOptions extends MaterialOptions {
+  /**
+   * Override how this surface is laid: [flag X (m), flag Z (m), joint strength].
+   * Defaults come from the archetype's family — see `PAVING_DEFAULT`.
+   */
+  paving?: [number, number, number];
+  /**
+   * Scale on the rain-burnish metal wash, 0..1. Painted stock wants a fraction
+   * of what bare structural steel wants.
+   */
+  burnish?: number;
+  /**
+   * Override the family's weathering film, 0..1 — see `FILM_DEFAULT`.
+   */
+  film?: number;
+  /**
+   * Linear multiplier on the tint, allowing an albedo *above* what a hex colour
+   * can express.
+   *
+   * `tint` is applied as a linear multiplier on a base map that is already
+   * authored at the material's real reflectance, so every tint below white is a
+   * darkener. Most of this palette's tints are — `asphalt` at 0x4a4b4e is linear
+   * 0.070 against a 0.22 map, i.e. 1.5 % reflectance, half the albedo of coal —
+   * and a surface at 1.5 % contributes almost nothing to its own pixel: measured
+   * on the alley floor, the diffuse term is 6 % of the rendered radiance and an
+   * ambient/specular veil is the other 94 %, which is exactly why no amount of
+   * authored surface story was visible there. The final product is clamped in
+   * the shader so F0 can never exceed 1.
+   */
+  gain?: number;
+  /**
+   * Override the albedo strength of the shared detail layer for this surface.
+   *
+   * A ground plane is read in shadow, where the transfer curve compresses a
+   * multiplicative layer to roughly a fifth of its nominal amplitude, so it
+   * needs a wider gain than a facade to arrive at the same visible place.
+   */
+  detailAlbedo?: number;
+}
 export { applyInstanceVariation, setBlendWeights, materialUniforms } from './MaterialShaders';
 export type { PbrTextureSet } from './TextureForge';
 
@@ -151,6 +199,28 @@ const MACRO_DEFAULT: Record<string, [number, number, number, number]> = {
 const MACRO_FALLBACK: [number, number, number, number] = [6.0, 18, 0.075, 0.05];
 
 /**
+ * Weathering film per family, 0..1.
+ *
+ * How much of the recipe's own deep end is lifted and neutralised by chalking,
+ * dust and salt. It is a *contrast* control, not a brightness one: the paint,
+ * timber and plastic recipes are authored with 2-3 stops of internal range so
+ * that they read on a swatch, and outdoors after forty years no such surface
+ * still holds that range — the shutters in the alley were a third pigment-black
+ * because nothing was taking it away.
+ *
+ * Masonry and ground deliberately get none: those recipes already run a narrow
+ * palette, and compressing them further is what makes a floor read as a printed
+ * sheet.
+ */
+const FILM_DEFAULT: Record<string, number> = {
+  metal: 0.55, metalThin: 0.50, diamondPlate: 0.45, aluminium: 0.30,
+  pipe: 0.45, grate: 0.40,
+  wood: 0.40, woodThin: 0.40, plywood: 0.40, crate: 0.35,
+  plastic: 0.45, rubber: 0.30, fabric: 0.35, sandbag: 0.35,
+  carpet: 0.30, cardboard: 0.35,
+};
+
+/**
  * Masonry lattices, mirroring the `obBrick()` call inside each recipe:
  * `[blocksAcross, coursesUp, perCourseJitter, recipeSeed]`.
  *
@@ -216,6 +286,39 @@ const SURF_LAYERS: Record<string, [number, number, number, number]> = {
 };
 const SURF_FALLBACK: [number, number, number, number] = [0.35, 0.25, 0.20, 0];
 
+/**
+ * How a family's floors are *laid*: [flag X (m), flag Z (m), joint strength].
+ *
+ * A ground plane is the one surface the player spends the whole match looking
+ * at, and the thing that separates a photographed street from a tiled one is
+ * that a real floor is assembled out of units — flags, setts, bays, a poured
+ * slab with movement joints — with a joint network that takes the light
+ * completely differently from the faces beside it. None of that can live in a
+ * tiling map, because the units have to keep their identity across sixty metres
+ * of world space.
+ *
+ * Joint strength 0 keeps the per-flag tone and draws no joint, which is what
+ * loose ground (dirt, gravel, grass) wants.
+ */
+const PAVING_DEFAULT: Record<string, [number, number, number]> = {
+  // Pressed concrete footway flags: the standard 900 x 600 slab.
+  concrete: [0.90, 0.60, 1.0],
+  // Roads are not flagged. They are laid in lanes and bays and then patched, so
+  // the "joint" is a construction seam and a sealed crack — wide, soft, weak.
+  asphalt: [3.60, 2.80, 0.34],
+  // Setts and ashlar carry their own lattice in `cellTone`; this layer only
+  // supplies the metre-scale bay tone under it.
+  stone: [1.80, 1.30, 0.0],
+  brick: [1.60, 1.20, 0.0],
+  tile: [1.20, 0.90, 0.0],
+  dirt: [2.20, 2.20, 0.0],
+  gravel: [2.00, 2.00, 0.0],
+  grass: [2.40, 2.40, 0.0],
+  mud: [2.20, 2.20, 0.0],
+  sand: [2.60, 2.60, 0.0],
+  snow: [3.00, 3.00, 0.0],
+};
+
 const EMISSIVE_DEFAULT: Record<EmissiveKind, { gain: number; rate: number; temp: number }> = {
   none: { gain: 1, rate: 1, temp: 1 },
   fluorescent: { gain: 3.4, rate: 1, temp: 1 },
@@ -231,7 +334,7 @@ const EMISSIVE_DEFAULT: Record<EmissiveKind, { gain: number; rate: number; temp:
 interface PendingUpgrade {
   material: THREE.MeshStandardMaterial;
   archetype: MaterialArchetype;
-  opts: MaterialOptions;
+  opts: SurfaceOptions;
 }
 
 export class MaterialSystem implements System {
@@ -345,17 +448,17 @@ export class MaterialSystem implements System {
   /* ----------------------------------------------------------- materials -- */
 
   /** Returns (and caches) a material for a surface archetype. */
-  get(surface: SurfaceType, opts: MaterialOptions = {}): THREE.Material {
+  get(surface: SurfaceType, opts: SurfaceOptions = {}): THREE.Material {
     return this.getStandard(surface, opts);
   }
 
-  getStandard(surface: SurfaceType, opts: MaterialOptions = {}): THREE.MeshStandardMaterial {
+  getStandard(surface: SurfaceType, opts: SurfaceOptions = {}): THREE.MeshStandardMaterial {
     const id = opts.archetype ?? SURFACE_DEFAULT[surface] ?? 'concrete';
     return this.material(id, opts, surface);
   }
 
   /** Returns (and caches) a material for an explicit archetype id. */
-  material(id: string, opts: MaterialOptions = {}, surface?: SurfaceType): THREE.MeshStandardMaterial {
+  material(id: string, opts: SurfaceOptions = {}, surface?: SurfaceType): THREE.MeshStandardMaterial {
     const arch = this.archetypes.get(id);
     const key = `${id}|${stableKey(opts)}`;
     const cached = this.cache.get(key);
@@ -400,7 +503,7 @@ export class MaterialSystem implements System {
   }
 
   /** Attaches the generated textures + shader extension to an existing material. */
-  private upgrade(mat: THREE.MeshStandardMaterial, arch: MaterialArchetype, opts: MaterialOptions): void {
+  private upgrade(mat: THREE.MeshStandardMaterial, arch: MaterialArchetype, opts: SurfaceOptions): void {
     const set = this.texturesFor(arch.id);
     if (!set) return;
 
@@ -412,6 +515,7 @@ export class MaterialSystem implements System {
     mat.aoMapIntensity = 1;
     mat.normalScale.set(1, 1);
     mat.color.set(opts.tint ?? arch.color ?? 0xffffff);
+    if (opts.gain !== undefined) mat.color.multiplyScalar(opts.gain);
     mat.roughness = opts.roughness ?? arch.roughness ?? 1;
     mat.metalness = opts.metalness ?? arch.metalness ?? 1;
 
@@ -467,7 +571,14 @@ export class MaterialSystem implements System {
     let surfaceLayers: THREE.Vector4 | null = null;
     if (worldLayers && settings.preset !== 'low') {
       const s = SURF_LAYERS[arch.id] ?? SURF_FALLBACK;
-      surfaceLayers = new THREE.Vector4(s[0], s[1], s[2], s[3]);
+      surfaceLayers = new THREE.Vector4(s[0], s[1], s[2], s[3] * (opts.burnish ?? 1));
+    }
+    // How this floor is laid. Only meaningful where the story layers run, since
+    // the joint network shares their up-facing gate.
+    let paving: THREE.Vector4 | null = null;
+    if (surfaceLayers) {
+      const p = opts.paving ?? PAVING_DEFAULT[arch.id];
+      paving = new THREE.Vector4(p?.[0] ?? tile, p?.[1] ?? tile, p?.[2] ?? 0, hash01(arch.id) * 61 + 3);
     }
     const lat = worldLayers && settings.preset !== 'low' ? CELL_LATTICE[arch.id] : undefined;
     const cellLattice = lat ? new THREE.Vector4(lat[0], lat[1], lat[2], lat[3]) : null;
@@ -490,7 +601,12 @@ export class MaterialSystem implements System {
       // out at 1.68/m, near DC. Both are now inside the 4-8 repeats/m band that
       // puts the detail map's own cells at a legible 3-25 mm.
       detailScale: detailRepeatsPerMetre(arch) * tile,
-      detailStrength: arch.shader?.detailStrength,
+      detailStrength: opts.detailAlbedo !== undefined
+        ? new THREE.Vector3(
+            arch.shader?.detailStrength?.x ?? 0.26,
+            opts.detailAlbedo,
+            arch.shader?.detailStrength?.z ?? 0.74)
+        : arch.shader?.detailStrength,
       // A long, lazy cross-fade. The old 4-14 m window put the whole
       // transition inside the part of the ground the player is looking at, so
       // there was a readable arc on the street where the grain stopped.
@@ -504,12 +620,14 @@ export class MaterialSystem implements System {
       blend: blendSet,
       blendTile: opts.blendScale ?? blendSet?.tile,
       wear: opts.wear ?? 0,
+      film: opts.film ?? (worldLayers ? FILM_DEFAULT[arch.id] ?? 0 : 0),
       specularAA: true,
       normalFadeDistance: 9,
       macro,
       surface: surfaceLayers,
       ground: groundBand,
       cellTone: cellLattice,
+      paving,
       alphaFromMap,
       uvVariation: arch.shader?.uvVariation ?? false,
       emissiveMode: EMISSIVE_MODES[emissiveKind],
@@ -582,7 +700,7 @@ function detailRepeatsPerMetre(arch: MaterialArchetype): number {
   return Math.min(DETAIL_RPM_MAX, Math.max(DETAIL_RPM_MIN, authored * 0.22));
 }
 
-function stableKey(o: MaterialOptions): string {
+function stableKey(o: SurfaceOptions): string {
   const keys = Object.keys(o).sort();
   let s = '';
   for (const k of keys) {

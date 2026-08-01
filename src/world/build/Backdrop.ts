@@ -35,10 +35,39 @@ type BackdropKey = 'backdropMid' | 'backdropFar' | 'ridgeNear' | 'ridgeMid' | 'r
 export function buildBackdrop(chunk: Chunk): void {
   const rand = new Rand(1717);
 
-  /* --- receding bands of city blocks ---------------------------------- */
+  /* --- receding bands of city blocks ----------------------------------
+   *
+   * **A backdrop must sit below the sky it is cut out against.** Value, not
+   * detail, is what makes a distant mass recede: measured against this level's
+   * horizon sky (display ≈172 on `overview`), the three bands used to land at
+   * 135 / 143 / 146 with individual sunlit faces reaching 219 — brighter than
+   * the sky behind them — so the whole city advanced instead of receding and
+   * the upper third of the establishing shot read as polystyrene.
+   *
+   * Two things are being asked of the numbers below, and they pull in the same
+   * direction:
+   *
+   *  1. **Each band lands at a distinct fraction of sky** — roughly 0.6 at
+   *     150 m, 0.75 at 250 m, 0.85 at 400 m, never above 1.0. Aerial
+   *     perspective already lifts the far bands, so the albedo ramp has to run
+   *     the *other* way: the near band gets the darkest keys in the catalogue
+   *     and the far band the lightest, and the two effects compose into a
+   *     monotonic ramp instead of cancelling.
+   *  2. **The mass has internal value structure.** Backdrop blocks are on
+   *     `LAYERS.BACKDROP` and therefore never shadow each other, which is why a
+   *     hundred of them read as one flat cut-out. `baseDark` paints the bottom
+   *     of every block in the darkest key in two steps, standing in for the
+   *     mutual shadowing a real district has at street level — and that is also
+   *     what pulls the near band's mean down without touching the roofline,
+   *     where all the silhouette information lives.
+   */
   const bands: {
     r0: number; r1: number; count: number; minH: number; maxH: number;
     keys: BackdropKey[]; minW: number; maxW: number; glaze: boolean;
+    /** Fraction of the block height painted as street-level shadow. */
+    baseDark: number;
+    /** Storey-band depth as a fraction of the storey. */
+    bandGain: number;
   }[] = [
     // A provincial town, not a CBD: three to eight storeys, receding into haze.
     //
@@ -53,16 +82,31 @@ export function buildBackdrop(chunk: Chunk): void {
     // that. Pushed out, aerial perspective does its job and the band reads as
     // the next district.
     { r0: 118, r1: 180, count: 100, minH: 6, maxH: 16, minW: 9, maxW: 23, glaze: true,
-      keys: ['backdropMid', 'backdropMid', 'backdropFar', 'ridgeMid', 'ridge'] },
+      baseDark: 0.46, bandGain: 0.50,
+      keys: ['ridgeMid', 'ridgeMid', 'backdropFar', 'ridgeMid', 'backdropFar'] },
     { r0: 190, r1: 298, count: 112, minH: 7, maxH: 24, minW: 13, maxW: 37, glaze: true,
-      keys: ['backdropFar', 'backdropMid', 'ridgeMid', 'ridge', 'backdropFar'] },
+      baseDark: 0.34, bandGain: 0.42,
+      keys: ['ridgeMid', 'backdropFar', 'backdropFar', 'ridge', 'ridgeMid'] },
     { r0: 306, r1: 404, count: 88, minH: 9, maxH: 32, minW: 18, maxW: 56, glaze: true,
-      keys: ['backdropFar', 'ridge', 'backdropFar', 'ridgeMid'] },
+      baseDark: 0.18, bandGain: 0.34,
+      keys: ['backdropFar', 'ridge', 'backdropFar', 'backdropMid'] },
   ];
 
-  // Window / shadow-gap ribbons. `ridgeNear` is the darkest key in the catalogue
-  // and it is only ever seen at 400 m, so it doubles as the backdrop's void.
-  const voidM = chunk.m('ridgeNear');
+  /**
+   * Window / shadow-gap ribbons and street-level shadow. `ridgeNear` is the
+   * darkest key in the catalogue and is otherwise only used by the near
+   * mountain range, so it doubles as the backdrop's void.
+   *
+   * **`VOID_KEY` must never appear in a band's `keys`.** `chunk.m()` returns
+   * one shared `Mesher` per key and `Mesher.push()` *multiplies into* the
+   * current transform, so a block whose body key equalled the void key got the
+   * same placement matrix applied twice: `R·p + p`, which for the blocks whose
+   * angle is near π collapses to the origin. The symptom is a 30 m untextured
+   * slab standing in the middle of the square on top of the tram. The guard
+   * below is belt and braces — the key lists above already exclude it.
+   */
+  const VOID_KEY: BackdropKey = 'ridgeNear';
+  const voidM = chunk.m(VOID_KEY);
 
   for (const band of bands) {
     for (let i = 0; i < band.count; i++) {
@@ -79,11 +123,13 @@ export function buildBackdrop(chunk: Chunk): void {
       const d = rand.range(band.minW, band.maxW) * rand.range(0.55, 1.0);
       // Blocks face the street grid of their own district, not the camera.
       const yaw = -a + rand.range(-0.9, 0.9);
-      const m = chunk.m(band.keys[rand.int(0, band.keys.length - 1)]);
+      const key = band.keys[rand.int(0, band.keys.length - 1)];
+      const m = chunk.m(key);
+      const vm = key === VOID_KEY ? m : voidM;   // see the note on VOID_KEY
       m.pushTRS(x, 0, z, yaw);
-      voidM.pushTRS(x, 0, z, yaw);
-      cityBlock(m, voidM, w, d, h, rand, band.glaze);
-      voidM.pop();
+      if (vm !== m) vm.pushTRS(x, 0, z, yaw);
+      cityBlock(m, vm, w, d, h, rand, band.glaze, band.baseDark, band.bandGain);
+      if (vm !== m) vm.pop();
       m.pop();
     }
   }
@@ -120,6 +166,10 @@ export function buildBackdrop(chunk: Chunk): void {
     const x = Math.cos(a) * r, z = Math.sin(a) * r;
     land.pushTRS(x, 0, z, -a + 0.4);
     land.box(0, h * 0.5, 0, w * 0.5, h * 0.5, w * 0.5, 10);
+    // The lower third sits in the district around it, same as every block.
+    voidM.pushTRS(x, 0, z, -a + 0.4);
+    voidM.box(0, h * 0.17, 0, w * 0.5 + 0.05, h * 0.17, w * 0.5 + 0.05, 8);
+    voidM.pop();
     if (kind === 0) {
       // Water tower / silo pair.
       land.box(0, h + 3.5, 0, w * 0.22, 3.5, w * 0.22, 10);
@@ -136,17 +186,26 @@ export function buildBackdrop(chunk: Chunk): void {
     land.pop();
   }
 
-  /* --- low industrial sheds hugging the near band ---------------------- */
-  const shed = chunk.m('backdropMid');
+  /* --- low industrial sheds hugging the near band ----------------------
+   * These sit at 72–128 m: nearer than anything else out here, so they are the
+   * darkest thing on the far side of the map edge and the first rung of the
+   * value ladder. `backdropMid` is the *lightest* key in the catalogue and put
+   * them at the top of it instead. */
+  const shedKeys: BackdropKey[] = ['ridgeMid', 'ridgeMid', 'backdropFar', 'ridgeMid', 'backdropFar'];
   for (let i = 0; i < 34; i++) {
     const a = rand.range(0, Math.PI * 2);
     const r = rand.range(72, 128);
     const w = rand.range(12, 30), d = rand.range(9, 20);
     const h = rand.range(4.0, 8.0);
+    const shed = chunk.m(shedKeys[rand.int(0, shedKeys.length - 1)]);
     shed.pushTRS(Math.cos(a) * r, 0, Math.sin(a) * r, -a + rand.range(-1.2, 1.2));
     shed.box(0, h * 0.5, 0, w * 0.5, h * 0.5, d * 0.5, 8);
     gable(shed, w * 0.5, d * 0.5, h, rand.range(1.2, 2.6));
     shed.pop();
+    // Yard wall / loading bank along the foot, in the darkest key.
+    voidM.pushTRS(Math.cos(a) * r, 0, Math.sin(a) * r, -a + rand.range(-1.2, 1.2));
+    voidM.box(0, h * 0.16, 0, w * 0.5 + 0.08, h * 0.16, d * 0.5 + 0.08, 6);
+    voidM.pop();
   }
 }
 
@@ -157,9 +216,25 @@ export function buildBackdrop(chunk: Chunk): void {
  * rooftop clutter. Everything is proportional to the block so a 6 m shed and a
  * 34 m slab both read correctly.
  */
-function cityBlock(m: Mesher, voidM: Mesher, w: number, d: number, h: number, rand: Rand, glaze: boolean): void {
+function cityBlock(
+  m: Mesher, voidM: Mesher, w: number, d: number, h: number, rand: Rand,
+  glaze: boolean, baseDark = 0, bandGain = 0.35,
+): void {
   const hw = w * 0.5, hd = d * 0.5;
   m.box(0, h * 0.5, 0, hw, h * 0.5, hd, 8.0);
+
+  /* Street-level shadow, in two steps. Nothing on `LAYERS.BACKDROP` casts or
+   * receives a shadow, so without this every block is lit top to bottom by the
+   * same key and a hundred of them average out to one flat value. Two steps
+   * rather than one gradient because at 150 m the eye is reading a *value
+   * boundary*, and one at 20% of the height plus one at 45% gives the mass a
+   * base, a body and a roofline. */
+  if (baseDark > 0.01) {
+    const h0 = h * baseDark * 0.42;
+    const h1 = h * baseDark;
+    voidM.box(0, h0 * 0.5, 0, hw + 0.06, h0 * 0.5, hd + 0.06, 6.0);
+    voidM.box(0, (h0 + h1) * 0.5, 0, hw + 0.03, (h1 - h0) * 0.5, hd + 0.03, 6.0);
+  }
 
   // Massing. A single extruded rectangle is the bar-chart primitive; a real
   // block is a main range plus a lower back wing, a corner infill of a
@@ -193,7 +268,7 @@ function cityBlock(m: Mesher, voidM: Mesher, w: number, d: number, h: number, ra
     const sill = rand.range(0.9, 1.35);
     for (let s = 0; s < n; s++) {
       const y = 1.0 + s * storey + sill;
-      const bh = storey * rand.range(0.28, 0.42);
+      const bh = storey * bandGain * rand.range(0.8, 1.2);
       if (y + bh > h - 0.4) break;
       // Slightly proud of the wall so it never z-fights; dark, so it reads as
       // the shadow inside a reveal rather than as a projecting band.

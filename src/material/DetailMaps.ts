@@ -71,11 +71,37 @@ float obDetailH(vec2 uv) {
   // is what a swept concrete flag or a worn tarmac patch actually shows at a
   // metre. The Worley grain alone is a uniform rash.
   float coarse = obFbm(uv * 6.0, vec2(6.0), 3, 0.5, 29.0);
+  // Decimetre structure. At the 4-8 repeats/m this layer is authored for, six
+  // cells per repeat is already down at 2-3 cm — small enough that from a
+  // metre it is texture rather than *features*, which is precisely why a
+  // stretched crop of the alley floor came back blank while the same crop of a
+  // wall came back full of information. A walked-on floor is a field of
+  // decimetre-scale patches: swept clean here, ground-in there, resurfaced
+  // over there, and the eye reads those long before it reads the aggregate.
+  float patch2 = obFbm(uv * 2.0, vec2(2.0), 3, 0.5, 53.0);
+  float patch3 = obFbm(uv * 3.0, vec2(3.0), 3, 0.5, 71.0);
+  // Ground-in dirt, oil and old spill. Deliberately one-sided: dirt only ever
+  // subtracts, so a symmetric noise field can never produce it.
+  float stain = smoothstep(0.50, 0.86, obFbm(obWarp(uv * 4.0, vec2(4.0), 0.6, 83.0), vec2(4.0), 4, 0.55, 89.0));
+  // A floor that has been walked on, driven over and shelled is cracked, and
+  // the crack network is the one feature on a ground plane that is legible at
+  // every range from 30 cm to 15 m.
+  float cr = obCracks(uv, vec2(1.0), 5.0, 0.014, 97.0);
+  cr += obCracks(uv, vec2(1.0), 11.0, 0.008, 103.0) * 0.55;
+  // The Worley grain has to stay *quiet*. At 4-8 repeats/m its cells land at
+  // 2-5 mm, so at a metre it is a field of identical bright dots — and a bright
+  // dot field over a dark base does not read as concrete, it reads as sand
+  // scattered on a mat. Aggregate is a low-contrast texture; the information
+  // the eye actually uses on a floor is all an order of magnitude larger.
   return 0.5
-       + (coarse - 0.5) * 0.80
-       + (base  - 0.5) * 0.40
-       + (grain - 0.45) * 0.40
-       + (fine  - 0.30) * 0.22;
+       + (patch2 - 0.5) * 0.74
+       + (patch3 - 0.5) * 0.50
+       + (coarse - 0.5) * 0.46
+       + (base  - 0.5) * 0.22
+       + (grain - 0.45) * 0.17
+       + (fine  - 0.30) * 0.09
+       - stain * 0.34
+       - min(cr, 1.0) * 0.34;
 }`,
   fibre: /* glsl */ `
 float obDetailH(vec2 uv) {
@@ -109,7 +135,13 @@ float obDetailH(vec2 uv) {
  * stop, below 8-bit quantisation. Albedo now carries the layer (a real render
  * varies 10-15% over a few centimetres) and roughness backs it up. */
 const ALBEDO_GAIN: Record<Exclude<DetailKind, 'none'>, number> = {
-  micro: 0.25, grit: 0.25, fibre: 0.22, metal: 0.16, organic: 0.20,
+  // `grit` runs the ground plane, which is the one surface in the frame that is
+  // read in shadow — and a multiplicative layer on a surface at display 50 is
+  // compressed by the transfer curve to roughly a fifth of its nominal
+  // amplitude. 0.25 there measured as 3 levels of local sd on a shadowed alley
+  // floor; a wall in the same frame measured 22. Ground needs the wider gain to
+  // arrive at the same place.
+  micro: 0.25, grit: 0.34, fibre: 0.22, metal: 0.16, organic: 0.20,
 };
 const ROUGH_GAIN: Record<Exclude<DetailKind, 'none'>, number> = {
   micro: 0.28, grit: 0.30, fibre: 0.20, metal: 0.24, organic: 0.16,

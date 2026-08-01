@@ -612,28 +612,49 @@ float boContactShadow( const in vec3 viewPos, const in vec3 viewNormal,
 /* ---------------------------------------------------------- sky occlusion -- */
 
 /**
- * Large-scale sky visibility.
+ * Large-scale sky visibility, from a baked top-down height field.
  *
- * The SH probe is baked from the sky dome alone and applied with no notion of
- * whether the receiver can actually see the sky, so a warehouse floor, a flat's
- * back wall and the open plaza all took the same unoccluded fill. That is the
- * whole reason walking warehouse -> street moved auto-exposure by 0.05 stops:
- * there was no measurable difference between inside and outside for it to react
- * to, and "interiors are lit exactly like the open square" is a AAA-vs-hobby
- * tell on its own (VISUAL-BAR #4).
+ * The SH probe is projected from the sky dome alone and applied with no notion
+ * of whether the receiver can actually see the sky, so a warehouse floor, a
+ * flat's back wall and the open plaza all take the same unoccluded fill.
+ * "Interiors are lit exactly like the open square" is a AAA-vs-hobby tell on its
+ * own (VISUAL-BAR #4), and an ambient that lights every face equally is #4's
+ * "single flattest-looking mistake".
  *
- * This is the cheap, geometry-free version of a baked sky-occlusion field: an
- * Alchemy-style hemisphere integral against the depth prepass at a *large*
- * world radius. It is deliberately a different animal from GTAO — GTAO is a
- * sub-metre crease term, this is a ten-metre "how much of the sky can this
- * point see" term, and only the SH probe is multiplied by it. Direct sun,
- * contact shadows and the specular path are untouched.
+ * ## Why this is not screen space any more
  *
- * Declared in its own chunk, not in BO_CONTACT, because `render/Decals.ts`
- * includes the contact chunk and must not inherit a uniform it never binds.
+ * The previous implementation was an Alchemy-style hemisphere integral plus a
+ * "is there a roof over me" ray, both marched against the **depth prepass**.
+ * Both are functions of where the receiver happens to land in the frame:
  *
- * Requires BO_COMMON and BO_CONTACT (for `boSceneDepth` / `boCameraParams`), and
- * three's own fragment prefix for `viewMatrix`.
+ *   • taps that leave the viewport are skipped but still counted in the divisor,
+ *   • the screen-radius cap bites at a different world radius on every row,
+ *   • the roof ray terminates at the top of the frame, so the same floor tile
+ *     is "open" when it sits high in frame and "roofed" when it sits low,
+ *   • and any object nearer to the camera than the ray is a false ceiling.
+ *
+ * Sampling one continuous flat plane measured the result sweeping -4.6% to
+ * +29.2% purely as a function of frame row. That is not a tuning value, it is a
+ * term that changes when you tilt the camera — worse than nothing, because the
+ * ambient fill of a static surface visibly breathes as the player looks around.
+ *
+ * ## What this is instead
+ *
+ * `GtaoPass` bakes one orthographic top-down depth render of every sky-blocking
+ * surface in the level into `boSkyHeight` — a height field, in world space,
+ * built once because the level is static. Sky visibility here is the classic
+ * height-field horizon integral: for each of eight azimuths, find the highest
+ * elevation angle the field reaches within the search radius, and the
+ * unoccluded fraction of a cosine-weighted hemisphere above that horizon is
+ * cos²θ. Weighted by the receiver's own normal, so a wall is judged on the half
+ * of the sky it actually faces.
+ *
+ * Every input is world space: position, normal, and a static texture. The same
+ * world point returns the same number from every camera, which is the property
+ * the term is supposed to have and never had.
+ *
+ * Requires BO_COMMON. Only the SH probe and the specular IBL are multiplied by
+ * it — direct sun, contact shadows and GTAO are untouched.
  */
 export const GLSL_SKYOCC = /* glsl */ `
 #ifndef BO_SKYOCC
@@ -641,127 +662,114 @@ export const GLSL_SKYOCC = /* glsl */ `
 
 /** x strength, y radius (m), z floor, w response exponent. */
 uniform vec4 boSkyOccParams;
+/** Top-down height field: 1 - orthographic window depth, looking straight down. */
+uniform sampler2D boSkyHeight;
+/** xy world origin (m) of the field, zw 1 / world extent. world.xz -> [0,1]. */
+uniform vec4 boSkyFieldXform;
+/** x top Y (m), y depth range (m), z texel world size (m), w 1 when built. */
+uniform vec4 boSkyFieldInfo;
 
-float boSkyVisibility( const in vec3 viewPos, const in vec3 viewNormal,
-                       const in mat4 proj, const in vec2 screenPos ) {
+/** Radii the horizon search visits, as a fraction of the search radius. */
+const float BO_SKY_R[ 3 ] = float[ 3 ]( 0.12, 0.38, 0.85 );
 
+/**
+ * World height of the highest sky-blocking surface over an XZ position.
+ * Outside the baked footprint there is nothing to block anything, so the field
+ * reads far below any receiver.
+ */
+float boSkyHeightAt( const in vec2 wxz ) {
+	// V is flipped: the bake camera looks straight down with up = -Z, so its
+	// screen Y axis is world -Z and the top row of the texture is the *most
+	// positive* Z. Getting this wrong mirrors the whole level about its own
+	// centre-line, which is invisible on a symmetrical square and completely
+	// wrong everywhere else.
+	vec2 uv = vec2( ( wxz.x - boSkyFieldXform.x ) * boSkyFieldXform.z,
+	                1.0 - ( wxz.y - boSkyFieldXform.y ) * boSkyFieldXform.w );
+	if ( any( lessThan( uv, vec2( 0.0 ) ) ) || any( greaterThan( uv, vec2( 1.0 ) ) ) ) return -1.0e4;
+	// MeshDepthMaterial / BasicDepthPacking writes 1 - z_window, and the bake
+	// camera is orthographic looking straight down, so z_window is linear in
+	// world height: one lerp decodes it. A cleared texel reads 0 -> the bottom
+	// of the range, i.e. "nothing here".
+	float d = texture( boSkyHeight, uv ).r;
+	return boSkyFieldInfo.x - ( 1.0 - d ) * boSkyFieldInfo.y;
+}
+
+/**
+ * Sky visibility at a world point.
+ *
+ * The openness output comes back alongside it: the same enclosure measure with the
+ * receiver's normal taken out, and — for a downward-facing surface — evaluated
+ * for the space *under* it rather than the slab it is part of. That is a
+ * genuinely different question from "how much sky does this face see", and the
+ * ground-bounce gate needs the second one. A warehouse ceiling sees no sky
+ * whatever is above it (its own SH lobe points at the floor), so its visibility
+ * is legitimately 1 and using that as "is the street in front of me sunlit"
+ * hands every interior ceiling a full sunlit-plaza bounce — which is exactly
+ * how interior-flat's ceiling came out 33% brighter than its own floor.
+ */
+float boSkyVisibility( const in vec3 worldPos, const in vec3 worldNormal, out float openness ) {
+
+	openness = 1.0;
 	// Strength 0 disables the term; a *negative* strength is the debug view, which
-	// must not be swallowed by this early-out.
-	if ( abs( boSkyOccParams.x ) < 1e-4 ) return 1.0;
+	// must not be swallowed by this early-out. An unbaked field is fully open.
+	if ( abs( boSkyOccParams.x ) < 1e-4 || boSkyFieldInfo.w < 0.5 ) return 1.0;
 
-	float radius = max( boSkyOccParams.y, 0.5 );
-	float viewZ = max( - viewPos.z, 0.05 );
+	float radius = max( boSkyOccParams.y, 1.0 );
 
-	float p00 = proj[ 0 ][ 0 ], p11 = proj[ 1 ][ 1 ];
-	float p02 = proj[ 2 ][ 0 ], p12 = proj[ 2 ][ 1 ];
+	// A surface only occludes the sky once it is clear of the receiver's own
+	// plane. Below this the field is measuring the floor the point is standing
+	// on, one texel of quantisation at a time.
+	float lift = max( 0.35, boSkyFieldInfo.z * 2.0 );
 
-	// World radius projected to UV, then capped so a point right against the
-	// camera cannot drag the whole frame through the texture cache.
-	//
-	// The cap has to shrink the *world* radius with it. Clamping the UV alone
-	// puts every tap further away in world space than the falloff allows, so the
-	// range check rejects all of them and the term silently returns "fully open"
-	// exactly where geometry is closest — which is how the first version of this
-	// moved interior exposure by 4%.
-	vec2 want = vec2( 0.5 * p00, 0.5 * p11 ) * ( radius / viewZ );
-	float shrink = min( 1.0, 0.60 / max( max( want.x, want.y ), 1e-4 ) );
-	vec2 rUV = max( want * shrink, vec2( 0.004 ) );
+	// The azimuth set is rotated per world cell, never per pixel: a screen-space
+	// rotation would put the view dependence straight back in. Quantised so the
+	// rotation is constant over ~30 cm and the term stays smooth.
+	float rot = boHash12( floor( worldPos.xz * 3.0 ) ) * 6.2831853;
 
-	float rot = ( boIGN( screenPos + vec2( 19.73, 5.31 ) ) + boFrameJitter ) * 6.2831853;
-	float ca = cos( rot ), sa = sin( rot );
-	mat2 rm = mat2( ca, sa, - sa, ca );
-
-	vec2 uv0 = gl_FragCoord.xy * boCameraParams.zw;
+	float yVis = worldPos.y + lift;
+	// A ceiling is judged on the room it roofs, not on the 20 cm of slab over it.
+	float yOpen = yVis - 2.2 * boSat( - worldNormal.y );
 
 	float occ = 0.0;
-	for ( int i = 0; i < 10; i ++ ) {
-		// The Poisson set is a disc already; the sqrt term redistributes the taps
-		// so near and far radii are both represented instead of clustering.
-		float k = sqrt( ( float( i ) + 0.5 ) / 10.0 );
-		vec2 uv = uv0 + rm * BO_POISSON16[ i ] * rUV * k;
-		if ( any( lessThan( uv, vec2( 0.0 ) ) ) || any( greaterThan( uv, vec2( 1.0 ) ) ) ) continue;
+	float wsum = 0.0;
+	float occOpen = 0.0;
+	for ( int a = 0; a < 8; a ++ ) {
+		float ang = rot + float( a ) * 0.7853981634;
+		vec2 dir = vec2( cos( ang ), sin( ang ) );
 
-		float z = boLinearDepth( texture( boSceneDepth, uv ).r,
-		                         boCameraParams.x, boCameraParams.y );
-		vec3 sp = vec3( z * ( ( uv.x * 2.0 - 1.0 ) + p02 ) / p00,
-		                z * ( ( uv.y * 2.0 - 1.0 ) + p12 ) / p11,
-		                - z );
-		vec3 v = sp - viewPos;
-		float len = max( length( v ), 1e-3 );
-		// Cosine-weighted contribution, range-checked against the *authored*
-		// radius rather than the screen-capped one. Weighting by the capped
-		// radius makes the falloff collapse exactly where the cap bites — a
-		// ceiling three metres above an interior floor scored 6% of a tap
-		// instead of 75% — which is why the first version of this term moved
-		// interior exposure by 0.003 stops.
-		float fall = 1.0 - boSat( len / radius );
-		occ += boSat( dot( viewNormal, v / len ) - 0.08 ) * fall;
+		// Highest horizon this azimuth reaches, as sin^2(elevation). The
+		// cosine-weighted hemisphere above an elevation t is cos^2(t), so the
+		// blocked fraction of this azimuth's wedge is exactly sin^2(t).
+		float blocked = 0.0;
+		float blockedOpen = 0.0;
+		for ( int k = 0; k < 3; k ++ ) {
+			float r = radius * BO_SKY_R[ k ];
+			float h = boSkyHeightAt( worldPos.xz + dir * r );
+			float dh = h - yVis;
+			if ( dh > 0.0 ) blocked = max( blocked, ( dh * dh ) / ( dh * dh + r * r ) );
+			float dho = h - yOpen;
+			if ( dho > 0.0 ) blockedOpen = max( blockedOpen, ( dho * dho ) / ( dho * dho + r * r ) );
+		}
+
+		// Weight each wedge by how much of the receiver's own cosine lobe points
+		// into it, so a wall is judged on the sky it faces rather than on the
+		// building it is attached to. The 0.15 floor keeps the average defined
+		// for a downward-facing surface, where no wedge scores at all.
+		vec3 wdir = normalize( vec3( dir.x, 1.0, dir.y ) );
+		float w = max( dot( worldNormal, wdir ), 0.0 ) + 0.15;
+		occ += blocked * w;
+		wsum += w;
+		occOpen += blockedOpen;
 	}
-	occ = boSat( occ * ( 1.0 / 10.0 ) * 3.4 );
-
-	// A ray straight at the sky.
-	//
-	// The hemisphere integral above measures how *enclosed* a point is, and on
-	// the two shapes that matter most — a big flat floor and a big flat ceiling —
-	// most of its taps land on the receiver's own plane and contribute nothing.
-	// Measured: it moved the warehouse-to-street exposure swing by 0.03 stops.
-	// So ask the blunt question an interior actually turns on instead: is there
-	// a roof over this point. Marched in screen space against the same prepass
-	// depth, started one bias off the surface so a facade cannot occlude itself,
-	// and jittered per pixel and per frame so TAA resolves it as a soft cone
-	// rather than a hard binary edge.
-	// One ray per pixel, but its direction is drawn from a wide cone around world
-	// up and re-drawn every frame, so what TAA accumulates is the *fraction* of
-	// the upper hemisphere that is blocked, not a binary answer. That difference
-	// is the whole ballgame: a single vertical ray cannot tell a warehouse
-	// ceiling (blocks everything) from a 40 cm cornice four metres up (blocks
-	// almost nothing), and treating the cornice like a ceiling took an ordinary
-	// sunlit facade to a quarter of its ambient.
-	vec3 upW = normalize( mat3( viewMatrix ) * vec3( 0.0, 1.0, 0.0 ) );
-	vec2 h2 = boHash22( screenPos + vec2( boFrameJitter * 37.0 ) );
-	// +/-20 deg. Wide enough that a 40 cm cornice four metres up is only blocking
-	// part of the cone (so an ordinary facade keeps its fill), narrow enough that
-	// a warehouse ceiling blocks all of it. Measured at +/-60 deg the cone stopped
-	// occluding ceilings reliably and the interior/exterior swing fell from 2.04
-	// to 1.86 stops; at 0 deg a cornice reads like a ceiling.
-	float cz = mix( 1.0, 0.94, h2.x );
-	float sz = sqrt( max( 1.0 - cz * cz, 0.0 ) );
-	float ph = h2.y * 6.2831853;
-	vec3 ax = normalize( cross( upW, abs( upW.z ) < 0.9 ? vec3( 0.0, 0.0, 1.0 ) : vec3( 1.0, 0.0, 0.0 ) ) );
-	vec3 ay = cross( upW, ax );
-	vec3 upView = normalize( upW * cz + ( ax * cos( ph ) + ay * sin( ph ) ) * sz );
-	// Never sample into the surface itself.
-	upView = normalize( upView + viewNormal * max( 0.0, 0.18 - dot( upView, viewNormal ) ) );
-
-	float roofBias = 0.06 + viewZ * 0.012;
-	vec3 ro = viewPos + viewNormal * roofBias;
-	float jit = fract( boIGN( screenPos + vec2( 3.11, 11.73 ) ) + boFrameJitter );
-	float roof = 0.0;
-	for ( int i = 0; i < 8; i ++ ) {
-		float t = ( ( float( i ) + jit ) / 8.0 );
-		t = t * t * radius;                       // dense near the surface
-		vec3 p = ro + upView * t;
-		vec4 clip = proj * vec4( p, 1.0 );
-		if ( clip.w <= 0.0 ) break;
-		vec2 uv = clip.xy / clip.w * 0.5 + 0.5;
-		if ( any( lessThan( uv, vec2( 0.0 ) ) ) || any( greaterThan( uv, vec2( 1.0 ) ) ) ) break;
-		float sz = boLinearDepth( texture( boSceneDepth, uv ).r,
-		                          boCameraParams.x, boCameraParams.y );
-		float diff = ( - p.z ) - sz;
-		// Behind something, but not behind the whole world: a thickness window
-		// keeps a distant building from acting as everyone's ceiling.
-		if ( diff > roofBias && diff < 8.0 ) { roof = 1.0 - 0.5 * ( t / radius ); break; }
-	}
-	occ = max( occ, roof * 0.92 );
-	// Bare sky above and nothing in the hemisphere: force the term to exactly 1
-	// so an open street is bit-identical to the term being switched off.
-	occ = ( roof <= 0.0 && occ < 0.02 ) ? 0.0 : occ;
+	occ = boSat( occ / max( wsum, 1e-4 ) );
+	openness = boSat( 1.0 - occOpen * 0.125 );
 
 	float vis = mix( boSkyOccParams.z, 1.0, pow( 1.0 - occ, boSkyOccParams.w ) );
 	// A negative strength means "full strength, and paint me" — see the debug
 	// branch in MaterialPatch's G-buffer write. Blending toward 1 with a negative
 	// weight would extrapolate and report a number the shading never used.
 	if ( boSkyOccParams.x < 0.0 ) return vis;
+	openness = mix( 1.0, openness, boSkyOccParams.x );
 	return mix( 1.0, vis, boSkyOccParams.x );
 }
 

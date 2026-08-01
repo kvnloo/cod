@@ -113,6 +113,15 @@ export function burntCar(chunk: Chunk, x: number, z: number, yaw: number, seed: 
 /* ----------------------------------------------------------------- tram -- */
 
 /**
+ * Roll of the two half-cars, in radians, and their mean.
+ *
+ * Exported because the acceptance vantages in `build/Dressing.ts` are placed on
+ * the normal of the square-facing flank: if this lean is ever re-tuned the
+ * cameras that grade it follow, instead of quietly grading a different face.
+ */
+export const TRAM_LEAN = { lead: -0.2269, trail: -0.1745, mean: -0.2007 } as const;
+
+/**
  * A toppled articulated tram lying on its side across the square. The single
  * most valuable piece of cover on the map: it turns one 55 m sightline into
  * two short ones and gives both approaches a vaulting point.
@@ -125,24 +134,30 @@ export function toppledTram(chunk: Chunk, x: number, z: number, yaw: number): vo
   const y = groundHeightAt(x, z);
 
   const L = 6.6, H = 1.6, W = 1.25;
-  // Rolled −50°, and the sign matters.
-  //
-  // Flat on its side a tram shows the player either its roof or its underframe,
-  // and both read as an anonymous corrugated wall. Standing on one corner — the
-  // original +56° — it read as an abstract monolith floating over the cobbles,
-  // because the face aimed down the hero sightline was the blank end cap and
-  // the contact edge was hidden behind its own overhang.
-  //
-  // Half-toppled and rolled *toward* the southern approach, the flank the
-  // player sees is the one carrying the window band, the door recesses and the
-  // livery, with the bogies and the buckled underframe exposed along the bottom
-  // edge. It reads as a tram from 40 m.
-  //
-  // The pivot is the underside of the floor pan, so the roll is paid back in
-  // height: +0.85 buries the leading edge 9 cm in the cobbles — no gap to see
-  // under — and puts the top of the shell at 3.8 m, which is what makes it the
-  // sightline break the square is built around.
-  const roll = -Math.PI * 0.28;
+  /**
+   * Derailed and keeled over, **not** rolled on to its side.
+   *
+   * The previous −50° roll was the reason this object was unidentifiable. A
+   * tram is read almost entirely from one cue — a long continuous horizontal
+   * band of glass at head height with painted panel above and below it — and
+   * rolling the shell 50° takes that band off the vertical entirely: the flank
+   * facing the square becomes a 50° slope, so the glazing reads as a skylight,
+   * the cream waist band rotates up next to the roof edge and reads as
+   * tarpaulin, and the silhouette collapses to a wedge. Blind critics called it
+   * a shed at 8 m, a skip at 10 m and a shipping container at 22 m.
+   *
+   * 10–13° is what a tram that has come off the rails and dropped a bogie
+   * actually does, and it keeps every cue where the eye expects it: the flanks
+   * stay within 13° of vertical, the glazing band lands 1.57–2.13 m above the
+   * cobbles on both faces, the livery stays on the sides, the roof stays on
+   * top with its resistor bank and pantograph against the sky, and the low side
+   * digs its wheels into the setts while the high side lifts clear of them.
+   *
+   * `lift` is solved from the roll rather than authored, so the shell always
+   * meets the ground the same way whatever the lean: the lowest corner of the
+   * body sits 2 cm clear of the paving and the bogie on that side is buried.
+   */
+  const bodyLift = (roll: number): number => 0.02 - (W * Math.sin(roll) + 0.032 * Math.cos(roll));
 
   // Jackknifed, and the two half-cars are *not* copies.
   //
@@ -152,23 +167,46 @@ export function toppledTram(chunk: Chunk, x: number, z: number, yaw: number): vo
   // the leading car takes the damage: so each half now gets its own yaw and
   // roll about the articulation point, its own bay count, its own door
   // positions and its own state of repair.
+  const rollLead = TRAM_LEAN.lead, rollTrail = TRAM_LEAN.trail;   // −13° and −10°
+  const roll = TRAM_LEAN.mean;
   const segYaw = { '-1': yaw - 0.115, '1': yaw + 0.10 } as Record<string, number>;
-  const segRoll = { '-1': roll - 0.055, '1': roll + 0.035 } as Record<string, number>;
+  const segRoll = { '-1': rollLead, '1': rollTrail } as Record<string, number>;
+
+  /* Band layout, authored against the upright shell (0 → 3.17 local) and then
+   * checked against the post-roll world heights, which is the step the old
+   * version skipped. */
+  const bandY = H + 0.02, bandH = 0.38;               // glazing 1.24 – 2.00
+  const railUp = H + 0.46, railDn = H - 0.43;         // waist rails
+  const liveryY = H + 0.78, liveryH = 0.26;           // cream 2.12 – 2.64
+  const skirtY = H - 0.64, skirtH = 0.09;             // lower stripe
 
   for (const seg of [-1, 1]) {
     const lead = seg === -1;                          // the car that ploughed
-    body.pushTRS(x, y + 0.85, z, segYaw[String(seg)], 0, segRoll[String(seg)]);
+    body.pushTRS(x, y + bodyLift(segRoll[String(seg)]), z, segYaw[String(seg)], 0, segRoll[String(seg)]);
     glass.push(body.matrix);
     rustM.push(body.matrix);
     cream.push(body.matrix);
+    /**
+     * Saloon interior behind every pane.
+     *
+     * `glassDirty` is authored at opacity 0.26, so a pane laid straight on an
+     * opaque flank composites 74% of the *body paint* and renders as a slightly
+     * shiny panel the same value as the shell — which is why the window band
+     * measured as decoration rather than as glazing. A near-black reveal one
+     * centimetre behind each pane, sized slightly proud of it, gives the band
+     * both the dark interior a real window has and a visible frame, and it is
+     * the single strongest identification cue the shape has at 40 m.
+     */
+    const cabin = chunk.m('rubber');
+    cabin.push(body.matrix);
     const cz = seg * (L * 0.52);
     body.chamferBox(0, H, cz, W, H * 0.98, L * 0.5, 0.05, 2.0);
     // Cream livery band along the waist — the single strongest read at
     // distance, and the reason the shell stops looking like a shipping
     // container.
     for (const sx of [-1, 1]) {
-      cream.box(sx * (W + 0.006), H + 0.86, cz, 0.006, 0.26, L * 0.49, 1.6);
-      cream.box(sx * (W + 0.006), H - 0.62, cz, 0.006, 0.09, L * 0.49, 1.6);
+      cream.box(sx * (W + 0.006), liveryY, cz, 0.006, liveryH, L * 0.49, 1.6);
+      cream.box(sx * (W + 0.006), skirtY, cz, 0.006, skirtH, L * 0.49, 1.6);
     }
     // Window band.
     //
@@ -181,21 +219,23 @@ export function toppledTram(chunk: Chunk, x: number, z: number, yaw: number): vo
     const step = (L * 0.84) / (bays - 1);
     for (let i = 0; i < bays; i++) {
       const wz = cz - L * 0.42 + i * step;
-      // The leading car lost two panes and has one blown out of its frame.
-      if (lead && (i === 1 || i === 3)) continue;
+      // The leading car lost two panes; the reveal stays, so a blown-out window
+      // reads as an empty frame rather than as a missing bay.
+      const blown = lead && (i === 1 || i === 3);
       for (const sx of [-1, 1]) {
-        glass.box(sx * (W + 0.006), H + 0.35, wz, 0.008, 0.4, step * 0.4, { unit: true });
+        cabin.box(sx * (W + 0.004), bandY, wz, 0.012, bandH + 0.02, step * 0.44, 1.0);
+        if (!blown) glass.box(sx * (W + 0.024), bandY, wz, 0.006, bandH * 0.9, step * 0.38, { unit: true });
       }
     }
     for (let i = 0; i < bays - 1; i++) {
       const pz = cz - L * 0.42 + (i + 0.5) * step;
       for (const sx of [-1, 1]) {
-        body.box(sx * (W + 0.012), H + 0.35, pz, 0.018, 0.42, step * 0.12, 1.0);
+        body.box(sx * (W + 0.012), bandY, pz, 0.018, bandH + 0.02, step * 0.12, 1.0);
       }
     }
     for (const sx of [-1, 1]) {
-      rustM.box(sx * (W + 0.012), H + 0.79, cz, 0.014, 0.045, L * 0.48, 1.2);
-      rustM.box(sx * (W + 0.012), H - 0.08, cz, 0.014, 0.045, L * 0.48, 1.2);
+      rustM.box(sx * (W + 0.012), railUp, cz, 0.014, 0.045, L * 0.48, 1.2);
+      rustM.box(sx * (W + 0.012), railDn, cz, 0.014, 0.045, L * 0.48, 1.2);
     }
     // Passenger doors: the leading car has a single wide door aft of centre,
     // the trailing car a pair either side of its bogie — different rhythms, so
@@ -204,8 +244,13 @@ export function toppledTram(chunk: Chunk, x: number, z: number, yaw: number): vo
     for (const dOff of doors) {
       const dz = cz - seg * L * dOff;
       for (const sx of [-1, 1]) {
-        body.box(sx * (W - 0.035), H - 0.05, dz, 0.045, H * 0.86, lead ? 0.78 : 0.55, 1.2);
-        rustM.box(sx * (W + 0.006), H - 0.05, dz, 0.01, H * 0.86, 0.02, 0.6);
+        // Door leaf from the step to just above the window head, not the whole
+        // flank: the break has to read against the glazing band, not swallow it.
+        body.box(sx * (W - 0.035), H - 0.35, dz, 0.045, H * 0.72, lead ? 0.78 : 0.55, 1.2);
+        rustM.box(sx * (W + 0.006), H - 0.35, dz, 0.01, H * 0.72, 0.02, 0.6);
+        // Glazed upper half of the door, level with the saloon windows.
+        cabin.box(sx * (W + 0.004), bandY, dz, 0.012, bandH * 0.9, (lead ? 0.74 : 0.52), 1.0);
+        glass.box(sx * (W + 0.024), bandY, dz, 0.006, bandH * 0.8, (lead ? 0.68 : 0.46), { unit: true });
       }
     }
     // Roof: a dark, sooted deck carrying real equipment, not a clean corrugated
@@ -238,10 +283,13 @@ export function toppledTram(chunk: Chunk, x: number, z: number, yaw: number): vo
     const ez = seg * (L * 1.02);
     body.box(0, H + 0.15, ez, W * 0.98, H * 0.72, 0.06, 1.4);
     if (!lead) {
-      glass.box(0, H + 0.62, ez + seg * 0.035, W * 0.82, 0.44, 0.008, { unit: true });
+      // Windscreen head aligned with the saloon band so the horizontal reads
+      // right round the corner — that continuity is most of the "tram" cue.
+      cabin.box(0, bandY + 0.08, ez + seg * 0.02, W * 0.86, bandH + 0.10, 0.012, 1.0);
+      glass.box(0, bandY + 0.08, ez + seg * 0.045, W * 0.80, bandH + 0.06, 0.006, { unit: true });
     } else {
       // Windscreen gone, cab roof stove in on the impact corner.
-      rustM.box(0, H + 0.62, ez + seg * 0.03, W * 0.82, 0.05, 0.03, 0.5);
+      rustM.box(0, bandY + 0.16, ez + seg * 0.03, W * 0.82, 0.05, 0.03, 0.5);
       body.pushTRS(W * 0.45, H * 2 - 0.12, ez - seg * 0.35, 0, 0, -0.32);
       body.box(0, 0, 0, W * 0.5, 0.05, 0.55, 1.2);
       body.pop();
@@ -270,14 +318,20 @@ export function toppledTram(chunk: Chunk, x: number, z: number, yaw: number): vo
     wh.pop();
 
     if (!lead) {
-      // Pantograph, folded and bent — only the trailing car carries one.
+      // Pantograph, sprung half-open and bent over. With the shell upright this
+      // is the one part of the silhouette that is unambiguously electric
+      // traction, so it reads against the sky rather than lying along the deck.
       const pan = chunk.m('rust');
       pan.push(body.matrix);
-      pan.tube([V3(0, H * 2, 0.6), V3(0.5, H * 2 + 0.6, 1.3), V3(-0.2, H * 2 + 0.75, 2.1)], 0.035, 5, false, 0.5);
-      pan.tube([V3(0, H * 2, 0.6), V3(0.35, H * 2 + 0.75, 0.9)], 0.03, 5, false, 0.5);
+      pan.tube([V3(-0.5, H * 2 + 0.04, 0.5), V3(0.05, H * 2 + 1.05, 1.15), V3(-0.42, H * 2 + 1.72, 2.0)], 0.036, 5, false, 0.5);
+      pan.tube([V3(0.5, H * 2 + 0.04, 0.5), V3(0.05, H * 2 + 1.05, 1.15)], 0.032, 5, false, 0.5);
+      pan.tube([V3(-0.55, H * 2 + 1.66, 2.0), V3(0.55, H * 2 + 1.78, 2.0)], 0.028, 4, false, 0.4);
+      // Pan base insulators.
+      for (const sx of [-1, 1]) pan.box(sx * 0.5, H * 2 + 0.02, 0.5, 0.07, 0.06, 0.07, 0.3);
       pan.pop();
     }
 
+    cabin.pop();
     glass.pop();
     rustM.pop();
     cream.pop();
@@ -288,36 +342,47 @@ export function toppledTram(chunk: Chunk, x: number, z: number, yaw: number): vo
    * The joint is the thing that proves this is one vehicle and not two. It
    * gets a turntable ring, a concertina wide enough to bridge the fold, and
    * the torn skirt plates that pulled apart when the cars jackknifed. */
+  const midLift = bodyLift(roll);
   const bel = chunk.m('rubber');
-  bel.pushTRS(x, y + 0.85, z, yaw - 0.01, 0, roll - 0.01);
+  bel.pushTRS(x, y + midLift, z, yaw - 0.01, 0, roll - 0.01);
   for (let i = 0; i < 7; i++) {
     const t = (i - 3) * 0.115;
     bel.box(0, H, t, W * 0.93 + (i % 2) * 0.055, H * 0.88, 0.055, 0.6);
   }
   bel.pop();
   const ring = chunk.m('steel');
-  ring.pushTRS(x, y + 0.85, z, yaw - 0.01, 0, roll - 0.01);
+  ring.pushTRS(x, y + midLift, z, yaw - 0.01, 0, roll - 0.01);
   ring.box(0, 0.1, 0, W * 0.92, 0.09, 0.5, 0.8);
   for (const sx of [-1, 1]) ring.box(sx * W * 0.96, H, 0, 0.04, H * 0.5, 0.42, 0.6);
   ring.pop();
 
   /* --- contact ---------------------------------------------------------
    * Nothing sells weight like the ground giving way under it. A berm of dirt
-   * and ripped setts is banked along the underside for the full length, so
-   * there is no gap to see under and no clean line where shell meets paving. */
+   * and ripped setts is banked along both flanks for the full length, heavier
+   * on the low side where the bogie is buried.
+   *
+   * The two basis vectors below were swapped: `(cos yaw, sin yaw)` is the
+   * *across* axis of a `pushTRS(_, _, _, yaw)` transform, not the along axis,
+   * so the berm, the thrown debris and the derailment gouge all ran across the
+   * car instead of down it — a 14 m ridge of dirt at right angles to the tram
+   * and a scar that pointed at nothing. */
   const rand = new Rand(6601);
   const dirt = chunk.m('dirt');
-  const ux = Math.cos(yaw), uz = Math.sin(yaw);      // along the car
-  const nx = -uz, nz = ux;                            // across it
-  for (let i = 0; i <= 24; i++) {
-    const t = (i / 24 - 0.5) * L * 2.15;
-    const side = Math.sin(i * 2.7) * 0.35;
-    const bx = x + ux * t + nx * (0.35 + side);
-    const bz = z + uz * t + nz * (0.35 + side);
-    const s = 0.5 + 0.28 * Math.abs(Math.sin(i * 1.7));
-    dirt.pushTRS(bx, groundHeightAt(bx, bz) + 0.02, bz, yaw + rand.range(-0.3, 0.3));
-    dirt.lump(s, 7, 4, (k) => 0.4 + 0.3 * frac(Math.sin((k + i * 5) * 12.9898) * 43758.5), 1.2);
-    dirt.pop();
+  const ux = Math.sin(yaw), uz = Math.cos(yaw);      // along the car (local +Z)
+  const nx = Math.cos(yaw), nz = -Math.sin(yaw);     // across it   (local +X)
+  for (const sideSign of [1, -1]) {
+    const heavy = sideSign > 0 ? 1.0 : 0.72;         // low flank gets the bank
+    for (let i = 0; i <= 22; i++) {
+      const t = (i / 22 - 0.5) * L * 2.05;
+      const jitter = Math.sin(i * 2.7 + sideSign) * 0.16;
+      const c = sideSign * (1.30 + jitter);
+      const bx = x + ux * t + nx * c;
+      const bz = z + uz * t + nz * c;
+      const s = (0.42 + 0.24 * Math.abs(Math.sin(i * 1.7 + sideSign))) * heavy;
+      dirt.pushTRS(bx, groundHeightAt(bx, bz) + 0.02, bz, yaw + rand.range(-0.3, 0.3));
+      dirt.lump(s, 7, 4, (k) => 0.4 + 0.3 * frac(Math.sin((k + i * 5) * 12.9898) * 43758.5), 1.2);
+      dirt.pop();
+    }
   }
 
   // Debris and glass thrown out from the impact.
@@ -345,7 +410,10 @@ export function toppledTram(chunk: Chunk, x: number, z: number, yaw: number): vo
   const torn = chunk.m('setts');
   const ballast = chunk.m('gravel');
   const start = { x: 0.9, z: -21.5 };                 // still on the alignment
-  const nose = { x: x + ux * L * 0.95, z: z + uz * L * 0.95 };
+  // The gouge ends under the *leading* car (local −Z), which is the end that
+  // ploughed; it used to be computed off the trailing end and off the wrong
+  // basis vector, so it pointed away from the vehicle entirely.
+  const nose = { x: x - ux * L * 0.95, z: z - uz * L * 0.95 };
   const steps = 22;
   for (let i = 0; i <= steps; i++) {
     const t = i / steps;

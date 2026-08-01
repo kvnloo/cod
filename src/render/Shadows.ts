@@ -12,9 +12,32 @@
  * kernel widens to match. Bias is normal-offset plus slope-scaled, both scaled
  * by the cascade's world texel size so cascade 0 is tight and cascade 3 is
  * forgiving.
+ *
+ * ## Two depth materials, not one
+ *
+ * The atlas is drawn with `scene.overrideMaterial`, which is the cheapest thing
+ * a depth pass can do: one program, one uniform block, no per-mesh state. It is
+ * also blind to alpha, so every alpha-cut card in the level — foliage, ivy,
+ * bar grating, chainlink — used to be *excluded from casting altogether*
+ * (`Scatter.ts` / `Chunk.ts` both zero `castShadow` for them) because the
+ * alternative was a solid black quad under every bush and a plywood panel where
+ * a wire fence should be.
+ *
+ * So the fast path stays exactly as it was, and alpha-cut geometry opts out of
+ * it. three's `Material.allowOverride` flag lets one material refuse the scene
+ * override, so each alpha-cut material gets a matching depth variant that
+ * reproduces its own alpha lookup — triplanar or uv, with the same per-instance
+ * jitter — and discards below the same threshold.
+ *
+ * On the shipped level that is 17 meshes carrying 299 instances paying one
+ * texture fetch and a discard, against ~1475 atlas draws that pay nothing. The
+ * measured price is +61 draws and +4% of atlas draw time; what it buys is a
+ * chainlink fence that throws a mesh pattern and a bush that throws dapple.
  */
 
 import * as THREE from 'three';
+import { settings } from '../core/Settings';
+import { materialUniforms } from '../material/MaterialShaders';
 import { skipPatch } from './MaterialPatch';
 import type { RenderUniforms } from './RenderUniforms';
 import { CSM_MAX } from './RenderUniforms';
@@ -43,6 +66,123 @@ export interface ShadowConfig {
   lambda: number;
 }
 
+/* --------------------------------------------------------- alpha casters -- */
+
+/**
+ * Sun elevation the caster budget is authored against, as a tangent.
+ *
+ * Mirrors `SHADOW_TAN` / `MIN_SHADOW` in `src/world/props/Scatter.ts`, which is
+ * where the same test is applied to solid props. It is duplicated rather than
+ * imported because the two live in different packages and the renderer must not
+ * depend on the level's prop tables — but the numbers must agree, or a bush
+ * would be adopted here on a rule the brick beside it fails.
+ *
+ * The level's hero hour puts the sun at 32.4°, so an object throws
+ * `height / tan(32.4°)` across the ground. 12 cm of projected shadow is the
+ * floor worth an atlas draw: comfortably above the 0.9 / 2.0 / 4.9 cm texel
+ * footprints of the first three cascades, and about a fist at 3 m.
+ */
+const SHADOW_TAN = 0.635;
+const MIN_SHADOW = 0.12;
+/** 7.6 cm. Below this a card is lying on the surface that receives its shadow. */
+const MIN_CASTER_HEIGHT = MIN_SHADOW * SHADOW_TAN;
+
+/** Frames between full scene walks looking for newly built alpha-cut geometry. */
+const RESCAN_INTERVAL = 30;
+
+/** How many instances of a cluster are measured for the height gate. */
+const HEIGHT_SAMPLES = 64;
+
+/** One adopted alpha-cut caster and the state needed to put it back. */
+interface AlphaCaster {
+  mesh: THREE.Mesh;
+  /** Alpha-tested depth variant of `source`, shared by every mesh using it. */
+  depth: THREE.Material;
+  /** The mesh's own material, restored the moment the atlas is done. */
+  source: THREE.Material;
+  /** `castShadow` as the level authored it, restored if the path is disabled. */
+  authored: boolean;
+  /** Tallest instance, world space, metres. */
+  height: number;
+}
+
+const ALPHA_VERT_PARS = /* glsl */ `
+#ifdef OBS_TRIPLANAR
+  varying vec3 vObsWorld;
+  varying vec3 vObsNormal;
+#endif
+#ifdef OBS_INSTANCE_VAR
+  attribute vec4 obVar;
+  varying float vObsVar;
+#endif
+`;
+
+const ALPHA_VERT_BODY = /* glsl */ `
+#ifdef OBS_TRIPLANAR
+  {
+    vec4 obsP = vec4(transformed, 1.0);
+    vec3 obsN = normal;
+    #ifdef USE_INSTANCING
+      obsP = instanceMatrix * obsP;
+      obsN = mat3(instanceMatrix) * obsN;
+    #endif
+    vObsWorld = (modelMatrix * obsP).xyz;
+    vObsNormal = normalize(mat3(modelMatrix) * obsN);
+  }
+#endif
+#ifdef OBS_INSTANCE_VAR
+  vObsVar = obVar.w;
+#endif
+`;
+
+const ALPHA_FRAG_PARS = /* glsl */ `
+#ifdef OBS_TRIPLANAR
+  varying vec3 vObsWorld;
+  varying vec3 vObsNormal;
+  uniform float obTileScale;
+  uniform float obTriSharp;
+#endif
+#ifdef OBS_INSTANCE_VAR
+  varying float vObsVar;
+#endif
+`;
+
+/**
+ * The cut-out, evaluated exactly the way the lit material evaluates it.
+ *
+ * `MaterialShaders.ts` puts the mask in the albedo map's alpha channel and
+ * reads it through whichever mapping the archetype uses: world-space triplanar
+ * for grating, plain uv for foliage cards, both offset by the per-instance
+ * jitter in `obVar.w`. Sampling it any other way would put a shadow on the
+ * ground that does not match the object standing over it, which is worse than
+ * no shadow — so this block is a transcription, not an approximation.
+ */
+const ALPHA_FRAG_TEST = /* glsl */ `
+#ifdef USE_ALPHATEST
+  {
+    #ifdef OBS_INSTANCE_VAR
+      float obsJ = vObsVar;
+    #else
+      float obsJ = 0.0;
+    #endif
+    #ifdef OBS_TRIPLANAR
+      vec3 obsN = normalize(vObsNormal);
+      vec3 obsW = pow(abs(obsN), vec3(obTriSharp));
+      obsW /= (obsW.x + obsW.y + obsW.z + 1e-5);
+      vec3 obsS = sign(obsN + vec3(1e-6));
+      vec3 obsP = vObsWorld * obTileScale + obsJ;
+      float obsA =
+          texture2D(map, vec2(-obsP.z * obsS.x, obsP.y)).a * obsW.x
+        + texture2D(map, vec2( obsP.x, -obsP.z * obsS.y)).a * obsW.y
+        + texture2D(map, vec2( obsP.x * obsS.z, obsP.y)).a * obsW.z;
+    #else
+      float obsA = texture2D(map, vMapUv + obsJ).a;
+    #endif
+    if (obsA < alphaTest) discard;
+  }
+#endif
+`;
+
 export class ShadowSystem {
   private renderer!: THREE.WebGLRenderer;
   private uniforms!: RenderUniforms;
@@ -67,6 +207,33 @@ export class ShadowSystem {
   private readonly lightBasis = new THREE.Matrix4();
   private readonly lightBasisInv = new THREE.Matrix4();
   private readonly invProj = new THREE.Matrix4();
+  private readonly instM = new THREE.Matrix4();
+  private readonly instBox = new THREE.Box3();
+
+  /* --- alpha-cut casters */
+  private alphaWanted = true;
+  private alphaActive = false;
+  /** Debug-only: adopt the cards but cast them through the opaque fast path. */
+  private alphaSolid = false;
+  private alphaCasters: AlphaCaster[] = [];
+  /** Alpha-cut geometry the height gate turned down, kept for the census. */
+  private alphaRejected: { name: string; height: number; instances: number }[] = [];
+  private readonly alphaRecords = new WeakMap<THREE.Mesh, AlphaCaster>();
+  private readonly alphaDepthCache = new WeakMap<THREE.Material, THREE.Material | null>();
+  private readonly alphaHeights = new WeakMap<THREE.Mesh, number>();
+  private readonly alphaOwned: THREE.Material[] = [];
+  private frame = 0;
+  private lastCalls = 0;
+  private lastTriangles = 0;
+  private rescanMs = 0;
+  private rescans = 0;
+  private last: {
+    scene: THREE.Scene;
+    camera: THREE.PerspectiveCamera;
+    sunDir: THREE.Vector3;
+    index: SceneIndex;
+    cfg: ShadowConfig;
+  } | null = null;
 
   init(renderer: THREE.WebGLRenderer, uniforms: RenderUniforms): void {
     this.renderer = renderer;
@@ -76,6 +243,7 @@ export class ShadowSystem {
       side: THREE.DoubleSide,
     }));
     this.depthMaterial.colorWrite = false;
+    this.installDebugHandle();
 
     for (let i = 0; i < CSM_MAX; i++) {
       const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 100);
@@ -163,6 +331,9 @@ export class ShadowSystem {
     const target = this.target;
     if (!target) return;
 
+    this.last = { scene, camera, sunDir, index, cfg };
+    this.syncAlphaCasters(scene);
+
     const count = this.cascadeCount;
     const near = camera.near;
     const far = Math.min(cfg.distance, camera.far);
@@ -202,6 +373,10 @@ export class ShadowSystem {
     scene.overrideMaterial = this.depthMaterial;
     scene.background = null;
     index.hideNonCasters();
+    this.bindAlphaCasters();
+
+    const callsBefore = renderer.info.render.calls;
+    const trisBefore = renderer.info.render.triangles;
 
     let prevSplit = near;
     for (let i = 0; i < count; i++) {
@@ -222,6 +397,10 @@ export class ShadowSystem {
       this.publish(i, c, splits[i]);
     }
 
+    this.lastCalls = renderer.info.render.calls - callsBefore;
+    this.lastTriangles = renderer.info.render.triangles - trisBefore;
+
+    this.unbindAlphaCasters();
     index.restoreNonCasters();
     scene.overrideMaterial = prevOverride;
     scene.background = prevBackground;
@@ -310,6 +489,331 @@ export class ShadowSystem {
     cam.matrixWorldNeedsUpdate = false;
   }
 
+  /* ------------------------------------------------------- alpha casters -- */
+
+  /**
+   * Keeps the adopted-caster list in step with the scene.
+   *
+   * A full walk is cheap (one `traverse`, a `WeakMap` hit per mesh) but not
+   * free, and the set only changes when the world builds or a district streams
+   * in, so it runs on a slow cadence. Measured on the shipped level: 0.075-0.09
+   * ms per walk in steady state, once every 30 frames — 0.003 ms/frame, against
+   * an atlas that costs 5.1 ms.
+   *
+   * It has to be a walk of the whole graph rather than of `SceneIndex.meshes`: a
+   * bush that has never once been inside the main camera's frustum is exactly
+   * the bush whose shadow should already be lying across the plaza when the
+   * player turns round.
+   */
+  private syncAlphaCasters(scene: THREE.Scene): void {
+    const want = this.alphaWanted && settings.preset !== 'low';
+    if (!want) {
+      if (this.alphaActive) this.releaseAlphaCasters();
+      this.frame = 0;
+      return;
+    }
+    const due = !this.alphaActive || this.frame % RESCAN_INTERVAL === 0;
+    this.frame++;
+    if (!due) return;
+    this.alphaActive = true;
+    const t0 = performance.now();
+
+    const found = this.alphaCasters;
+    found.length = 0;
+    this.alphaRejected.length = 0;
+    scene.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      if (mesh.isMesh !== true) return;
+      const source = mesh.material;
+      if (!source || Array.isArray(source)) return;
+      const depth = this.alphaDepthFor(source);
+      if (!depth) return;
+
+      let height = this.alphaHeights.get(mesh);
+      if (height === undefined) {
+        height = this.casterHeight(mesh);
+        this.alphaHeights.set(mesh, height);
+      }
+      // Flat ground furniture — drain grates, floor plates — lies *on* the
+      // surface that would receive its shadow. It projects nothing and
+      // self-shadows into acne, so it stays out however cheap the test is.
+      if (height < MIN_CASTER_HEIGHT) {
+        const inst = mesh as THREE.InstancedMesh;
+        this.alphaRejected.push({
+          name: mesh.name,
+          height: Math.round(height * 1000) / 1000,
+          instances: inst.isInstancedMesh === true ? inst.count : 1,
+        });
+        return;
+      }
+
+      let rec = this.alphaRecords.get(mesh);
+      if (!rec) {
+        rec = { mesh, depth, source, authored: mesh.castShadow === true, height };
+        this.alphaRecords.set(mesh, rec);
+      } else {
+        rec.depth = depth;
+        rec.source = source;
+        rec.height = height;
+      }
+      // Culling reads `castShadow` to decide whether an off-screen object is
+      // still worth publishing to the atlas, so the adoption has to be visible
+      // there and not only inside this file.
+      mesh.castShadow = true;
+      found.push(rec);
+    });
+    this.rescanMs = performance.now() - t0;
+    this.rescans++;
+  }
+
+  /** Hands every adopted mesh back to the level exactly as it was authored. */
+  private releaseAlphaCasters(): void {
+    for (let i = 0; i < this.alphaCasters.length; i++) {
+      const c = this.alphaCasters[i];
+      c.mesh.material = c.source;
+      c.mesh.castShadow = c.authored;
+    }
+    this.alphaCasters.length = 0;
+    this.alphaActive = false;
+  }
+
+  private bindAlphaCasters(): void {
+    if (this.alphaSolid) return;
+    const list = this.alphaCasters;
+    for (let i = 0; i < list.length; i++) list[i].mesh.material = list[i].depth;
+  }
+
+  private unbindAlphaCasters(): void {
+    if (this.alphaSolid) return;
+    const list = this.alphaCasters;
+    for (let i = 0; i < list.length; i++) list[i].mesh.material = list[i].source;
+  }
+
+  /**
+   * The alpha-tested depth variant of a material, or null if it does not need
+   * one. Cached per source material — three shares the compiled program across
+   * every material with the same define set, so the whole level costs at most
+   * one extra program per mapping mode.
+   */
+  private alphaDepthFor(source: THREE.Material): THREE.Material | null {
+    const hit = this.alphaDepthCache.get(source);
+    if (hit !== undefined) return hit;
+
+    const std = source as THREE.MeshStandardMaterial;
+    // Transparent materials (glass) are not cut-outs: they have no threshold to
+    // test against, and they are excluded from casting on purpose.
+    if (!(std.alphaTest > 0) || std.transparent === true) {
+      this.alphaDepthCache.set(source, null);
+      return null;
+    }
+    // Textures are generated on the GPU at boot; a material seen before its
+    // maps exist is not a permanent negative, so it is deliberately not cached.
+    const map = std.map;
+    if (!map) return null;
+
+    const defines = (std.defines ?? {}) as Record<string, string>;
+    const triplanar = defines.OB_TRIPLANAR === '1';
+    const instanceVar = defines.OB_INSTANCE_VAR === '1';
+    const u = materialUniforms(std);
+    // Two mappings this pass cannot reproduce, and would rather refuse than
+    // approximate — a shadow whose holes are in different places from the
+    // object's own holes is worse than no shadow at all:
+    //
+    //  - `OB_UV_VARY` recovers a per-panel id from screen-space derivatives of
+    //    the uv, which a depth-only pass does not have the same view of.
+    //  - a material extended without its uniform block has no tile scale, so the
+    //    triplanar lookup has no world frequency to sample at.
+    //
+    // Nothing in the shipped catalogue hits either: the only `uvVariation`
+    // material with an alpha channel is glass, which is transparent and excluded
+    // above. (`OB_POM` is not refused — it displaces the uv by at most the
+    // material's own height scale, well under a shadow texel.)
+    if (defines.OB_UV_VARY === '1' || (triplanar && !u)) {
+      this.alphaDepthCache.set(source, null);
+      return null;
+    }
+
+    const mat = skipPatch(new THREE.MeshDepthMaterial({
+      depthPacking: THREE.BasicDepthPacking,
+      side: THREE.DoubleSide,
+      alphaTest: std.alphaTest,
+      map,
+    }));
+    mat.colorWrite = false;
+    // The one line that makes this possible: `scene.overrideMaterial` is what
+    // the opaque fast path is built on, and this material declines it.
+    mat.allowOverride = false;
+    mat.name = `csm:alpha:${std.name || 'material'}`;
+
+    const defs: Record<string, string> = {};
+    if (triplanar) defs.OBS_TRIPLANAR = '1';
+    if (instanceVar) defs.OBS_INSTANCE_VAR = '1';
+    mat.defines = defs;
+
+    mat.onBeforeCompile = (shader) => {
+      if (u) {
+        shader.uniforms.obTileScale = u.obTileScale;
+        shader.uniforms.obTriSharp = u.obTriSharp;
+      }
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', `#include <common>\n${ALPHA_VERT_PARS}`)
+        .replace('#include <project_vertex>', `#include <project_vertex>\n${ALPHA_VERT_BODY}`);
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', `#include <common>\n${ALPHA_FRAG_PARS}`)
+        // The stock chunk samples the albedo map a second time, at the uv the
+        // triplanar path does not use, to build a colour this pass never writes.
+        .replace('#include <map_fragment>', '')
+        .replace('#include <alphatest_fragment>', ALPHA_FRAG_TEST);
+    };
+    const key = `csm-alpha|${triplanar ? 'tri' : 'uv'}|${instanceVar ? 'var' : 'flat'}`;
+    mat.customProgramCacheKey = () => key;
+
+    this.alphaOwned.push(mat);
+    this.alphaDepthCache.set(source, mat);
+    return mat;
+  }
+
+  /**
+   * World-space height of the tallest instance, which is what decides whether
+   * this thing projects anything on to the ground.
+   *
+   * Planar radius is deliberately not consulted: a wide flat plate does not
+   * lengthen a shadow, it only widens one that is already coincident with the
+   * floor underneath it.
+   */
+  private casterHeight(mesh: THREE.Mesh): number {
+    const geo = mesh.geometry;
+    if (!geo.boundingBox) geo.computeBoundingBox();
+    const bb = geo.boundingBox;
+    if (!bb) return 0;
+
+    const inst = mesh as THREE.InstancedMesh;
+    if (inst.isInstancedMesh === true && inst.count > 0) {
+      let best = 0;
+      const step = Math.max(1, Math.ceil(inst.count / HEIGHT_SAMPLES));
+      for (let i = 0; i < inst.count; i += step) {
+        inst.getMatrixAt(i, this.instM);
+        this.instM.premultiply(mesh.matrixWorld);
+        this.instBox.copy(bb).applyMatrix4(this.instM);
+        best = Math.max(best, this.instBox.max.y - this.instBox.min.y);
+      }
+      return best;
+    }
+    this.instBox.copy(bb).applyMatrix4(mesh.matrixWorld);
+    return this.instBox.max.y - this.instBox.min.y;
+  }
+
+  /**
+   * Automation handle, mirroring `__RENDER__`. Nothing in the frame loop reads
+   * it; it exists so an acceptance script can A/B the alpha path against the
+   * exact build it is grading instead of against a different one.
+   */
+  private installDebugHandle(): void {
+    (globalThis as unknown as Record<string, unknown>).__SHADOWS__ = {
+      /**
+       * `true` ships. `false` is the pre-wave behaviour (cards excluded from
+       * the atlas). `'solid'` adopts them but casts them through the opaque
+       * override — the black-rectangle-under-every-bush failure this whole
+       * path exists to avoid, kept renderable so the A/B can show it.
+       */
+      setAlpha: (mode: boolean | string) => {
+        this.alphaSolid = mode === 'solid';
+        this.alphaWanted = mode !== false;
+      },
+      state: () => ({
+        wanted: this.alphaWanted,
+        solid: this.alphaSolid,
+        active: this.alphaActive,
+        meshes: this.alphaCasters.length,
+        instances: this.alphaCasters.reduce((n, c) => {
+          const inst = c.mesh as THREE.InstancedMesh;
+          return n + (inst.isInstancedMesh === true ? inst.count : 1);
+        }, 0),
+        rejected: this.alphaRejected.slice(),
+        atlasCalls: this.lastCalls,
+        atlasTriangles: this.lastTriangles,
+        rescanMs: this.rescanMs,
+        rescans: this.rescans,
+        rescanInterval: RESCAN_INTERVAL,
+      }),
+      census: () => this.alphaCasters.map((c) => {
+        const inst = c.mesh as THREE.InstancedMesh;
+        this.instBox.setFromObject(c.mesh);
+        const r3 = (v: number) => Math.round(v * 100) / 100;
+        return {
+          name: c.mesh.name,
+          material: c.source.name,
+          instances: inst.isInstancedMesh === true ? inst.count : 1,
+          height: Math.round(c.height * 1000) / 1000,
+          triplanar: ((c.depth.defines ?? {}) as Record<string, string>).OBS_TRIPLANAR === '1',
+          visible: c.mesh.visible,
+          box: [
+            r3(this.instBox.min.x), r3(this.instBox.min.y), r3(this.instBox.min.z),
+            r3(this.instBox.max.x), r3(this.instBox.max.y), r3(this.instBox.max.z),
+          ],
+        };
+      }),
+      /** World positions of every instance of the adopted meshes matching `q`. */
+      locate: (q: string) => {
+        const out: { name: string; at: number[] }[] = [];
+        for (const c of this.alphaCasters) {
+          if (!c.mesh.name.includes(q)) continue;
+          const inst = c.mesh as THREE.InstancedMesh;
+          const n = inst.isInstancedMesh === true ? inst.count : 1;
+          for (let i = 0; i < n; i++) {
+            if (inst.isInstancedMesh === true) {
+              inst.getMatrixAt(i, this.instM);
+              this.instM.premultiply(c.mesh.matrixWorld);
+            } else {
+              this.instM.copy(c.mesh.matrixWorld);
+            }
+            this.tmpV.setFromMatrixPosition(this.instM);
+            out.push({
+              name: c.mesh.name,
+              at: [
+                Math.round(this.tmpV.x * 100) / 100,
+                Math.round(this.tmpV.y * 100) / 100,
+                Math.round(this.tmpV.z * 100) / 100,
+              ],
+            });
+          }
+        }
+        return out;
+      },
+      bench: (iters?: number, cfg?: Partial<ShadowConfig>) => this.bench(iters ?? 40, cfg),
+    };
+  }
+
+  /**
+   * Times the atlas on its own.
+   *
+   * Frame time cannot answer "what did this cost the shadow pass" — the atlas is
+   * a few percent of it. This re-renders the atlas `iters` times from the last
+   * frame's arguments and blocks on `finish()`, so the number returned is submit
+   * plus GPU for the depth passes and nothing else.
+   */
+  private bench(iters: number, override?: Partial<ShadowConfig>): unknown {
+    const l = this.last;
+    if (!l) return null;
+    const gl = this.renderer.getContext();
+    const cfg = override ? { ...l.cfg, ...override } : l.cfg;
+    const once = (n: number) => {
+      const calls = this.renderer.info.render.calls;
+      const tris = this.renderer.info.render.triangles;
+      const t0 = performance.now();
+      for (let i = 0; i < n; i++) this.render(l.scene, l.camera, l.sunDir, l.index, cfg);
+      gl.finish();
+      const ms = (performance.now() - t0) / n;
+      return {
+        ms,
+        calls: (this.renderer.info.render.calls - calls) / n,
+        triangles: (this.renderer.info.render.triangles - tris) / n,
+      };
+    };
+    once(Math.min(10, iters));
+    return once(iters);
+  }
+
   private publish(i: number, c: Cascade, splitFar: number): void {
     const u = this.uniforms;
     const m = u.boCsmMatrix.value[i];
@@ -326,6 +830,10 @@ export class ShadowSystem {
   }
 
   dispose(): void {
+    this.releaseAlphaCasters();
+    for (const m of this.alphaOwned) m.dispose();
+    this.alphaOwned.length = 0;
+    this.last = null;
     this.target?.dispose();
     this.depthTexture?.dispose();
     this.depthMaterial.dispose();

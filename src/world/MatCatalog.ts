@@ -18,7 +18,7 @@
 
 import * as THREE from 'three';
 import type { SurfaceType } from '../core/Surfaces';
-import type { MaterialSystem, MaterialOptions } from '../material/MaterialLibrary';
+import { materialUniforms, type MaterialSystem, type SurfaceOptions } from '../material/MaterialLibrary';
 
 export type MatKey =
   /* masonry & render */
@@ -67,7 +67,7 @@ export type FixtureClass =
 interface MatDef {
   archetype: string;
   surface: SurfaceType;
-  opts?: MaterialOptions;
+  opts?: SurfaceOptions;
   /** Flat colour used when the material library is unavailable. */
   fallback: number;
   /** Backdrop-style materials skip the procedural stack entirely. */
@@ -143,19 +143,49 @@ const D: Record<MatKey, MatDef> = {
    * removes local variation rather than adding it. The hard-bordered blotches
    * the brief is describing come from the height-blend threshold, which is
    * fixed there instead. */
-  cobble: { archetype: 'stone', surface: 'stone', fallback: 0x6f6d66, opts: { scale: 0.55, tint: 0x47443f, saturation: 0.7, wear: 0.95, pom: true, blendWith: 'dirt', blendScale: 3.2 } },
+  cobble: { archetype: 'stone', surface: 'stone', fallback: 0x6f6d66, opts: { scale: 0.55, tint: 0x44464b, gain: 2.6, saturation: 0.60, wear: 0.95, pom: true, blendWith: 'dirt', blendScale: 3.2, detailAlbedo: 1.05 } },
   /* Dark granite setts: the tram trackbed, laid flush into the square. */
-  setts: { archetype: 'stone', surface: 'stone', fallback: 0x4b4a47, opts: { scale: 0.5, tint: 0x565350, saturation: 0.55, wear: 0.9, pom: true, blendWith: 'dirt', blendScale: 3.0 } },
+  setts: { archetype: 'stone', surface: 'stone', fallback: 0x4b4a47, opts: { scale: 0.5, tint: 0x515358, gain: 2.2, saturation: 0.55, wear: 0.9, pom: true, blendWith: 'dirt', blendScale: 3.0 } },
 
   /* -------------------------------------------------------------- ground */
-  asphalt: { archetype: 'asphalt', surface: 'asphalt', fallback: 0x3b3c3e, opts: { scale: 3.0, wear: 0.6, tint: 0x4a4b4e, saturation: 0.7, pom: false, blendWith: 'dirt', blendScale: 0.9 } },
-  asphaltWorn: { archetype: 'asphalt', surface: 'asphalt', fallback: 0x4a4b4c, opts: { scale: 3.0, tint: 0x6a6862, saturation: 0.5, wear: 0.95, pom: false, blendWith: 'dirt', blendScale: 0.9 } },
-  /* Pavement slabs read as *paper* at golden hour if their albedo is anywhere
-   * near neutral concrete: a horizontal plane still takes ~45 % of normal
-   * incidence from a 26° sun, and the exposure is anchored on the facades.
-   * City paving is a dark grey anyway once it has been walked on. */
-  pavement: { archetype: 'concrete', surface: 'concrete', fallback: 0x8b8880, opts: { scale: 1.35, tint: 0x4e4b46, saturation: 0.75, wear: 0.9, pom: false, blendWith: 'dirt', blendScale: 1.6 } },
-  kerb: { archetype: 'stone', surface: 'stone', fallback: 0x9b9890, opts: { scale: 1.1, tint: 0x67645e, wear: 0.65, pom: false } },
+  /* Carriageway.
+   *
+   * `tint: 0x4a4b4e` is linear 0.070 against a base map that averages 0.22, so
+   * the street was arriving at **1.5 % reflectance** — half the albedo of coal.
+   * Measured consequence, by flooding the tint white in a live session and
+   * solving the two-point line: at the authored tint the diffuse term is 0.0014
+   * of the 0.0239 linear radiance the alley floor renders at, i.e. **the
+   * material contributes 6 % of what you see** and a sky-specular veil supplies
+   * the other 94 %. That is the whole of "one solid dark blue-grey with no
+   * texture at all": every layer this package can author is being multiplied by
+   * six percent of the pixel. Real asphalt is 4-12 % and real paving 15-25 %;
+   * bringing the street to ~5 % roughly quadruples the material's share without
+   * making it a light surface. */
+  asphalt: { archetype: 'asphalt', surface: 'asphalt', fallback: 0x3b3c3e, opts: { scale: 3.0, wear: 0.6, tint: 0x86878c, gain: 1.5, saturation: 0.62, pom: false, blendWith: 'dirt', blendScale: 0.9, paving: [4.5, 3.4, 0.20], detailAlbedo: 1.15 } },
+  asphaltWorn: { archetype: 'asphalt', surface: 'asphalt', fallback: 0x4a4b4c, opts: { scale: 3.0, tint: 0x97948c, gain: 1.4, saturation: 0.5, wear: 0.95, pom: false, blendWith: 'dirt', blendScale: 0.9, paving: [4.5, 3.4, 0.20], detailAlbedo: 1.15 } },
+  /* Pavement.
+   *
+   * `tint: 0x4e4b46` is linear 0.076 against a base map that averages 0.22, so
+   * the footway was arriving at **1.6 % reflectance** — charcoal, three times
+   * darker than wet tarmac and roughly a tenth of a real walked-on concrete
+   * flag. That is why the alley floor came back as "one solid dark blue-grey
+   * with no texture at all": every layer in the shader is *multiplicative*, and
+   * a surface sitting at display 52 has its whole modulation range squeezed
+   * into a handful of code values by the transfer curve, so a ±20 % albedo
+   * story arrives as ±5 levels and the floor takes its entire colour from the
+   * sky above it. Lifting it to ~3.5 % keeps the "not paper at golden hour"
+   * intent — it is still much darker than the render above it — while giving
+   * the joints, flags, damp and oil somewhere to be seen.
+   *
+   * `paving` is the other half: 900 x 600 pressed flags with a real joint. */
+  pavement: {
+    archetype: 'concrete', surface: 'concrete', fallback: 0x8b8880,
+    opts: {
+      scale: 1.35, tint: 0xa39e93, gain: 1.9, saturation: 0.66, wear: 0.9, pom: false,
+      blendWith: 'dirt', blendScale: 1.6, paving: [0.90, 0.60, 1.0], detailAlbedo: 1.15,
+    },
+  },
+  kerb: { archetype: 'stone', surface: 'stone', fallback: 0x9b9890, opts: { scale: 1.1, tint: 0x67645e, gain: 1.8, wear: 0.65, pom: false } },
   /* The blend layer under every ground surface. Kept a shade darker and less
    * yellow than it wants to be: silt in a European town square is grey-brown,
    * and at golden hour a warm mid-tone flares out to pale sand. */
@@ -182,7 +212,10 @@ const D: Record<MatKey, MatDef> = {
 
   /* -------------------------------------------------------------- metals */
   steel: { archetype: 'metal', surface: 'metal', fallback: 0x6c7a72, opts: { scale: 1.6, wear: 0.5, instanced: true } },
-  steelPaint: { archetype: 'metal', surface: 'metal', fallback: 0x3f5b5e, opts: { scale: 1.6, tint: 0x53757a, saturation: 0.9, wear: 0.7 } },
+  /* Painted structural steel: shutters, tram masts, railings. Same story as
+   * `paintRed` — a saturated teal tint over a dark base gave a card that was
+   * 40 % near-black with a blue mirror in what was left. */
+  steelPaint: { archetype: 'metal', surface: 'metal', fallback: 0x3f5b5e, opts: { scale: 1.6, tint: 0x8a9698, gain: 4.2, saturation: 0.48, wear: 0.5, burnish: 0.3, film: 0.95 } },
   /* Weathered steel, not orange plastic.
    *
    * `roughness: 1.0, wear: 1.0` was a dielectric: `wear` darkens and roughens
@@ -199,8 +232,21 @@ const D: Record<MatKey, MatDef> = {
   grate: { archetype: 'grate', surface: 'grate', fallback: 0x53565a, opts: { scale: 0.8 } },
   pipe: { archetype: 'pipe', surface: 'pipe', fallback: 0x8a7e46, opts: { scale: 1.2, wear: 0.6 } },
   copper: { archetype: 'pipe', surface: 'pipe', fallback: 0x6c8a6a, opts: { scale: 1.2, tint: 0x8fae94, saturation: 0.9, wear: 0.9 } },
-  paintRed: { archetype: 'metal', surface: 'metal', fallback: 0x8c2a20, opts: { scale: 1.4, tint: 0xa8382a, saturation: 1.2, wear: 0.8 } },
-  paintYellow: { archetype: 'metal', surface: 'metal', fallback: 0xb08a1c, opts: { scale: 1.4, tint: 0xcaa334, saturation: 1.2, wear: 0.85 } },
+  /* Shutter and joinery paint.
+   *
+   * These two keys hang the largest flat cards in the level — a shopfront
+   * shutter is a metre of unbroken surface three metres from the camera — and
+   * they were authored as *pigment* rather than as paint: `tint 0xa8382a` is
+   * linear (0.404, 0.030, 0.019), a 22:1 red-to-blue ratio, multiplied into a
+   * base map that is already dark. Every pixel on the card therefore sat on one
+   * hue line at two values, and the cavity wear pulled the low end to black:
+   * measured 36-40 % of the card under code value 32 with a single 30° hue bin
+   * covering 43 % of it. Real weathered shutter paint is chalked, dusty and a
+   * long way toward neutral, and it is the desaturation — not the darkening —
+   * that reads as age. `burnish` keeps the rain-wash off it: paint chalks, it
+   * does not polish into a mirror. */
+  paintRed: { archetype: 'metal', surface: 'metal', fallback: 0x8c2a20, opts: { scale: 1.4, tint: 0x9a8b85, gain: 4.2, saturation: 0.46, wear: 0.5, burnish: 0.25, film: 0.95 } },
+  paintYellow: { archetype: 'metal', surface: 'metal', fallback: 0xb08a1c, opts: { scale: 1.4, tint: 0xb5a992, gain: 3.8, saturation: 0.52, wear: 0.55, burnish: 0.25, film: 0.95 } },
 
   /* ----------------------------------------------------------- soft/misc
    * Glazing has to *transmit*. At opacity 1 the archetype is an opaque grey
@@ -343,11 +389,65 @@ export function fixtureGain(cls: FixtureClass, night: number): number {
   return floor + (1 - floor) * n;
 }
 
+/* ------------------------------------------------------------ debug tap -- */
+
+/**
+ * Which palette key is that surface?
+ *
+ * A screenshot cannot be argued with, but it also cannot tell you whether the
+ * flat grey floor you are looking at is `asphalt`, `pavement` or `concrete` —
+ * and picking the wrong one wastes a whole authoring pass. Mirrors
+ * `RenderSystem.installDebugHandle`: read-only from the game's point of view,
+ * nothing in the frame loop touches it, and it exists so a capture script can
+ * flood-fill one key at a time and read the answer off the frame.
+ *
+ *   __MATDBG__.keys()             // every key that resolved to a material
+ *   __MATDBG__.tint('asphalt', 0xff00ff)
+ *   __MATDBG__.reset()
+ */
+const DEBUG_LIVE = new Map<MatKey, { mat: THREE.Material; base: number }>();
+
+function installMatDebug(): void {
+  const g = globalThis as unknown as Record<string, unknown>;
+  if (g.__MATDBG__) return;
+  g.__MATDBG__ = {
+    keys: () => [...DEBUG_LIVE.keys()],
+    tint: (key: string, hex: number) => {
+      const e = DEBUG_LIVE.get(key as MatKey);
+      if (!e) return false;
+      (e.mat as THREE.MeshStandardMaterial).color?.setHex(hex);
+      return true;
+    },
+    reset: () => {
+      for (const e of DEBUG_LIVE.values()) (e.mat as THREE.MeshStandardMaterial).color?.setHex(e.base);
+    },
+    /** Live-set one of the shader extension's uniforms, e.g. `obPave`. */
+    uni: (key: string, name: string, ...v: number[]) => {
+      const e = DEBUG_LIVE.get(key as MatKey);
+      const u = e && materialUniforms(e.mat);
+      const slot = u?.[name];
+      if (!slot) return false;
+      const val = slot.value as { set?: (...a: number[]) => void };
+      if (typeof val === 'number' || v.length === 1 && !val?.set) slot.value = v[0];
+      else val.set?.(...v);
+      return true;
+    },
+    /** Read a uniform back, so a sweep can be reported against real values. */
+    read: (key: string, name: string) => {
+      const e = DEBUG_LIVE.get(key as MatKey);
+      const u = e && materialUniforms(e.mat);
+      const val = u?.[name]?.value as { toArray?: () => number[] } | number | undefined;
+      if (val === undefined) return null;
+      return typeof val === 'number' ? val : val.toArray?.() ?? null;
+    },
+  };
+}
+
 export class MatCatalog {
   private cache = new Map<MatKey, THREE.Material>();
   private disposables: THREE.Material[] = [];
 
-  constructor(private mats: MaterialSystem | null) { }
+  constructor(private mats: MaterialSystem | null) { installMatDebug(); }
 
   /** Archetype ids this palette will actually pull from the forge. */
   archetypeIds(): string[] {
@@ -381,6 +481,8 @@ export class MatCatalog {
     }
     if (def.fixture) registerFixture(mat, def.fixture);
     this.cache.set(key, mat);
+    const std = mat as THREE.MeshStandardMaterial;
+    if (std.color && !DEBUG_LIVE.has(key)) DEBUG_LIVE.set(key, { mat, base: std.color.getHex() });
     return mat;
   }
 

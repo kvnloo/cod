@@ -28,6 +28,7 @@ import {
   WallFrame, type Opening,
 } from '../geom/Kit';
 import { buildBlock, ladder, plankBridge, type BlockResult, type BlockSpec } from './Block';
+import { registerWorldArtVantages } from './Dressing';
 import type { MatKey } from '../MatCatalog';
 import { V3 } from '../geom/Mesher';
 
@@ -40,6 +41,7 @@ export interface BuiltWorld {
 export function buildAllBuildings(set: ChunkSet): BuiltWorld {
   const blocks: Record<string, BlockResult> = {};
   const interiors: BuiltWorld['interiors'] = [];
+  registerWorldArtVantages();
 
   blocks.townHall = townHall(set.get('townHall'));
   blocks.clinic = clinic(set.get('clinic'));
@@ -89,8 +91,29 @@ function townHall(chunk: Chunk): BlockResult {
   // The hall's floor is level with the raised terrace in front of it, so the
   // arcade is walkable straight off the square's steps.
   const baseY = SQUARE.terraceY;
-  const springY = baseY + 2.4;
-  const archTop = springY + span * 0.5;
+  /**
+   * Arcade section. Every number below is derived from one another so the
+   * opening the wall cuts and the ring that dresses it can never disagree —
+   * which is exactly how the old arcade ended up as five sawtooth holes with
+   * detached voussoirs hanging over the void.
+   *
+   *   springY   impost / springing line
+   *   bayR      intrados radius = half the clear span (a true semicircle)
+   *   crownY    intrados apex
+   *   ringD     archivolt depth, so the extrados is bayR + ringD
+   *   cutTop    what `wall()` actually removes: one rectangle, span wide,
+   *             reaching just past the extrados apex.
+   *
+   * Everything between the extrados and that rectangle is filled here as real
+   * ashlar coursing, and everything between the intrados and the extrados is
+   * filled by the voussoirs. The two overlap by construction, so no course
+   * step is ever exposed and no voussoir is ever unsupported.
+   */
+  const bayR = span * 0.5;
+  const springY = baseY + 2.05;
+  const ringD = 0.30;
+  const crownY = springY + bayR;
+  const cutTop = crownY + ringD + 0.06;
   const bayCentreU: number[] = [];
   for (let i = 0; i < bays; i++) bayCentreU.push(pierW * (i + 1) + span * (i + 0.5));
 
@@ -130,7 +153,7 @@ function townHall(chunk: Chunk): BlockResult {
     // The arcade bays are cut out of the south wall; the arch rings are added
     // afterwards so the opening and the masonry agree.
     extraOpenings: bayCentreU.map((u) => ({
-      side: 's' as const, at: f.x0 + u, width: span, y: baseY, height: archTop - baseY + 0.05, kind: 'arch' as const,
+      side: 's' as const, at: f.x0 + u, width: span, y: baseY, height: cutTop - baseY, kind: 'arch' as const,
     })),
     downpipes: [{ x: f.x0 - 0.2, z: f.z1 + 0.2 }, { x: f.x1 + 0.2, z: f.z1 + 0.2 }],
     chimneys: [{ x: -9, z: -52, height: 1.9 }, { x: 9, z: -52, height: 1.9 }],
@@ -138,112 +161,33 @@ function townHall(chunk: Chunk): BlockResult {
   };
   const res = buildBlock(chunk, spec);
 
-  // --- south arcade: five arch rings on to the square, the hall's signature.
-  //
-  // Five identical rings on five identically spaced piers read as a stamped
-  // repeat — a stepped starburst repeated at mathematical intervals is the
-  // strongest "this was generated" tell in the whole facade. The bays are
-  // still structurally identical (they have to be), but each ring now has its
-  // own voussoir count and its own state: two are shelled, one has lost its
-  // keystone, one has been sandbagged up to springing level.
-  const south = rectWalls(f.x0, f.z0, f.x1, f.z1)[2];
-  const arcRand = new Rand(2277);
-  const bayState: ('clean' | 'shelled' | 'noKey' | 'blocked')[] = ['shelled', 'clean', 'noKey', 'blocked', 'shelled'];
-  for (let i = 0; i < bayCentreU.length; i++) {
-    const u = bayCentreU[i];
-    archOpening(chunk, south, 'stone', u, span, springY, archTop + 0.05, 0.55, 7 + i * 2, 'stoneTrim');
-    const cx = f.x0 + u;
-    const st = bayState[i];
-    if (st === 'shelled') {
-      // Voussoirs blown out of the ring and the spandrel scarred above it.
-      const dbg = chunk.m('concreteDark');
-      const side = i === 0 ? -1 : 1;
-      for (let k = 0; k < 5; k++) {
-        const a = Math.PI * (0.14 + k * 0.07) * (side > 0 ? 1 : -1) + (side > 0 ? 0 : Math.PI);
-        const r = span * 0.5 + 0.28;
-        dbg.pushTRS(cx + Math.cos(a) * r, springY + Math.sin(a) * r, f.z1 + 0.18,
-          arcRand.range(0, 3), arcRand.range(-0.4, 0.4), arcRand.range(-0.4, 0.4));
-        dbg.box(0, 0, 0, arcRand.range(0.14, 0.25), arcRand.range(0.1, 0.2), 0.3, 0.6);
-        dbg.pop();
-      }
-    } else if (st === 'noKey') {
-      // Keystone gone: a wedge of sky through the top of the ring.
-      const gap = chunk.m('concreteDark');
-      gap.box(cx, archTop + 0.24, f.z1 + 0.16, 0.3, 0.22, 0.36, 0.5);
-    } else if (st === 'blocked') {
-      // Bricked up to springing with a firing slot left in it.
-      const b = chunk.m('brickPale');
-      b.boxMinMax(cx - span * 0.5 + 0.12, baseY, f.z1 - 0.34, cx - 0.28, springY - 0.2, f.z1 - 0.08, 1.0);
-      b.boxMinMax(cx + 0.28, baseY, f.z1 - 0.34, cx + span * 0.5 - 0.12, springY - 0.2, f.z1 - 0.08, 1.0);
-      b.boxMinMax(cx - 0.28, baseY, f.z1 - 0.34, cx + 0.28, baseY + 0.95, f.z1 - 0.08, 1.0);
-      b.boxMinMax(cx - 0.28, baseY + 1.35, f.z1 - 0.34, cx + 0.28, springY - 0.2, f.z1 - 0.08, 1.0);
-    }
-  }
-  /* --- arcade piers: plinth, chamfered shaft, impost ---------------------
+  /* --- south arcade: five arch rings on to the square, the hall's signature.
    *
-   * Standing under the arcade, one pier is the nearest thing in frame and used
-   * to be a bare render plane meeting its return on a razor-sharp 90° arris —
-   * a metre and a half of unbroken flat value with no edge highlight anywhere
-   * on it. Real arcade piers are dressed: a splayed plinth, a shaft with its
-   * arrises chamfered off at about 8 cm (so a cart does not shatter the
-   * corner), and an impost band at springing. Three mouldings turn the pier
-   * from a card into something with a lit edge and two shadow lines. */
-  const pier = chunk.m('stone');
-  const pierTrim = chunk.m('stoneTrim');
-  const zf = f.z1 + 0.03;
-  const pRand = new Rand(2288);
-  for (let i = 0; i <= bays; i++) {
-    const cx = f.x0 + (pierW + span) * i + pierW * 0.5;
-    // Plinth: proud of the wall and splayed, so the pier has a foot.
-    pierTrim.chamferBox(cx, baseY + 0.29, zf + 0.06, pierW * 0.5 + 0.045, 0.29, 0.115, 0.055, 0.5);
-    // Shaft: the chamfer is the whole point — a 7 cm splay catches the sky and
-    // reads as an edge at any angle, which a mitred 90° corner never does.
-    pier.chamferBox(cx, (baseY + 0.58 + springY - 0.06) * 0.5, zf + 0.045,
-      pierW * 0.5 - 0.055, (springY - 0.06 - baseY - 0.58) * 0.5, 0.09, 0.075, 0.55);
-    // Impost band at springing, carried a little past the shaft.
-    pierTrim.chamferBox(cx, springY + 0.02, zf + 0.075, pierW * 0.5 + 0.05, 0.095, 0.13, 0.035, 0.4);
-    // Bill-poster boards, a stencilled number and old fixings: the flat panel
-    // between plinth and impost needs something on it at reading height.
-    if (pRand.bool(0.55)) {
-      const pl = chunk.m(pRand.bool() ? 'plywood' : 'plank');
-      pl.pushTRS(cx + pRand.range(-0.22, 0.22), baseY + pRand.range(1.15, 1.75), zf + 0.11,
-        0, 0, pRand.range(-0.05, 0.05));
-      pl.box(0, 0, 0, pRand.range(0.24, 0.38), pRand.range(0.3, 0.46), 0.012, 0.6);
-      pl.pop();
-    }
-    if (pRand.bool(0.5)) {
-      const cn = chunk.m('pipe');
-      const cy0 = baseY + 0.6, cy1 = springY - 0.2;
-      const cu = cx + (pRand.bool() ? 1 : -1) * (pierW * 0.5 - 0.16);
-      cn.boxMinMax(cu - 0.026, cy0, zf + 0.09, cu + 0.026, cy1, zf + 0.142, 0.4);
-      for (const cy of [cy0 + 0.5, (cy0 + cy1) * 0.5, cy1 - 0.4]) {
-        cn.box(cu, cy, zf + 0.075, 0.045, 0.022, 0.03, 0.2);
-      }
-    }
+   * `wall()` removes one rectangle per bay. `arcadeBay()` then puts the arch
+   * back into that rectangle: ashlar spandrel coursing stepping down on to the
+   * extrados, and a voussoir ring filling the annulus between extrados and
+   * intrados. Because the courses stop on the extrados and the ring covers the
+   * extrados outwards, every course step is behind masonry and every voussoir
+   * has wall on both of its radial faces. That is the difference between an
+   * arch and the crown-shaped hole with floating blocks this used to be.
+   *
+   * The bays are structurally identical — they have to be — so the variation
+   * is in the ring: each has its own voussoir count and its own war damage. */
+  const wallHalf = 0.55 * 0.5;
+  const zFaceOut = f.z1 + wallHalf;
+  const bayState: BayState[] = ['shelled', 'clean', 'noKey', 'blocked', 'shelledR'];
+  const bayVoussoirs = [9, 13, 11, 9, 11];
+  for (let i = 0; i < bayCentreU.length; i++) {
+    arcadeBay(chunk, {
+      cx: f.x0 + bayCentreU[i], zFace: zFaceOut, thickness: 0.55,
+      baseY, springY, radius: bayR, ringDepth: ringD, cutTop,
+      voussoirs: bayVoussoirs[i], state: bayState[i], seed: 2277 + i * 37,
+    });
   }
 
   // The terrace runs through the arcade so the hall floor and the terrace are
   // one continuous surface.
   chunk.m('stone').boxMinMax(f.x0 + 0.2, -0.4, f.z1 - 1.2, f.x1 - 0.2, baseY, f.z1 + 0.2, 1.1);
-
-  // Vaulted soffit through the arcade so it reads as depth, not a painted arch.
-  const soffit = chunk.m('stone');
-  for (const u of bayCentreU) {
-    const cx = f.x0 + u;
-    const seg = 7;
-    for (let i = 0; i < seg; i++) {
-      const a0 = Math.PI * (i / seg);
-      const a1 = Math.PI * ((i + 1) / seg);
-      const am = (a0 + a1) * 0.5;
-      const r = span * 0.5;
-      soffit.pushTRS(
-        cx - Math.cos(am) * (r + 0.08), springY + Math.sin(am) * (r + 0.08), f.z1 - 0.28,
-        0, 0, am - Math.PI / 2,
-      );
-      soffit.box(0, 0, 0, (Math.PI * r) / seg * 0.62, 0.08, 0.28, 1.6);
-      soffit.pop();
-    }
-  }
 
   // --- arcade piers.
   //
@@ -255,15 +199,23 @@ function townHall(chunk: Chunk): BlockResult {
   const pierU: number[] = [];
   for (let i = 0; i <= bays; i++) pierU.push(pierW * (i + 0.5) + span * i);
   const pierT = chunk.m('stoneTrim');
-  const zFace = f.z1;
+  /**
+   * The exterior face of a `wall()` run is at `z1 + thickness/2`, not `z1` —
+   * the frame is centred on the footprint edge. Every moulding below used to be
+   * authored against `f.z1` and was therefore 15 cm *inside* the masonry: the
+   * plinth, the impost, the angle shafts, the lamp brackets and the whole inner
+   * face treatment existed in the buffer and were invisible in every frame.
+   */
+  const zFace = f.z1 + wallHalf;
   for (let i = 0; i < pierU.length; i++) {
     const cx = f.x0 + pierU[i];
     const hwP = pierW * 0.5;
     // Plinth and its weathered cap.
     pierT.boxMinMax(cx - hwP - 0.09, baseY, zFace - 0.62, cx + hwP + 0.09, baseY + 0.62, zFace + 0.09, 1.0);
     pierT.boxMinMax(cx - hwP - 0.12, baseY + 0.62, zFace - 0.64, cx + hwP + 0.12, baseY + 0.74, zFace + 0.12, 1.0);
-    // Impost band at springing.
-    pierT.boxMinMax(cx - hwP - 0.10, springY - 0.26, zFace - 0.64, cx + hwP + 0.10, springY - 0.06, zFace + 0.10, 1.0);
+    // Impost band, its top course level with the springing line so the ring
+    // visibly lands on it.
+    pierT.boxMinMax(cx - hwP - 0.10, springY - 0.30, zFace - 0.64, cx + hwP + 0.10, springY + 0.02, zFace + 0.10, 1.0);
     // Angle shafts on both arrises: the chamfer the corner never had.
     for (const sx of [-1, 1]) {
       pierT.pushTRS(cx + sx * hwP, baseY + 0.74, zFace + 0.02, Math.PI * 0.25);
@@ -428,6 +380,189 @@ function townHall(chunk: Chunk): BlockResult {
   ], 1.0, 'ornate');
 
   return res;
+}
+
+/* ------------------------------------------------------- arcade bay ----- */
+
+type BayState = 'clean' | 'shelled' | 'shelledR' | 'noKey' | 'blocked';
+
+interface BayOptions {
+  /** World X of the bay's centre line. */
+  cx: number;
+  /** World Z of the wall's *exterior* face (footprint edge + thickness/2). */
+  zFace: number;
+  thickness: number;
+  baseY: number;
+  /** Impost / springing line. */
+  springY: number;
+  /** Intrados radius — half the clear span, so the head is a true semicircle. */
+  radius: number;
+  /** Radial depth of the archivolt. */
+  ringDepth: number;
+  /** Top of the rectangle `wall()` removed for this bay. */
+  cutTop: number;
+  /** Odd, so one block always lands on the crown and becomes the keystone. */
+  voussoirs: number;
+  state: BayState;
+  seed: number;
+}
+
+/**
+ * One arcade bay: spandrel, archivolt, keystone and war damage.
+ *
+ * The wall builder can only remove rectangles, so a bay arrives here as a
+ * `span × (cutTop − baseY)` hole. This puts the arch back, and the two halves
+ * are sized off each other so they cannot disagree:
+ *
+ *  - **Spandrel.** Horizontal ashlar courses from each jamb inwards. A course
+ *    stops at the extrados height of *its own top edge*, so it always overlaps
+ *    inwards into the ring's annulus and never into the opening. The deepest
+ *    bite is `sqrt(rEx² − (yTop² − yBot²))`, which for an 11 cm course on a
+ *    2.6 m extrados is 2.52 m — comfortably outside the 2.32 m intrados.
+ *  - **Archivolt.** `voussoirs` radial blocks filling intrados→extrados over
+ *    the full 180°, proud of the wall face, so every course step above them is
+ *    behind masonry and every block has wall on both radial faces.
+ *
+ * That is the whole fix for the crown-shaped holes: previously the ring sat on
+ * a circle while the wall was cut as a stepped polygon, so the blocks over the
+ * void had nothing behind them and the steps showed as a sawtooth.
+ */
+function arcadeBay(chunk: Chunk, o: BayOptions): void {
+  const { cx, zFace, thickness, baseY, springY, radius: r, cutTop } = o;
+  const zBack = zFace - thickness;
+  const rEx = r + o.ringDepth;
+  const rand = new Rand(o.seed);
+
+  /* --- spandrel coursing ---------------------------------------------- */
+  const ash = chunk.m('stone');
+  const course = 0.11;
+  const yFoot = springY + Math.sqrt(Math.max(0, rEx * rEx - r * r));
+  for (let y = yFoot; y < cutTop - 1e-4; y += course) {
+    const yb = Math.min(y + course, cutTop);
+    const h = yb - springY;
+    const g = h >= rEx ? 0 : Math.sqrt(Math.max(0, rEx * rEx - h * h));
+    if (g >= r - 1e-3) continue;
+    // 2 cm into the pier on each side so the jamb faces are never coplanar.
+    ash.boxMinMax(cx - r - 0.02, y, zBack, cx - g, yb, zFace, 4.2);
+    ash.boxMinMax(cx + g, y, zBack, cx + r + 0.02, yb, zFace, 4.2);
+  }
+
+  /* --- archivolt -------------------------------------------------------- */
+  const ring = chunk.m('stoneTrim');
+  const n = o.voussoirs;
+  const dth = Math.PI / n;
+  const rIn = r - 0.02;
+  const keyIdx = (n - 1) >> 1;
+  const gone = new Set<number>();
+  if (o.state === 'noKey') gone.add(keyIdx);
+  if (o.state === 'shelled') { gone.add(1); gone.add(2); }
+  if (o.state === 'shelledR') { gone.add(n - 2); gone.add(n - 3); }
+
+  for (let k = 0; k < n; k++) {
+    const th = (k + 0.5) * dth;
+    const isKey = k === keyIdx && o.state !== 'noKey';
+    // Alternate blocks stand a couple of centimetres proud: at 25 m that is
+    // the only thing that separates a ring of voussoirs from a smooth band.
+    const alt = k % 2 === 0 ? 0 : 0.022;
+    const missing = gone.has(k);
+    const rOut = missing ? rEx : rEx + 0.02 + (isKey ? 0.15 : alt);
+    const rc = (rIn + rOut) * 0.5;
+    const halfR = (rOut - rIn) * 0.5;
+    const hw = rc * Math.tan(dth * 0.5) * (isKey ? 1.24 : 1.05);
+    // A blown-out voussoir leaves a sooted socket, not a hole through the wall.
+    const front = missing ? zFace - 0.15 : zFace + 0.09 + (isKey ? 0.045 : alt);
+    const m = missing ? chunk.m('brickSoot') : ring;
+    m.pushTRS(cx + Math.cos(th) * rc, springY + Math.sin(th) * rc,
+      (front + zBack) * 0.5, 0, 0, th);
+    m.box(0, 0, 0, halfR, hw, (front - zBack) * 0.5, missing ? 0.9 : 1.2);
+    m.pop();
+  }
+
+  /* Hood mould over the extrados. A ring of voussoirs in the same stone as the
+   * spandrel is only 30 cm of value difference at 20 m; the label is what
+   * actually draws the arch, because it throws a hard 13 cm shadow line on to
+   * the wall behind it whatever the sun is doing. */
+  const hoodSeg = 26;
+  for (let k = 0; k < hoodSeg; k++) {
+    const th = ((k + 0.5) / hoodSeg) * Math.PI;
+    const rc = rEx + 0.055;
+    const hw = rc * Math.tan((Math.PI / hoodSeg) * 0.5) * 1.06;
+    ring.pushTRS(cx + Math.cos(th) * rc, springY + Math.sin(th) * rc, zFace + 0.055, 0, 0, th);
+    ring.box(0, 0, 0, 0.055, hw, 0.075, 0.5);
+    ring.pop();
+  }
+  // Label stops: a corbel where the hood dies into the pier on both sides.
+  for (const sx of [-1, 1]) {
+    ring.box(cx + sx * (rEx + 0.03), springY - 0.02, zFace + 0.05, 0.10, 0.13, 0.09, 0.4);
+  }
+
+  /* --- damage ----------------------------------------------------------- */
+  if (o.state === 'shelled' || o.state === 'shelledR') {
+    // The blocks that came out of the ring are lying on the terrace deck under
+    // it, keyed against the pier — not hanging in mid-air over the void.
+    const rub = chunk.m('stoneTrim');
+    const side = o.state === 'shelled' ? 1 : -1;
+    for (let i = 0; i < 4; i++) {
+      const px = cx + side * (r - rand.range(0.15, 1.1));
+      rub.pushTRS(px, baseY + 0.11, zFace + rand.range(0.35, 1.15),
+        rand.range(0, Math.PI), rand.range(-0.12, 0.12), rand.range(-0.25, 0.25));
+      rub.box(0, 0, 0, rand.range(0.19, 0.30), 0.10, rand.range(0.13, 0.20), 0.6);
+      rub.pop();
+    }
+    // Crack running up out of the socket into the spandrel.
+    const cr = chunk.m('brickSoot');
+    for (let i = 0; i < 5; i++) {
+      const t = i / 4;
+      cr.boxMinMax(cx + side * (1.55 + t * 0.55) - 0.05, yFoot + t * 0.7 - 0.03, zFace - 0.03,
+        cx + side * (1.55 + t * 0.55) + 0.05, yFoot + t * 0.7 + 0.03, zFace + 0.012, 0.5);
+    }
+  }
+  if (o.state === 'noKey') {
+    // Keystone gone: the two blocks either side are propped by a timber raker
+    // off the terrace, which is what actually holds a de-keyed arch up.
+    const tim = chunk.m('plank');
+    for (const sx of [-1, 1]) {
+      const ax = cx + sx * 0.55, ay = springY + rEx - 0.25;
+      const bx = cx + sx * 2.0, by = baseY;
+      const len = Math.hypot(ax - bx, ay - by);
+      tim.pushTRS((ax + bx) * 0.5, (ay + by) * 0.5, zFace + 0.16,
+        0, 0, Math.atan2(ay - by, ax - bx));
+      tim.box(0, 0, 0, len * 0.5, 0.055, 0.055, 0.8);
+      tim.pop();
+    }
+  }
+  if (o.state === 'blocked') {
+    /* Bricked up: a rectangle to the springing plus courses following the
+     * intrados, all set 0.14 back so the reveal reads, with a firing slot cut
+     * out of it at chest height. The head courses overlap outwards into the
+     * annulus, where the ring hides them. */
+    const b = chunk.m('brickPale');
+    const zf = zFace - 0.14;
+    const slotY0 = baseY + 1.05, slotY1 = baseY + 1.42;
+    const slotHalf = 0.30;
+    for (let y = baseY; y < springY - 1e-4; y += course) {
+      const yb = Math.min(y + course, springY);
+      if (yb > slotY0 && y < slotY1) {
+        b.boxMinMax(cx - r + 0.03, y, zBack, cx - slotHalf, yb, zf, 1.0);
+        b.boxMinMax(cx + slotHalf, y, zBack, cx + r - 0.03, yb, zf, 1.0);
+      } else {
+        b.boxMinMax(cx - r + 0.03, y, zBack, cx + r - 0.03, yb, zf, 1.0);
+      }
+    }
+    for (let y = springY; y < springY + r - 1e-4; y += course) {
+      const yb = Math.min(y + course, springY + r);
+      const g = Math.sqrt(Math.max(0, r * r - (y - springY) * (y - springY)));
+      b.boxMinMax(cx - g - 0.03, y, zBack, cx + g + 0.03, yb, zf, 1.0);
+    }
+    // Sandbag course along the foot of the blocking, on the terrace side.
+    const sb = chunk.m('sandbag');
+    for (let i = 0; i < 7; i++) {
+      const px = cx - r + 0.45 + i * 0.62;
+      sb.pushTRS(px, baseY + 0.16, zFace + 0.26, rand.range(-0.15, 0.15));
+      sb.box(0, 0, 0, 0.33, 0.15, 0.20, 0.7);
+      sb.pop();
+    }
+  }
 }
 
 /* =============================================================== clinic == */

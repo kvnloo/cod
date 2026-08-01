@@ -50,6 +50,13 @@ export interface ShaderExtensionConfig {
   blendTile?: number;
   /** 0..1 extra grime multiplier applied to albedo/roughness. */
   wear?: number;
+  /**
+   * 0..1 weathering film. Lifts and neutralises the deep end of the albedo,
+   * the way chalked binder and settled dust do on anything left outdoors.
+   * Recipes with a wide internal range (painted metal, timber, plastic) need
+   * it; narrow-palette masonry and ground recipes must not have it.
+   */
+  film?: number;
   specularAA?: boolean;
   /** Distance past which normal strength is damped, metres. */
   normalFadeDistance?: number;
@@ -90,6 +97,13 @@ export interface ShaderExtensionConfig {
    * Null disables the layer. Triplanar only — the UV path has uvVariation.
    */
   cellTone?: THREE.Vector4 | null;
+  /**
+   * Laid paving: courses, a running bond, a joint network and a per-flag value
+   * spread, all in world space so a floor is *laid* rather than tiled.
+   *   x, y = flag size in metres, z = joint strength (0 = tone only), w = seed.
+   * Only applies to up-facing surfaces of archetypes that carry `surface`.
+   */
+  paving?: THREE.Vector4 | null;
   /** Take opacity from the albedo alpha channel (glass, grates, foliage). */
   alphaFromMap?: boolean;
   /**
@@ -126,6 +140,7 @@ export interface ObUniforms {
   obDetailFade: THREE.IUniform<THREE.Vector2>;
   obPom: THREE.IUniform<THREE.Vector3>;
   obWear: THREE.IUniform<number>;
+  obFilm: THREE.IUniform<number>;
   obNormalFade: THREE.IUniform<number>;
   obBlendAlb: THREE.IUniform<THREE.Texture | null>;
   obBlendNrm: THREE.IUniform<THREE.Texture | null>;
@@ -138,6 +153,7 @@ export interface ObUniforms {
   obSurf: THREE.IUniform<THREE.Vector4>;
   obGround: THREE.IUniform<THREE.Vector3>;
   obCell: THREE.IUniform<THREE.Vector4>;
+  obPave: THREE.IUniform<THREE.Vector4>;
   [key: string]: THREE.IUniform;
 }
 
@@ -183,6 +199,7 @@ uniform float obTileScale;
 uniform float obTriSharp;
 uniform vec3  obPom;
 uniform float obWear;
+uniform float obFilm;
 uniform float obNormalFade;
 uniform vec2  obHueSat;
 uniform float obTime;
@@ -196,6 +213,10 @@ uniform vec4  obEmissive;   // x = gain, y = rate, z = phase, w = temperature
 
 #ifdef OB_CELLTONE
   uniform vec4 obCell;        // x,y = blocks/courses per tile, z = jitter, w = seed
+#endif
+
+#ifdef OB_MACRO
+  uniform vec4 obPave;      // x,y = flag size (m), z = joint strength, w = seed
 #endif
 
 #ifdef OB_DETAIL
@@ -412,6 +433,10 @@ const FRAG_PROLOGUE = /* glsl */ `
   vec3 obNrmV = normalize(vNormal);
   float obPomShade = 1.0;
   float obDistFade = 1.0 - smoothstep(obNormalFade, obNormalFade * 4.0, obDist);
+  // Screen-space footprint of one world metre, hoisted out of every branch:
+  // fwidth() inside non-uniform control flow is undefined behaviour in GLSL ES
+  // and crashes some drivers outright.
+  float obPixW = max(fwidth(obWPos.x), fwidth(obWPos.z));
 
   #ifdef OB_TRIPLANAR
     /* ---------------------------------------------------- triplanar ---- */
@@ -702,16 +727,28 @@ const FRAG_PROLOGUE = /* glsl */ `
       float obCface = smoothstep(0.0, 0.055, min(obCd.x, obCd.y));
       // Once a block is near a pixel the hash is just noise, so fade it out and
       // let the macro drift carry the distance.
-      obCface *= 1.0 - smoothstep(16.0, 40.0, obDist);
+      obCface *= 1.0 - smoothstep(22.0, 48.0, obDist);
       float obCh0 = obHash13(vec3(obCcol, obCrow, obCell.w + 3.1));
       float obCh1 = obHash13(vec3(obCcol, obCrow, obCell.w + 17.7));
-      float obCv = mix(0.78, 1.22, obCh0);
-      obCv *= mix(1.0, 0.60, step(0.930, obCh1));
-      obCv *= mix(1.0, 1.24, step(0.965, obCh0));
+      float obCh2 = obHash13(vec3(obCcol, obCrow, obCell.w + 41.3));
+      // A 0.78..1.22 spread measured 6/255 across the plaza: the display
+      // transform is very compressive where the sunlit paving lands, so a
+      // quarter-stop authored spread arrives as two levels and the square reads
+      // as one printed grid you can count from 1 m to 40 m. A real setted
+      // square is a quarry mix — most stones close together, a solid minority a
+      // long way off — so the authored spread has to be a good deal wider than
+      // the one you would pick off a swatch.
+      float obCv = mix(0.66, 1.30, obCh0);
+      obCv *= mix(1.0, 0.52, step(0.880, obCh1));   // dark: wet, oil-soaked, replaced
+      obCv *= mix(1.0, 1.26, step(0.930, obCh0));   // bleached
       obAlb.rgb *= mix(1.0, obCv, obCface);
+      // Setts come out of more than one quarry and weather differently. Value
+      // alone still reads as a printed grid at a second exposure; the warm/cool
+      // spread is what makes them read as separate stones.
+      obAlb.rgb *= mix(vec3(1.0), mix(vec3(0.950, 0.986, 1.046), vec3(1.046, 1.004, 0.944), obCh2), obCface * 0.9);
       // Traffic has burnished some stones and left others matte; without this
       // the whole run answers a raking sun with one specular value.
-      obOrm.g = clamp(obOrm.g + (obCh1 - 0.5) * 0.26 * obCface, 0.03, 1.0);
+      obOrm.g = clamp(obOrm.g + (obCh1 - 0.5) * 0.30 * obCface, 0.03, 1.0);
       // Joints must be darker than the stones.
       //
       // The baked map draws its mortar a shade *lighter* than the stone faces
@@ -720,8 +757,11 @@ const FRAG_PROLOGUE = /* glsl */ `
       // 40 m. The height channel already knows where the joint is, so drive the
       // darkening off that rather than trying to re-author the map.
       float obCjoint = 1.0 - smoothstep(0.14, 0.44, obOrm.a);
-      obAlb.rgb *= mix(1.0, 0.58, obCjoint);
-      obOrm.g = clamp(obOrm.g + obCjoint * 0.22, 0.03, 1.0);
+      obAlb.rgb *= mix(1.0, 0.50, obCjoint);
+      obOrm.g = clamp(obOrm.g + obCjoint * 0.24, 0.03, 1.0);
+      // A joint is a hole. Occluding it as well as staining it is what turns a
+      // drawn grid into a network of gaps between separate stones.
+      obOrm.r = clamp(obOrm.r * mix(1.0, 0.62, obCjoint), 0.0, 1.0);
     }
   #endif
 
@@ -736,6 +776,13 @@ const FRAG_PROLOGUE = /* glsl */ `
         // a pixel, the mip chain keeps their variance, and what should be sand
         // grain turns into a crawling gravel rash across the whole wall.
         float dnFade = mix(0.28, 1.0, 1.0 - smoothstep(1.2, 7.0, obDist));
+        // Half strength on anything facing up. A ground plane returns the sky
+        // as a broad specular veil, and a millimetre-scale normal map modulating
+        // that veil is not texture — it is a field of identical bright dots, the
+        // "sand scattered on a mat" read that a 1 m crop of the alley floor came
+        // back with. On a wall the same layer is doing real work, so this is
+        // gated on the normal rather than turned down globally.
+        dnFade *= mix(1.0, 0.60, clamp(obWNrm.y * 2.4 - 0.7, 0.0, 1.0));
         vec2 dn = (dt.rg * 2.0 - 1.0) * obDetailStrength.x * dfade * dnFade;
         float da = (dt.b - 0.5) * obDetailStrength.y * dfade;
         float dr = (dt.a - 0.5) * obDetailStrength.z * dfade;
@@ -777,8 +824,21 @@ const FRAG_PROLOGUE = /* glsl */ `
       obAlb.rgb *= 1.0 + obMv * obMacro.z;
       // Temperature drift — sun-bleached patches go warm-pale, sheltered ones
       // stay cool. This is what sells "large scale variation" without contrast.
-      obAlb.rgb *= mix(vec3(0.985, 0.995, 1.020), vec3(1.022, 1.002, 0.968),
+      // Temperature drift. +/-2% was inside the noise: a facade with one hue at
+      // several values is the printed-sheet read, and the cure is a *hue*
+      // spread, not more value. Sun-bleached patches go warm-pale, sheltered
+      // ones keep the cool cast of the sky that is the only light they see.
+      obAlb.rgb *= mix(vec3(0.966, 0.990, 1.040), vec3(1.036, 1.004, 0.950),
                        clamp(obM2 * 1.35 - 0.18, 0.0, 1.0));
+      // A real hue drift on top of the temperature drift.
+      //
+      // A tinted family is a *hue line*: every pixel on a red shutter sits at
+      // the same hue and only its value moves, which is the "saturated blotch"
+      // read. Carried on the same weathering-film weight as the deep-end lift,
+      // so it lands on the paint/timber/plastic recipes that are authored as
+      // pigment and leaves masonry and ground — where a hue drift would only
+      // push a warm ground plane warmer — completely alone.
+      obAlb.rgb = obHueRot(obAlb.rgb, (obM3 - 0.5) * obFilm * 0.105);
       obOrm.g = clamp(obOrm.g + obMv * obMacro.w, 0.03, 1.0);
 
       /* ------------------------------------------------ gravity runoff --- */
@@ -880,31 +940,84 @@ const FRAG_PROLOGUE = /* glsl */ `
 
       }
 
-      /* ------------------------------------------------ slab-to-slab tone -- */
-      // A paving run is laid slab by slab out of different batches, polished by
-      // different amounts of traffic, and half of it has been lifted and relaid
-      // at some point. The base map cannot know any of that — it is the same
-      // tile from the player's boots to the end of the street — so the value
-      // spread a real pavement shows inside one frame has to be stamped here.
-      // The lattice is locked to the texture's own tile, so a step lands on a
-      // joint the map already draws instead of laying a second grid over it.
-      // This runs *after* the damp and traffic layers on purpose: those pin the
-      // roughness to one number over the whole wet area, and one number is
-      // exactly the thing that reads as a printed sheet rather than as stone.
+      /* ------------------------------------------------- laid paving ------ */
+      // A floor is *laid*, and that is the single loudest thing missing from a
+      // procedural ground plane: courses, a running bond, a joint network that
+      // takes the light differently from the flags, and a value spread flag to
+      // flag because they came out of different batches, have been lifted and
+      // relaid, and are polished by different amounts of traffic.
+      //
+      // The base map cannot carry any of it — it is the same tile from the
+      // player's boots to the end of the street — and the anonymous per-cell
+      // tint this replaces drew the value steps but never drew the joint, so
+      // the eye had nothing to read them against.
+      //
+      // obPave.xy is the flag size in metres, obPave.z the joint strength.
+      // With the joint at zero the block degenerates to exactly the per-cell
+      // tone it replaces, which is what dirt, gravel and grass want.
       if (obUp > 0.002 && obSurf.x > 0.001) {
-        vec2 obSc = floor(obWPos.xz * obTileScale + 0.017);
-        float obS0 = obHash1(dot(obSc, vec2(1.0, 137.0)) + 7.31);
-        float obS1 = obHash1(dot(obSc, vec2(53.0, 11.0)) + 91.7);
-        float obS2 = obHash1(dot(obSc, vec2(19.0, 71.0)) + 53.1);
-        // Hard cell edges alias badly once a cell is under a pixel, so the
-        // whole layer fades out with distance and lets the macro drift carry.
-        float obSw = obUp * obSurf.x * (1.0 - smoothstep(26.0, 62.0, obDist));
-        obAlb.rgb *= mix(1.0, mix(0.76, 1.20, obS0), obSw * 0.9);
-        obOrm.g = clamp(obOrm.g + (obS1 - 0.5) * 0.34 * obSw, 0.03, 1.0);
-        // One slab in six is a genuine replacement, a repair or a burnt one.
-        float obRe = step(0.83, obS2);
-        obAlb.rgb *= mix(1.0, mix(0.48, 1.32, obS1), obRe * obSw);
-        obOrm.g = clamp(mix(obOrm.g, mix(0.24, 0.98, obS1), obRe * obSw * 0.75), 0.03, 1.0);
+        vec2 obPsz = max(obPave.xy, vec2(0.05));
+        // Courses run along +x. Every other course is offset half a flag, and
+        // each one wanders a few centimetres, so the joints never resolve into
+        // one ruled grid running the length of the street.
+        float obPcrs = floor(obWPos.z / obPsz.y);
+        float obPoff = 0.5 * mod(obPcrs, 2.0)
+                     + (obHash1(obPcrs * 1.37 + obPave.w) - 0.5) * 0.42;
+        float obPsx = obWPos.x / obPsz.x + obPoff;
+        float obPcol = floor(obPsx);
+        vec2 obPlf = vec2(fract(obPsx), fract(obWPos.z / obPsz.y));
+        vec2 obPdm = min(obPlf, 1.0 - obPlf) * obPsz;      // metres to the joint
+
+        float obPh0 = obHash1(dot(vec2(obPcol, obPcrs), vec2(1.0, 137.0)) + obPave.w + 7.31);
+        float obPh1 = obHash1(dot(vec2(obPcol, obPcrs), vec2(53.0, 11.0)) + obPave.w + 91.7);
+        float obPh2 = obHash1(dot(vec2(obPcol, obPcrs), vec2(19.0, 71.0)) + obPave.w + 53.1);
+
+        // Hard cell edges alias badly once a cell is under a pixel, so the tone
+        // fades out with distance and lets the macro drift carry the far field.
+        float obPw = obUp * obSurf.x * (1.0 - smoothstep(26.0, 62.0, obDist));
+        // Most flags sit within a quarter stop of each other; a minority are a
+        // long way off, and *that* is what a real paving run looks like at
+        // twenty metres. A tight uniform spread just reads as noise.
+        float obPv = mix(0.80, 1.19, obPh0);
+        obPv *= mix(1.0, 0.62, step(0.86, obPh1));   // relaid, oil-soaked or burnt
+        obPv *= mix(1.0, 1.20, step(0.93, obPh2));   // and a few bleached
+        obAlb.rgb *= mix(1.0, obPv, obPw * 0.95);
+        // Batch temperature. A mixed run of flags is warm and cool, never one
+        // hue at several values — that is the printed-sheet read.
+        obAlb.rgb *= mix(vec3(1.0), mix(vec3(0.958, 0.988, 1.038), vec3(1.040, 1.004, 0.952), obPh1), obPw * 0.85);
+        obOrm.g = clamp(obOrm.g + (obPh2 - 0.5) * 0.34 * obPw, 0.03, 1.0);
+
+        if (obPave.z > 0.001) {
+          // Joint width wanders: a hand-laid joint is 12-30 mm and never twice
+          // the same. Below a pixel the whole term has to fade by *amplitude*
+          // rather than by width, or a paving run turns into a moire screen at
+          // thirty metres.
+          float obJw = 0.006 + 0.008 * obMNoiseN(obWPos * 5.7 + 3.3);
+          float obAa = obPixW;
+          float obJe = max(obAa * 0.8, obJw * 0.30);
+          float obJd = min(obPdm.x, obPdm.y);
+          float obJoint = 1.0 - smoothstep(obJw - obJe, obJw + obJe, obJd);
+          obJoint *= obJw / max(obJw, obAa);
+          float obJm = obJoint * obUp * obPave.z;
+          // Silt and grit pack into a joint and never wash out of it, so it is
+          // darker, matte, and occluded — the darkening is what makes each flag
+          // read as a separate object instead of as a printed rectangle.
+          obAlb.rgb *= mix(1.0, 0.46, obJm);
+          obOrm.g = clamp(obOrm.g + obJm * 0.30, 0.03, 1.0);
+          obOrm.r = clamp(obOrm.r * mix(1.0, 0.64, obJm), 0.0, 1.0);
+          // Flags are not flush: each one dishes into its joint, and that
+          // chamfer is what catches a low sun along one edge and shades the
+          // other. Without it the joint is a painted line.
+          float obJs = obJoint * (1.0 - obJoint) * 4.0 * obPave.z;
+          vec2 obJdir = obPdm.x < obPdm.y
+            ? vec2(sign(0.5 - obPlf.x), 0.0)
+            : vec2(0.0, sign(0.5 - obPlf.y));
+          #ifdef OB_TRIPLANAR
+            obWn = normalize(obWn + vec3(obJdir.x, 0.0, obJdir.y) * obJs * 0.50);
+          #else
+            obNrmT = normalize(obNrmT + vec3(obJdir.x, obJdir.y, 0.0) * obJs * 0.50);
+          #endif
+        }
       }
 
       /* ------------------------------------------------- ground gloss floor -- */
@@ -923,7 +1036,7 @@ const FRAG_PROLOGUE = /* glsl */ `
       // saturated specular blob. Vertical faces are untouched, and the metal
       // wash below deliberately runs *after* this so steel can still be a
       // mirror.
-      obOrm.g = mix(obOrm.g, max(obOrm.g, 0.62), obUp);
+      obOrm.g = mix(obOrm.g, max(obOrm.g, 0.72), obUp);
 
       /* --------------------------------------------- rain-burnished metal -- */
       // Steel left outdoors loses its paint and its oxide film to weather,
@@ -949,10 +1062,25 @@ const FRAG_PROLOGUE = /* glsl */ `
         // metal facing a blue sky is a mirror of a blue sky.
         float obRub = smoothstep(0.34, 0.78, obMNoiseN(obWPos * vec3(0.38, 0.11, 0.38) + 19.3));
         obWash = clamp(obWash + obRub * obSurf.w * 0.16 * (1.0 - obUp * 0.4), 0.0, 1.0);
+        // Paint does not burnish, it chalks.
+        //
+        // The recipe has already worked out where the paint film survived and
+        // where the steel is bare — that is what it writes into the metalness
+        // channel — and the wash was overriding it, driving *painted* panels to
+        // metalness 1 at roughness 0.30. A vertical painted panel at 0.30 is a
+        // mirror: it returns the sky where it faces it and near-black
+        // everywhere else, which is exactly how two hung shutters in a shaded
+        // alley came out 36-40% near-black with one saturated hue over 43% of
+        // the card. Bare steel still gets the full wash; paint gets a fifth of
+        // it, which is the chalked sheen it actually has.
+        float obBare = smoothstep(0.10, 0.55, obOrm.b);
+        obWash *= mix(0.20, 1.0, obBare);
         obOrm.b = clamp(mix(obOrm.b, 1.0, obWash), 0.0, 1.0);
-        // Weathered steel is a *blurry* mirror. Below about 0.2 it starts
-        // returning the sky as a flat colour instead of as a sheen.
-        obOrm.g = clamp(mix(obOrm.g, mix(0.30, 0.14, obUp), obWash * 0.9), 0.02, 1.0);
+        // Weathered steel is a *blurry* mirror, and a vertical face is blurrier
+        // than a rained-on top: water sheets off it and the polishing comes from
+        // hands and sleeves, not from grit under a boot. 0.30 on a wall was
+        // sharp enough to resolve the sky/wall boundary as an edge.
+        obOrm.g = clamp(mix(obOrm.g, mix(0.42, 0.15, obUp), obWash * 0.9), 0.02, 1.0);
         obAlb.rgb = mix(obAlb.rgb, mix(obAlb.rgb, vec3(0.62, 0.63, 0.66), 0.62), obWash);
       }
 
@@ -974,6 +1102,23 @@ const FRAG_PROLOGUE = /* glsl */ `
         // the wall is genuinely buried rather than merely splashed.
         float obWedge = pow(1.0 - smoothstep(obGround.x, obGround.x + obH * 0.30, obWPos.y), 1.6)
                       * (1.0 - abs(obWNrm.y)) * obGround.z;
+        // Rising damp.
+        //
+        // Splash-back dirt alone left a soft grey haze at the foot of every
+        // wall, and what a shaded alley actually shows is a hard, near-black
+        // wet band 30-45 cm up the render: masonry wicks water out of the
+        // ground continuously and it never dries in shade. It is much darker
+        // than the dirt above it, slightly *cooler* (wet stone loses its warm
+        // scatter), smoother, and it occludes — which together are what stop a
+        // wall and a floor reading as two cards that happen to touch.
+        float obDampH = obGround.y * 0.46 * mix(0.58, 1.32, obRag);
+        float obWet = 1.0 - smoothstep(obGround.x + obDampH * 0.30, obGround.x + obDampH, obWPos.y);
+        obWet = clamp(obWet, 0.0, 1.0) * (1.0 - abs(obWNrm.y)) * obGround.z * mix(0.62, 1.0, obM2);
+        obAlb.rgb *= mix(1.0, 0.42, obWet);
+        obAlb.rgb *= mix(vec3(1.0), vec3(0.93, 0.975, 1.070), obWet);
+        obOrm.g = clamp(mix(obOrm.g, 0.58, obWet * 0.75), 0.03, 1.0);
+        obOrm.r = clamp(obOrm.r * mix(1.0, 0.70, obWet), 0.0, 1.0);
+
         // Splash-back dirt: darker, desaturated, and much rougher.
         vec3 obGrime = obAlb.rgb * vec3(0.42, 0.40, 0.37);
         obAlb.rgb = mix(obAlb.rgb, obGrime, obGy);
@@ -989,10 +1134,67 @@ const FRAG_PROLOGUE = /* glsl */ `
   #endif
 
   /* ------------------------------------------------------------- wear --- */
+  // Grime is grey-brown dust and soot. It is *not* a darker version of the
+  // paint underneath — scaling a saturated albedo by 0.55 keeps every pixel on
+  // the same hue line and just moves it down, which is how a red shutter comes
+  // out as one hot orange at two values with black in the cavities. Real dirt
+  // pulls the surface toward neutral as it darkens it, and that desaturation is
+  // most of what makes a weathered object read as weathered.
   if (obWear > 0.001) {
     float cav = 1.0 - obOrm.a;
-    obAlb.rgb = mix(obAlb.rgb, obAlb.rgb * vec3(0.55, 0.52, 0.47), obWear * cav);
-    obOrm.g = clamp(mix(obOrm.g, 0.92, obWear * cav * 0.6), 0.03, 1.0);
+    float w = obWear * cav;
+    float lum = dot(obAlb.rgb, vec3(0.2126, 0.7152, 0.0722));
+    vec3 dust = mix(obAlb.rgb, vec3(lum * 1.02, lum * 0.96, lum * 0.86), 0.62) * 0.66;
+    obAlb.rgb = mix(obAlb.rgb, dust, w);
+    obOrm.g = clamp(mix(obOrm.g, 0.92, w * 0.6), 0.03, 1.0);
+  }
+
+  /* -------------------------------------------------- crevice grime ----- */
+  // "Every place two surfaces meet must darken." The base maps already carry a
+  // height field, so the shader knows where every joint, crack, dent, chip and
+  // mortar line on the surface is — and until now only obWear used it, so a
+  // material authored at wear 0 had perfectly clean crevices. Dirt accumulates
+  // by cavity before it accumulates by anything else, on every surface in the
+  // world, so it belongs here rather than in a per-material knob.
+  {
+    float obCav = smoothstep(0.34, 0.96, 1.0 - obOrm.a);
+    float obCg = obCav * (0.42 + 0.58 * obWear);
+    float obCl = dot(obAlb.rgb, vec3(0.2126, 0.7152, 0.0722));
+    obAlb.rgb = mix(obAlb.rgb, vec3(obCl * 0.62, obCl * 0.58, obCl * 0.50), obCg * 0.55);
+    obOrm.g = clamp(obOrm.g + obCg * 0.18, 0.03, 1.0);
+    // Ambient occlusion in the crevice as well as pigment: a joint is a hole,
+    // and a hole sees less sky than the face beside it.
+    obOrm.r = clamp(obOrm.r * mix(1.0, 0.70, obCg), 0.0, 1.0);
+  }
+
+  /* --------------------------------------------- weathering film -------- */
+  // Nothing outdoors keeps its factory contrast.
+  //
+  // Chalked binder, blown dust and salt settle on every exposed face, and they
+  // lift the *deep* end of a surface far more than the light end: a 1 %
+  // reflectance patch goes to 3-4 %, a 40 % patch barely moves. A texture map
+  // authored with two and a half stops of internal range keeps every bit of it
+  // forever without this, which is exactly how two hung shutters in a shaded
+  // alley came out with 27-36 % of their area more than two stops below their
+  // own mean — and a surface with a third of its area at pigment black does not
+  // read as paint, it reads as a saturated blotch pattern.
+  //
+  // Deliberately off for masonry and ground: those recipes already run a narrow
+  // palette, and the same compression there would flatten a floor.
+  if (obFilm > 0.001) {
+    // Judged on the *tinted* albedo, not on the raw map. The palette's tint is
+    // a separate uniform that never reaches this shader as part of obAlb, and
+    // most of the level's darkness lives in it — paintRed is linear 0.40,
+    // 0.03, 0.02 — so a threshold on obAlb alone fires nowhere and the term
+    // measures as a no-op.
+    vec3 obFc = obAlb.rgb * diffuse;
+    float obFl = dot(obFc, vec3(0.2126, 0.7152, 0.0722));
+    float obFdeep = 1.0 - smoothstep(0.006, 0.085, obFl);
+    // Least where the surface is a genuine cavity — dust does settle there, but
+    // a real recess is also genuinely occluded, and that darkness is earned.
+    float obFamt = obFilm * obFdeep * (1.0 - clamp(1.0 - obOrm.a, 0.0, 1.0) * 0.45);
+    vec3 obFlift = obFc * 0.44 + vec3(0.0225, 0.0210, 0.0184);
+    obAlb.rgb = mix(obAlb.rgb, obFlift / max(diffuse, vec3(1e-4)), obFamt);
   }
 
   /* --------------------------------------------------- hue / saturation - */
@@ -1001,6 +1203,14 @@ const FRAG_PROLOGUE = /* glsl */ `
     float obL = dot(obAlb.rgb, vec3(0.2126, 0.7152, 0.0722));
     obAlb.rgb = mix(vec3(obL), obAlb.rgb, obHueSat.y);
   }
+
+  /* ------------------------------------------------------ energy clamp -- */
+  // The palette may drive the diffuse uniform above 1 (SurfaceOptions.gain),
+  // because most of this level's tints are being used as darkeners on maps that
+  // are already at the right level. diffuse * obAlb is both the diffuse albedo
+  // and, where metalness is high, the specular F0, so it has to stay inside the
+  // unit cube whatever the palette asks for.
+  obAlb.rgb = min(obAlb.rgb, vec3(1.0) / max(diffuse, vec3(1e-3)));
 
   /* --------------------------------------------------- resolve normal --- */
   #ifdef OB_TRIPLANAR
@@ -1087,6 +1297,7 @@ function ensureUniforms(material: THREE.MeshStandardMaterial): ObUniforms {
     obDetailFade: { value: new THREE.Vector2(7, 24) },
     obPom: { value: new THREE.Vector3(0.02, 8, 32) },
     obWear: { value: 0 },
+    obFilm: { value: 0 },
     obNormalFade: { value: 14 },
     obBlendAlb: { value: null },
     obBlendNrm: { value: null },
@@ -1099,6 +1310,7 @@ function ensureUniforms(material: THREE.MeshStandardMaterial): ObUniforms {
     obSurf: { value: new THREE.Vector4(0, 0, 0, 0) },
     obGround: { value: new THREE.Vector3(0, 0.9, 0) },
     obCell: { value: new THREE.Vector4(0, 0, 0, 0) },
+    obPave: { value: new THREE.Vector4(1.0, 1.0, 0.0, 7.0) },
   };
   ud.obUniforms = u;
   return u;
@@ -1149,12 +1361,15 @@ export function extendStandardMaterial(
     cfg.pomMaxSteps ?? 28,
   );
   u.obWear.value = cfg.wear ?? 0;
+  u.obFilm.value = cfg.film ?? 0;
   u.obNormalFade.value = cfg.normalFadeDistance ?? 14;
   if (cfg.macro) u.obMacro.value.copy(cfg.macro);
   if (cfg.surface) u.obSurf.value.copy(cfg.surface);
   else u.obSurf.value.set(0, 0, 0, 0);
   if (cfg.cellTone) u.obCell.value.copy(cfg.cellTone);
   else u.obCell.value.set(0, 0, 0, 0);
+  if (cfg.paving) u.obPave.value.copy(cfg.paving);
+  else u.obPave.value.set(Math.max(cfg.tile, 0.05), Math.max(cfg.tile, 0.05), 0, 7);
   if (cfg.ground) u.obGround.value.copy(cfg.ground);
   else u.obGround.value.set(0, 0.9, 0);
   if (cfg.blend) {

@@ -7,8 +7,8 @@
  *    additive blending and centre-weighted metering — one vertex per tile texel,
  *    positioned at its own bin.
  * 3. Two reduction passes (256 → 16 → 1) compute the log-average of the middle
- *    of the distribution, discarding the darkest 45% and brightest 5% of the
- *    weight so a bright sky or a dark doorway cannot drag the exposure around.
+ *    of the distribution, over the weight window [`lowCut`, `highCut`], so a
+ *    bright sky or a dark doorway cannot drag the exposure around.
  * 4. The 1×1 result is packed to 16-bit and read back; adaptation and the final
  *    exposure multiplier are resolved on the CPU where gameplay can bias them.
  *
@@ -221,16 +221,43 @@ export class ExposureSystem {
   centreDepth = 10;
 
   settings: ExposureSettings = {
-    // Middle-grey target. Tuned so the *production* chain (the effect library's
-    // tonemap + grade, which is considerably more contrasty than a bare AgX)
-    // lands mid-grey on a sunlit diffuse surface. `FrameGraph.present` scales
-    // this back down when it has to tonemap by itself.
+    // Middle-grey target: the scene luminance the meter maps to, in the exposed
+    // linear buffer the tonemapper receives. `FrameGraph.present` scales this
+    // back down when it has to tonemap by itself.
     //
-    // 0.36 rather than 0.42: the trim window below no longer throws away the
-    // darkest half of the frame, so the same key now means something brighter
-    // than it used to — the number it was fitted against was the average of the
-    // *lit* part of the image, not of the image.
-    key: 0.36,
+    // This is the operating point, and the operating point is the whole game.
+    // The shipping display chain (AgX with the Punchy look, then the 32³ grade
+    // LUT) is an S-curve, and its log-log slope — display stops out per scene
+    // stop in — is not remotely flat across it. Evaluated numerically from
+    // `TonemapPass.TONEMAP_FRAG` + `ColorGrade.gradeLinear`:
+    //
+    //     exposed linear   display level   slope
+    //          0.02             45          1.48
+    //          0.06             95          1.18
+    //          0.10            123          1.00
+    //          0.18            157          0.79
+    //          0.28            181          0.64
+    //          0.45            205          0.50
+    //          0.70            223          0.37
+    //          1.20            239          0.23
+    //
+    // At 0.36 the meter parked sunlit plaza cobble at display 172-216 across
+    // three cameras twenty metres apart in the same square, i.e. at slope
+    // 0.37-0.55: three fifths of every scene stop in the brightest and most
+    // information-dense part of the frame was being thrown away by the transform
+    // before anyone looked at it. That is the "one continuous cream value from
+    // the camera to the town hall" reading, and no amount of shadow work
+    // upstream survives it.
+    //
+    // 0.30 lands the same cobble at 168/184/203 — the top of the curve's linear
+    // stretch rather than the shoulder — and buys back, measured on eroded
+    // same-material controls in one frame (physics sun-visibility ray, four-
+    // neighbour erosion, medians):
+    //     square-north  3.21 -> 3.53 stops of sunlit:shadowed separation
+    //     square-south  3.36 -> 3.68
+    //     fountain      1.82 -> 2.14
+    // while total clipped white stays at 0.0015% / 0.0012% / 0.000%.
+    key: 0.30,
     compensation: 0,
     manual: 1,
     speedUp: 3.6,
@@ -242,14 +269,26 @@ export class ExposureSystem {
     // relationship between times of day comes from `darkAdapt`.
     minEV: -8,
     maxEV: 16,
-    // 0.30 / 0.58 rather than 0.42 / 0.72. Measured across the time-of-day
-    // shots the old pair put midday and midnight 3.0 stops apart on the same
-    // tram roof; a real camera walking that cycle at a fixed key would see
-    // eleven. We cannot spend eleven — night has to stay playable — but three
-    // is what makes a day/night cycle read as a colour filter. Widening both
-    // ends buys roughly two more stops of separation while leaving the hero
-    // hour, whose EV100 sits between 0 and `brightPivot`, exactly where it is.
-    darkAdapt: 0.18,
+    // 0.32 rather than 0.18.
+    //
+    // `darkAdapt` was set to separate midnight from midday, and it does — but
+    // nothing had ever checked where this *level* actually meters, and the
+    // answer is that almost all of it lives below `darkPivot`, so the knob was
+    // silently governing the interior/exterior response as well. Surveyed at the
+    // shipped hour (raw EV100, before this curve): open square −0.13, arcade
+    // shade −1.54, lane A −2.45, north street −2.93, first-floor flat −3.11,
+    // deep warehouse −3.92. Three and eight tenths of a stop of real scene
+    // difference between the square and the warehouse, of which 0.18 compression
+    // let through 1.32 — so stepping inside barely changed the picture, which is
+    // VISUAL-BAR tell #4 and the reason the acceptance gate asks for 1.5.
+    //
+    // 0.32 passes that gate on the measurement rather than on the theory:
+    // square <-> warehouse 1.32 -> 1.74 stops, square <-> first-floor flat
+    // 1.17 -> 1.53. It does not touch the hero hour, which sits above the pivot
+    // and is therefore unchanged, and it *widens* the day/night split rather
+    // than narrowing it: midnight meters at EV100 −5.8, so it now falls 2.46
+    // stops under the pivot instead of 1.78.
+    darkAdapt: 0.32,
     brightAdapt: 0.58,
     brightPivot: 1.5,
     // Golden hour on this level meters at EV100 ≈ −0.4: with the dark rolloff
@@ -260,6 +299,18 @@ export class ExposureSystem {
     darkPivot: -0.9,
     skyWeight: 0.10,
     distantWeight: 0.35,
+    // The anchor. Left where it was, but not for want of trying: a highlight
+    // anchor is the obvious answer to "the sunlit surface is sitting on the
+    // shoulder", and on this level it measures worse. Swept in one session with
+    // everything else fixed, reading eroded plaza-stone controls off three
+    // cameras in the same square (spread = max/min of the sunlit display level,
+    // in stops; swing = square <-> deep warehouse exposure movement):
+    //     [0.10, 0.70]  spread 0.26 st   swing 0.25 st
+    //     [0.26, 0.88]  spread 0.69 st   swing 1.32 st
+    //     [0.45, 0.92]  spread 1.00 st   swing 0.43 st
+    // A low anchor makes three cameras agree with each other and makes an
+    // interior meter like the street; a high anchor does neither. The middle is
+    // where both are tolerable, and the *key* is what fixes the shoulder.
     lowCut: 0.26,
     highCut: 0.88,
   };

@@ -50,6 +50,26 @@ interface BOUserData {
   boNoSun?: boolean;
 }
 
+/**
+ * The baked top-down sky-occlusion height field, shared by every lit material.
+ *
+ * A module singleton rather than a member of `MaterialPatcher` because the two
+ * halves of the term live in different files: the shading side is here, and the
+ * bake — one orthographic depth render of every sky-blocking surface — belongs
+ * to a pass that has a `PassContext` (`passes/GtaoPass.ts`). Neither owns the
+ * other, and `RenderUniforms` is a different package's file.
+ *
+ * `info.w` is the "built" flag; until it flips, `boSkyVisibility` returns 1 and
+ * the shading is bit-identical to the term being switched off.
+ */
+export const skyField = {
+  texture: { value: null as THREE.Texture | null } as THREE.IUniform,
+  /** xy world origin (m), zw 1 / world extent — world.xz -> [0,1]. */
+  xform: { value: new THREE.Vector4(0, 0, 1, 1) } as THREE.IUniform,
+  /** x top Y (m), y depth range (m), z texel world size (m), w built flag. */
+  info: { value: new THREE.Vector4(0, 1, 1, 0) } as THREE.IUniform,
+};
+
 export function classifyMaterial(m: THREE.Material): MaterialKind | null {
   const mm = m as unknown as Record<string, boolean>;
   if (mm.isRawShaderMaterial) return null;
@@ -248,10 +268,27 @@ const MAPS_REPLACE = /* glsl */ `
 		// the middle of a 23x25 m warehouse, which is why auto-exposure moved
 		// 0.05 stops walking from one to the other. Interiors that meter the same
 		// as the street are VISUAL-BAR tell #4 on their own.
-		float boSkyVis = boSkyVisibility( vBoViewPos, normalize( normal ),
-		                                  projectionMatrix, gl_FragCoord.xy );
-		boSkyVisFrag = boSkyVis;
-		vec3 boIndirect = boShIrradiance( boIndN, boAmbientSH ) * boSkyVis;
+		//
+		// World position and world normal against a baked height field: this term
+		// used to be a screen-space march, and therefore a function of where the
+		// receiver happened to land in the frame. See the note on GLSL_SKYOCC.
+		float boSkyOpen = 1.0;
+		float boSkyVis = boSkyVisibility( vBoWorldPos, boIndN, boSkyOpen );
+
+		// Downward-facing surfaces need the enclosure, not the sky visibility.
+		//
+		// A ceiling's *sky* visibility is legitimately 1 — it faces the floor, so
+		// nothing above it can occlude anything it could see anyway. But the SH
+		// probe is a 9-coefficient fit with a large DC term, not a true sky-only
+		// hemisphere function, so a downward normal still collects a third of the
+		// zenith value out of that DC. Multiply that by 1 and an interior ceiling
+		// takes the *open sky's* fill while the floor two metres under it takes
+		// 12% of it: measured 121 sRGB against 31 on interior-flat, the ceiling
+		// 13x brighter than its own floor in linear luminance. Which is
+		// VISUAL-BAR tell #4 upside down.
+		float boSkyDiffuse = mix( boSkyVis, min( boSkyVis, boSkyOpen ), boSat( - boIndN.y ) );
+		boSkyVisFrag = boSkyDiffuse;
+		vec3 boIndirect = boShIrradiance( boIndN, boAmbientSH ) * boSkyDiffuse;
 
 		// Ground bounce.
 		//
@@ -286,9 +323,9 @@ const MAPS_REPLACE = /* glsl */ `
 		// a sunlit plaza. Neither gate reaches zero — multiply-scattered light does
 		// not, and zeroing it would re-open the "underside of an awning reads as a
 		// hole cut in the scene" problem this term exists to fix.
-		float boGroundLit = max( boSunVis, boSkyVis * boSkyVis );
+		float boGroundLit = max( boSunVis, boSkyOpen * boSkyOpen );
 		vec3 boGroundIrr =
-			  boShIrradiance( vec3( 0.0, 1.0, 0.0 ), boAmbientSH ) * mix( 0.18, 1.0, boSkyVis )
+			  boShIrradiance( vec3( 0.0, 1.0, 0.0 ), boAmbientSH ) * mix( 0.18, 1.0, boSkyOpen )
 			+ boSunColor * max( boSunDirWorld.y, 0.0 ) * mix( 0.10, 1.0, boGroundLit );
 		boIndirect += boGroundIrr * BO_GROUND_ALBEDO * max( 0.5 - 0.5 * boIndN.y, 0.0 );
 
@@ -409,8 +446,16 @@ export class MaterialPatcher {
    * Strength ships at 1.0, i.e. the term is live. `World.setAmbient`'s intensity
    * can only come down once this exists; before it, dropping the ambient just
    * made outdoors flat and dark.
+   *
+   * The radius is a *horizon search* radius against the baked height field now,
+   * not a screen-space tap radius: 12 m is far enough to see the roofline of the
+   * terrace across a street and close enough that a lamp column is not treated
+   * as a building. The response exponent came down from 1.9 to 1.25 with the
+   * estimator change — 1.9 was compensating for a screen-space integral that
+   * under-reported enclosure, and applied to a real cosine-weighted sky fraction
+   * it crushes every facade in the level.
    */
-  readonly skyOcc: THREE.IUniform = { value: new THREE.Vector4(1.0, 16.0, 0.12, 1.9) };
+  readonly skyOcc: THREE.IUniform = { value: new THREE.Vector4(1.0, 12.0, 0.12, 1.25) };
 
   constructor(private uniforms: RenderUniforms) {
     this.sharedUniforms = uniforms.shared();
@@ -489,7 +534,12 @@ export class MaterialPatcher {
       for (const k in shared) shader.uniforms[k] = shared[k];
       shader.uniforms.boMatId = matId;
       shader.uniforms.boPrevModelMatrix = prevMatrix;
-      if (wantSun) shader.uniforms.boSkyOccParams = this.skyOcc;
+      if (wantSun) {
+        shader.uniforms.boSkyOccParams = this.skyOcc;
+        shader.uniforms.boSkyHeight = skyField.texture;
+        shader.uniforms.boSkyFieldXform = skyField.xform;
+        shader.uniforms.boSkyFieldInfo = skyField.info;
+      }
 
       // --- vertex -------------------------------------------------------
       if (hasVertexAnchor) {

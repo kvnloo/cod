@@ -186,6 +186,7 @@ uniform vec3 uSunDisc;    // radiance of the disc itself
 uniform vec4 uAtmo;       // x sunIntensity, y betaM, z mieG, w altitude
 uniform vec4 uNight;      // x nightAmount, y moonIntensity, z moonPhase, w airglow
 uniform vec4 uGround;     // xyz albedo, w bounce strength
+uniform vec4 uGround2;    // x fraction of the ground that can see the sun
 uniform vec4 uWeather;    // x greyness, y disc enable, z horizonHaze, w unused
 uniform vec4 uMs;         // x amount, y horizon falloff, z forward power, w disc gain
 uniform vec3 uFogTint;
@@ -237,13 +238,25 @@ vec3 boSkyRadiance( vec3 dir ) {
 
 	// --- Lambertian ground bounce below the horizon. Without this the lower
 	// hemisphere is black and every vertical surface in the level goes dead.
+	//
+	// The sun term is weighted by uGround2.x, the fraction of the ground that can
+	// actually see the sun. It used to be an implicit 1.0 — a *fully sunlit*
+	// ground, everywhere, at every hour — and this hemisphere is not decoration:
+	// boAerialPerspective samples this cubemap along the view ray, and every view
+	// ray that lands on the floor points DOWN. So the aerial-perspective
+	// in-scatter on the plaza was the colour and brightness of ground in full
+	// sun, added unshadowed to shadowed and sunlit cobble alike. Measured on
+	// square-south at ambient 3.2 / specular probe 1.0: taking the fog out
+	// entirely dropped the shadowed stone from 80.3 to 57.4 display levels and
+	// its linear R:B from 1.461 (warmer than the key) to 0.915 (properly cool),
+	// i.e. one whole stop of warm, unshadowed lift on every shadow in the frame.
 	if ( dir.y < 0.10 ) {
 		float k = boSat( ( 0.10 - dir.y ) / 0.35 );
 		vec3 t2;
 		vec3 hemi = boAtmosphere( normalize( vec3( dir.x, 0.30, dir.z ) ),
 			uAtmo.w, uSunDir, uAtmo.x, uAtmo.y, uAtmo.z, t2 );
 		vec3 skyIrradiance = hemi * BO_PI;
-		vec3 groundIrradiance = uSunLum * max( uSunDir.y, 0.0 ) + skyIrradiance;
+		vec3 groundIrradiance = uSunLum * max( uSunDir.y, 0.0 ) * uGround2.x + skyIrradiance;
 		vec3 groundCol = uGround.xyz * groundIrradiance * ( 1.0 / BO_PI ) * uGround.w;
 		// Keep a little of the sky so the far distance reads as haze, not dirt.
 		groundCol = mix( groundCol, col * 0.9 + groundCol * 0.3, boSat( 0.35 + uWeather.z ) );
@@ -440,9 +453,47 @@ export class SkySystem {
   /** Per-level ambient controls, driven by the world system through the API. */
   ambientTint = new THREE.Color(1, 1, 1);
   ambientIntensity = 1;
+
+  /**
+   * Scale applied to the *specular* environment probe (`scene.environmentIntensity`).
+   *
+   * This used to be driven from `ambientIntensity`, i.e. the level's diffuse
+   * fill scale — 3.2 on this map. That number is an **irradiance** artistic
+   * scale; `scene.environmentIntensity` is a **radiance** scale, and after
+   * `MaterialPatch.MAPS_REPLACE` swaps the diffuse IBL for the SH probe it
+   * reaches nothing except `getIBLRadiance`. Running it at 3.2 put a 1.68-stop
+   * over-bright, view-dependent, *unshadowed* sky reflection on every surface in
+   * the level, and on a plaza seen at grazing incidence from eye height that
+   * sheen is what a cast shadow was competing with.
+   *
+   * Measured on eroded same-material plaza-stone controls (physics sun-visibility
+   * ray, four-neighbour erosion, one frame, shipping display chain), 3.2 -> 1.0:
+   *   square-north  1.51 -> 2.89 stops of sunlit:shadowed separation
+   *   square-south  1.80 -> 2.82
+   *   fountain      0.73 -> 1.67
+   * with the sunlit level essentially unmoved (172->175, 188->196, 215->216) and
+   * clipping unchanged. 1.0 is the physically correct scale for a probe that was
+   * baked in the same units the camera sees.
+   */
+  specularIntensity = 1;
+
   /** Diffuse albedo of the terrain, used for the sky's ground-bounce term. */
   readonly groundAlbedo = new THREE.Color(0.24, 0.225, 0.20);
   groundBounce = 1;
+  /**
+   * Fraction of the ground the sun can actually reach, for the bake's
+   * ground-bounce hemisphere. See the note in `SKY_RADIANCE`.
+   *
+   * The level's own raycast census (`__WORLD__.sunCensus`, 2 m grid) puts the
+   * lit fraction of playable ground at 27.3% at the shipped hour; roofs, upper
+   * facades and the terrace bounce too, so the effective figure a downward view
+   * ray sees is higher than that but nowhere near 1. 0.45 is the value that
+   * reproduces the measured fix: it turns the shadowed plaza stone from *warmer*
+   * than the key (linear R:B 1.575 against the key's 1.555 on `square-north`)
+   * to properly cooler (1.337 against 1.531), and adds a third of a stop to the
+   * sunlit:shadowed separation on top of the specular-probe fix.
+   */
+  groundSunLit = 0.45;
 
   private renderer!: THREE.WebGLRenderer;
   private blitter!: FullscreenBlitter;
@@ -497,6 +548,7 @@ export class SkySystem {
       uAtmo: { value: new THREE.Vector4(SKY_INTENSITY, 13e-6, 0.76, this.altitude) },
       uNight: { value: new THREE.Vector4(0, 0, 0, 1) },
       uGround: { value: new THREE.Vector4(0.21, 0.19, 0.16, 1) },
+      uGround2: { value: new THREE.Vector4(0.45, 0, 0, 0) },
       uWeather: { value: new THREE.Vector4(0, disc, 0.05, SKY_SATURATION) },
       uMs: { value: new THREE.Vector4(0.032, 3.2, 4.0, SUN_ANGULAR_RADIUS) },
       uFogTint: { value: new THREE.Color(0.72, 0.74, 0.78) },
@@ -676,6 +728,14 @@ export class SkySystem {
       this.bake(scene);
     }
 
+    // The sky owns the environment probe, so it owns the probe's scale. This is
+    // re-asserted every frame rather than only at bake time because
+    // `RenderSystem.setAmbient` also writes this field, from the level's diffuse
+    // fill scale — see `specularIntensity`. One float store; it removes an
+    // ordering dependency that is otherwise invisible until a level retunes its
+    // ambient at runtime and every metal in the frame changes brightness.
+    scene.environmentIntensity = this.specularIntensity;
+
     this.pushUniforms();
   }
 
@@ -711,6 +771,7 @@ export class SkySystem {
       (u.uGround.value as THREE.Vector4).set(
         this.groundAlbedo.r, this.groundAlbedo.g, this.groundAlbedo.b, this.groundBounce,
       );
+      (u.uGround2.value as THREE.Vector4).x = THREE.MathUtils.clamp(this.groundSunLit, 0, 1);
       const w = u.uWeather.value as THREE.Vector4;
       w.x = this.rain * 0.55 + this.fogAmount * 0.35;
       w.z = 0.045 + this.fogAmount * 0.55 + this.rain * 0.3;
@@ -769,7 +830,7 @@ export class SkySystem {
     const next = this.pmrem.fromCubemap(this.cubeTarget.texture, this.pmremTarget);
     this.pmremTarget = next;
     scene.environment = next.texture;
-    scene.environmentIntensity = this.ambientIntensity;
+    scene.environmentIntensity = this.specularIntensity;
 
     renderer.autoClear = prevAutoClear;
     renderer.setRenderTarget(prevTarget);

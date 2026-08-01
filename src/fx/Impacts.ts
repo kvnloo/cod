@@ -141,10 +141,11 @@ export class Impacts {
     g.begin({
       cell: CELL.DUST, frames: CELL.DUST_FRAMES, model: MODEL.MEDIA,
       flags: FLAG.ANIM | FLAG.FADEIN | FLAG.SHADOW,
-      r: tint[0] * 1.25, g: tint[1] * 1.22, b: tint[2] * 1.18,
+      // Warm pale concrete — lifted off the wall albedo so dust reads in sun.
+      r: tint[0] * 1.55, g: tint[1] * 1.48, b: tint[2] * 1.35,
       drag: 3.4, gravity: -0.03, turbulence: 0.5,
     });
-    g.pushMany(9 + Math.round(6 * detail), (d, i) => {
+    g.pushMany(12 + Math.round(8 * detail), (d, i) => {
       const s = 0.35 + rand.next() * 0.75;
       tmp.copy(nrm).multiplyScalar(1.1 + rand.next() * 1.6)
         .addScaledVector(tan, rand.signed() * 1.5)
@@ -153,12 +154,12 @@ export class Impacts {
       d.py = p.y + nrm.y * 0.12 + tmp.y * 0.05;
       d.pz = p.z + nrm.z * 0.12 + tmp.z * 0.05;
       d.vx = tmp.x * s; d.vy = tmp.y * s + 0.25; d.vz = tmp.z * s;
-      d.sizeBegin = (0.07 + rand.next() * 0.05) * dustMul;
-      d.sizeEnd = (0.30 + rand.next() * 0.34) * dustMul * (0.7 + power * 0.5);
+      d.sizeBegin = (0.10 + rand.next() * 0.08) * dustMul;
+      d.sizeEnd = (0.48 + rand.next() * 0.42) * dustMul * (0.7 + power * 0.5);
       d.lifetime = 0.7 + rand.next() * 0.8;
       d.rot = rand.range(0, 6.28);
       d.spin = rand.signed() * 1.2;
-      d.opacity = 0.34 + rand.next() * 0.24;
+      d.opacity = 0.58 + rand.next() * 0.28;
       void i;
     });
 
@@ -169,7 +170,7 @@ export class Impacts {
       r: tint[0] * 1.1, g: tint[1] * 1.08, b: tint[2] * 1.05,
       drag: 1.5, gravity: -0.05, turbulence: 0.9,
     });
-    g.pushMany(4 + Math.round(4 * detail), (d) => {
+    g.pushMany(6 + Math.round(5 * detail), (d) => {
       tmp.copy(nrm).multiplyScalar(0.4 + rand.next() * 0.8)
         .addScaledVector(tan, rand.signed() * 0.9)
         .addScaledVector(bit, rand.signed() * 0.9);
@@ -177,12 +178,12 @@ export class Impacts {
       d.py = p.y + nrm.y * 0.22 + tmp.y * 0.10;
       d.pz = p.z + nrm.z * 0.22 + tmp.z * 0.10;
       d.vx = tmp.x * 0.5; d.vy = tmp.y * 0.5 + 0.35; d.vz = tmp.z * 0.5;
-      d.sizeBegin = 0.12 * dustMul;
-      d.sizeEnd = (0.70 + rand.next() * 0.62) * dustMul;
+      d.sizeBegin = 0.16 * dustMul;
+      d.sizeEnd = (0.95 + rand.next() * 0.72) * dustMul;
       d.lifetime = 1.6 + rand.next() * 1.6;
       d.rot = rand.range(0, 6.28);
       d.spin = rand.signed() * 0.4;
-      d.opacity = 0.13 + rand.next() * 0.11;
+      d.opacity = 0.28 + rand.next() * 0.18;
     });
 
     // --- chips: the debris that says "masonry" rather than "smoke machine"
@@ -209,7 +210,7 @@ export class Impacts {
       d.spin = rand.signed() * 16;
     });
 
-    this.impactFlash(w, p, 0.07 * power, 0xffd9a0, 0.30);
+    this.impactFlash(w, p, 0.11 * power, 0xffe2b0, 0.42);
   }
 
   /* ------------------------------------------------------------------ metal */
@@ -615,54 +616,75 @@ export class Impacts {
   /* ------------------------------------------------------------------ flesh */
 
   private flesh(w: FxWorld, p: THREE.Vector3, power: number, detail: number, floorY: number): void {
-    if (!w.blood) {
-      this.impactFlash(w, p, 0.05, 0x886655, 0.3);
-      return;
-    }
+    // Always a punch of light so the hit is readable even with blood off, and
+    // so a still capture has a hot core when the mist is mid-expand.
+    this.impactFlash(w, p, 0.09 * power, w.blood ? 0xc02018 : 0x886655, 0.38);
+    if (!w.blood) return;
     const { particles: g, rand } = w;
 
-    // --- mist: a puff of atomised blood that hangs for a fraction of a second
+    // --- mist: saturated arterial red, MEDIA so it holds opacity in sun
     g.begin({
-      cell: CELL.BLOOD_MIST, frames: 1, model: MODEL.THIN,
+      cell: CELL.BLOOD_MIST, frames: 1, model: MODEL.MEDIA,
       flags: FLAG.FADEIN | FLAG.SHADOW,
-      r: 0.36, g: 0.030, b: 0.024, opacity: 0.62,
-      drag: 2.6, gravity: 0.35, turbulence: 0.3,
+      r: 0.78, g: 0.045, b: 0.032, opacity: 0.92,
+      drag: 2.2, gravity: 0.28, turbulence: 0.35,
     });
-    g.pushMany(7 + Math.round(7 * detail), () => {
+    g.pushMany(11 + Math.round(9 * detail), () => {
       const d = g.desc;
-      const s = 1.2 + rand.next() * 3.2 * power;
+      const s = 1.4 + rand.next() * 3.6 * power;
       tmp.copy(ref).multiplyScalar(0.8 + rand.next() * 0.7)
         .addScaledVector(tan, rand.signed() * 0.8)
         .addScaledVector(bit, rand.signed() * 0.8).normalize();
       d.px = p.x; d.py = p.y; d.pz = p.z;
-      d.vx = tmp.x * s; d.vy = tmp.y * s + 0.3; d.vz = tmp.z * s;
-      d.sizeBegin = 0.07; d.sizeEnd = 0.42 + rand.next() * 0.42;
-      d.lifetime = 0.4 + rand.next() * 0.45;
+      d.vx = tmp.x * s; d.vy = tmp.y * s + 0.35; d.vz = tmp.z * s;
+      d.sizeBegin = 0.12; d.sizeEnd = 0.62 + rand.next() * 0.55;
+      d.lifetime = 0.55 + rand.next() * 0.55;
       d.rot = rand.range(0, 6.28); d.spin = rand.signed() * 1.6;
+      d.opacity = 0.72 + rand.next() * 0.22;
+    });
+
+    // --- dense core: a single opaque blot that sells the entry wound at 15 m
+    g.begin({
+      cell: CELL.BLOOD_MIST, frames: 1, model: MODEL.MEDIA,
+      flags: FLAG.FADEIN,
+      r: 0.92, g: 0.06, b: 0.04, opacity: 1,
+      drag: 3.5, gravity: 0.15, turbulence: 0.1,
+    });
+    g.pushMany(3 + Math.round(2 * detail), () => {
+      const d = g.desc;
+      tmp.copy(ref).multiplyScalar(0.4 + rand.next() * 0.4)
+        .addScaledVector(tan, rand.signed() * 0.35)
+        .addScaledVector(bit, rand.signed() * 0.35).normalize();
+      d.px = p.x + tmp.x * 0.04; d.py = p.y + tmp.y * 0.04; d.pz = p.z + tmp.z * 0.04;
+      d.vx = tmp.x * 0.8; d.vy = tmp.y * 0.8 + 0.1; d.vz = tmp.z * 0.8;
+      d.sizeBegin = 0.18; d.sizeEnd = 0.36 + rand.next() * 0.18;
+      d.lifetime = 0.28 + rand.next() * 0.18;
+      d.rot = rand.range(0, 6.28); d.spin = rand.signed();
+      d.opacity = 0.95;
     });
 
     // --- droplets thrown along the exit direction
     g.begin({
       cell: CELL.BLOOD_DROP, frames: 1, model: MODEL.THIN,
       flags: FLAG.STRETCH | FLAG.COLLIDE,
-      r: 0.28, g: 0.018, b: 0.014, opacity: 1,
+      r: 0.62, g: 0.04, b: 0.028, opacity: 1,
       drag: 0.3, gravity: 1, bounce: 0, floorY,
     });
-    g.pushMany(9 + Math.round(9 * detail), () => {
+    g.pushMany(12 + Math.round(10 * detail), () => {
       const d = g.desc;
-      const s = 2.5 + rand.next() * 6 * power;
+      const s = 2.8 + rand.next() * 6.5 * power;
       tmp.copy(ref).multiplyScalar(0.9 + rand.next() * 0.6)
         .addScaledVector(tan, rand.signed() * 0.6)
         .addScaledVector(bit, rand.signed() * 0.6).normalize();
       d.px = p.x; d.py = p.y; d.pz = p.z;
       d.vx = tmp.x * s; d.vy = tmp.y * s + 0.9; d.vz = tmp.z * s;
-      d.sizeBegin = 0.020 + rand.next() * 0.026;
-      d.sizeEnd = 0.016;
-      d.lifetime = 0.8 + rand.next() * 0.5;
+      d.sizeBegin = 0.028 + rand.next() * 0.034;
+      d.sizeEnd = 0.020;
+      d.lifetime = 0.85 + rand.next() * 0.55;
     });
 
     // --- a handful of tracked droplets that leave decals where they land
-    const n = Math.round(clamp(3 * detail, 1, 6));
+    const n = Math.round(clamp(4 * detail, 2, 8));
     for (let i = 0; i < n; i++) {
       const drop = this.droplets.find((d) => !d.active);
       if (!drop) break;
@@ -675,7 +697,7 @@ export class Impacts {
       drop.vx = tmp.x * s; drop.vy = tmp.y * s + 1.2; drop.vz = tmp.z * s;
       drop.floorY = floorY;
       drop.age = 0;
-      drop.size = 0.16 + rand.next() * 0.4;
+      drop.size = 0.18 + rand.next() * 0.45;
     }
   }
 

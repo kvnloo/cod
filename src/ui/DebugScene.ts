@@ -189,8 +189,9 @@ export function registerUiDebugScene(hud: HUDSystem, ctx: EngineContext): void {
 
     // Direct HUD call rather than `damage:taken`: the bus event also drives the
     // player system's health and the renderer's full-screen damage effect, which
-    // would flood the frame we are trying to photograph.
-    hud.damageFrom(Math.atan2(-0.82, 0.57), 0.62);
+    // would flood the frame we are trying to photograph. Keep strength modest
+    // so the rim indicators read without a full red wash.
+    hud.damageFrom(Math.atan2(-0.82, 0.57), 0.38);
     step(4);
 
     hud.scorePopup(50, 'ASSIST');
@@ -202,7 +203,9 @@ export function registerUiDebugScene(hud: HUDSystem, ctx: EngineContext): void {
     hud.subtitle({ speaker: 'OVERLORD', text: 'Uplink secured. Hold that position.' });
 
     // Beats that must land inside the harness's 0.4 s settle window.
-    hud.schedule(0.10, () => {
+    // Hitmarker + killfeed fire early so they are mid-punch (~70–150 ms old)
+    // when the shutter opens — not scheduled so late they barely appear.
+    hud.schedule(0.04, () => {
       hud.killfeed({
         killer: 'HAVOC', victim: 'GHOST-ACTUAL', weapon: 'lmg', headshot: false,
         killerIsPlayer: false, victimIsPlayer: true,
@@ -211,15 +214,17 @@ export function registerUiDebugScene(hud: HUDSystem, ctx: EngineContext): void {
         targetId: 42, amount: 43, headshot: true, killed: false,
         point: ahead(11, 1.6, 0.4), fromPlayer: true,
       });
+      bus.emit('hud:hitmarker', { headshot: true, killed: false, armor: false });
     });
-    hud.schedule(0.20, () => hud.damageFrom(Math.atan2(0.55, -0.83), 0.42));
-    hud.schedule(0.24, () => hud.scorePopup(25, 'HIT'));
-    hud.schedule(0.31, () => bus.emit('hud:hitmarker', { headshot: true, killed: false, armor: false }));
+    hud.schedule(0.10, () => hud.scorePopup(25, 'HIT'));
+    hud.schedule(0.14, () => hud.damageFrom(Math.atan2(0.55, -0.83), 0.28));
+    // Second marker keeps the sandwich alive if the first fades before settle ends.
+    hud.schedule(0.22, () => bus.emit('hud:hitmarker', { headshot: false, killed: true, armor: false }));
     hud.promptProgress(0.62);
 
     // Wall-clock pause so DOM transitions (subtitles) finish. It does not
     // advance the simulation, so the posed canvas state is untouched.
-    await sleep(320);
+    await sleep(280);
   };
 
   /* ------------------------------------------------------------ shots -- */
@@ -260,11 +265,11 @@ export function registerUiDebugScene(hud: HUDSystem, ctx: EngineContext): void {
         hud.scorePopup(150, 'HEADSHOT');
         step(24);
         hud.flourish('HEADSHOT', 'CRITICAL HIT');
-        hud.schedule(0.30, () => bus.emit('hud:hitmarker', { headshot: false, killed: true, armor: false }));
-        hud.schedule(0.12, () => bus.emit('damage:dealt', {
+        hud.schedule(0.06, () => bus.emit('damage:dealt', {
           targetId: 51, amount: 112, headshot: true, killed: true,
           point: ahead(16, -0.8, 0.2), fromPlayer: true,
         }));
+        hud.schedule(0.10, () => bus.emit('hud:hitmarker', { headshot: false, killed: true, armor: false }));
       },
     },
     {
@@ -339,13 +344,13 @@ export function registerUiDebugScene(hud: HUDSystem, ctx: EngineContext): void {
         setAmmo(0, 31);
         hud.model.match.timeLeft = 38;
         step(60);
-        hud.damageFrom(-2.1, 0.9);
+        hud.damageFrom(-2.1, 0.55);
         step(18);
-        hud.damageFrom(1.35, 0.7);
+        hud.damageFrom(1.35, 0.45);
         step(10);
         hud.subtitle({ speaker: 'OVERLORD', text: 'You are hit — find cover and regroup.' });
-        await sleep(320);
-        hud.schedule(0.16, () => hud.damageFrom(Math.atan2(0.1, -0.99), 0.95));
+        await sleep(280);
+        hud.schedule(0.12, () => hud.damageFrom(Math.atan2(0.1, -0.99), 0.5));
       },
     },
     {
@@ -368,16 +373,16 @@ export function registerUiDebugScene(hud: HUDSystem, ctx: EngineContext): void {
         step(26);
         hud.scorePopup(300, 'KILLSTREAK');
         hud.flourish('ENEMY DOWN');
-        hud.schedule(0.06, () => bus.emit('damage:dealt', {
+        hud.schedule(0.04, () => bus.emit('damage:dealt', {
           targetId: 61, amount: 96, headshot: false, killed: true,
           point: ahead(9, -1.2, 0.6), fromPlayer: true,
         }));
-        hud.schedule(0.12, () => bus.emit('damage:dealt', {
+        hud.schedule(0.08, () => bus.emit('damage:dealt', {
           targetId: 62, amount: 38, headshot: true, killed: false,
           point: ahead(14, 2.4, 1.1), fromPlayer: true,
         }));
-        hud.schedule(0.28, () => bus.emit('hud:hitmarker', { headshot: false, killed: true, armor: false }));
-        hud.schedule(0.34, () => bus.emit('hud:hitmarker', { headshot: false, killed: false, armor: true }));
+        hud.schedule(0.10, () => bus.emit('hud:hitmarker', { headshot: false, killed: true, armor: false }));
+        hud.schedule(0.18, () => bus.emit('hud:hitmarker', { headshot: false, killed: false, armor: true }));
       },
     },
     {

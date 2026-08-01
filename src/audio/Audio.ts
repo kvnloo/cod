@@ -367,10 +367,15 @@ export class AudioSystem implements System, AudioAPI {
     this.on('weapon:reload:start', (e) => {
       if (!this.running) return;
       this.reload?.cancel();
-      this.reload = playReload(this.sfx, e.weaponId, e.tactical, true);
+      // Optional duration is stamped by WeaponSystem when reloadScale stretches
+      // the view-model; stages are fractions of that total (cat C AV sync).
+      const duration = (e as { duration?: number }).duration;
+      this.reload = playReload(this.sfx, e.weaponId, e.tactical, true, 0, 0, 0, duration);
     });
 
     this.on('weapon:reload:end', () => {
+      // Interrupt must silence remaining stages (sprint/fire cancel pre/post commit).
+      this.reload?.cancel();
       this.reload = null;
     });
 

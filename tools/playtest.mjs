@@ -378,7 +378,7 @@ const GATES = [
     read: (r) => r.combat.ttfc && r.combat.ttfc.medianSec,
     ok: (v) => Number.isFinite(v) && v >= 3 && v <= 8,
     why: 'Category F: longer than 8 s is boring; shorter than 3 s is spawn-trapping. '
-      + 'Samples are death→re-engage / cold-spawn contact (proximity ≤32 m or damage), '
+      + 'Samples are death→re-engage / cold-spawn contact (proximity ≤18 m or damage), '
       + 'not merely "an enemy exists on the map". Advisory until the distribution is settled.',
   },
   {
@@ -394,27 +394,25 @@ const GATES = [
     id: 'npe-look-hint', hard: false,
     what: 'CLICK TO LOOK armed until pointer lock on first match',
     target: 'lookHint armed (or already locked)',
-    read: (r) => r.npe && (r.npe.lookHint === true || r.npe.pointerLocked === true || r.npe.controlStripShown === true),
+    read: (r) => r.npe && (r.npe.lookHint === true || r.npe.pointerLocked === true),
     ok: (v) => v === true,
-    why: 'Category G: pointer-lock acquisition must be prompted until the player locks. '
+    why: 'Category G: pointer-lock acquisition must be prompted until the player locks '
+      + '(lookHint stays armed; menus must not permanently dismiss it). '
       + 'Advisory NPE surface for playtest; headless sessions may not lock the pointer.',
   },
   {
     id: 'ttk-zone-spread', hard: false,
-    what: 'zone TTK ordering at 10 m (AR): chest faster than leg; head band scores headshots',
-    target: 'chestMs < legMs && head band records headshots',
+    what: 'zone TTK at 10 m (AR): head < 0.85×leg, chest < leg',
+    target: 'headMs < 0.85*legMs && chestMs < legMs',
     read: (r) => r.combat.ttkZones,
     ok: (v) => {
       if (!v) return false;
-      const chestOk = Number.isFinite(v.chestMs) && Number.isFinite(v.legMs) && v.chestMs < v.legMs;
-      const headShots = v.detail && v.detail.head && v.detail.head.headshots;
-      // Full-auto head TTK is miss-dominated (tiny hitbox + recoil); require the
-      // head band to actually land headshots and torso to beat legs on TTK.
-      return chestOk && headShots > 0;
+      const head = v.headMs, chest = v.chestMs, leg = v.legMs;
+      if (![head, chest, leg].every(Number.isFinite)) return false;
+      return head < 0.85 * leg && chest < leg;
     },
-    why: 'Prompt E: zones must produce distinct lethality — torso faster than legs, and the '
-      + 'head band must land real headshots. Full-auto head TTK under recoil is miss-dominated '
-      + 'so the gate keys on ordering + headshot counts, not raw head clock time. Advisory.',
+    why: 'Prompt E: headshot TTK must be materially shorter than leg TTK (head < 0.85×leg @ 10 m) '
+      + 'and torso must beat legs. Full-health targets + recoil-compensated aim. Advisory.',
   },
 ];
 
@@ -763,6 +761,11 @@ function INSTALL_PROBE() {
       }
       player.camera.yaw = yaw;
       player.camera.pitch = pitch;
+    },
+    /** Zero transient recoil so zone TTK probes hitbox mults, not spray skill. */
+    zeroRecoil() {
+      const c = player.camera;
+      if (c && typeof c.reset === 'function') c.reset(c.yaw, c.pitch);
     },
     /** Drops a combatant on the ground `metres` down `yaw` from the player. */
     spawnTarget(yaw, metres, opts) {
@@ -1382,6 +1385,8 @@ async function runTtkZones(session) {
       a.setFrozen(true);
       a.giveWeapon(weaponId);
       a.refill();
+      // req.health is a *scale* on archetype HP (1 = full 200 rifleman). Using 200
+      // would mint a 40k sponge and null every TTK. Zone mults drive head < leg.
       const spawn = a.spawnTarget(yaw, m, { archetype: 'rifleman', health: 1, seed: 11 });
       if (spawn.id < 0) {
         a.setCombat(true); a.setFrozen(false); a.setSpawnLock(false); a.setRender(true);
@@ -1399,9 +1404,12 @@ async function runTtkZones(session) {
       let lastAmmo = e.get('weapons').current.ammo;
       const maxSteps = Math.ceil(capS * 120);
       for (let i = 0; i < maxSteps; i++) {
+        if (typeof a.zeroRecoil === 'function') a.zeroRecoil();
         a.aimAt(spawn.pos[0], aimY, spawn.pos[2]);
         hold(['ads', 'fire'], []);
         e.stepFrame(1 / 120);
+        if (typeof a.zeroRecoil === 'function') a.zeroRecoil();
+        a.aimAt(spawn.pos[0], aimY, spawn.pos[2]);
         const w = e.get('weapons').current;
         if (w.ammo < lastAmmo) {
           shots += lastAmmo - w.ammo;
@@ -1711,12 +1719,14 @@ async function runLive(session, ms, warmupMs, timeline = LIVE_TIMELINE) {
   // frames is a real cost, but it is not what "the framerate is bad" means.
   const keep = [], ctx = [], cpu = [];
   let acc = 0;
+  // wall[i] = start(frame i)→start(frame i+1); cpu[i]/ctx[i] belong to frame i.
+  // Pairing i+1 attributed the next frame's body/context to this wall sample.
   for (let i = 0; i < raw.wall.length; i++) {
     acc += raw.wall[i];
     if (acc < warmupMs) continue;
     keep.push(raw.wall[i]);
-    cpu.push(raw.cpu[i + 1] ?? raw.cpu[i]);
-    ctx.push(raw.ctx[i + 1] ?? raw.ctx[i]);
+    cpu.push(raw.cpu[i] ?? 0);
+    ctx.push(raw.ctx[i] || {});
   }
   const frame = stats(keep);
   frame.warmupDiscardedFrames = raw.wall.length - keep.length;

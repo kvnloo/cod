@@ -157,15 +157,21 @@ export class PhysicsSystem implements System, PhysicsAPI {
     }
 
     this.accumulator += dt;
-    // Cap the catch-up so a hitch cannot spiral into a multi-second solve.
-    const maxSteps = 3;
+    // Cap catch-up: multi-step stacks with ragdoll construct on death frames.
+    // Prefer 1 step when corpses are live; never more than 2.
+    const liveRags = this.ragdolls?.count ?? 0;
+    const maxSteps = liveRags > 0 ? 1 : 2;
     let steps = 0;
     while (this.accumulator >= this.simDt - 1e-9 && steps < maxSteps) {
       this.accumulator -= this.simDt;
       steps++;
       this.stepOnce(this.simDt);
     }
-    if (steps >= maxSteps) this.accumulator = 0;
+    // Keep one step of debt (do not wipe) so hitch remainder still advances
+    // clocks without a second full solve on this display frame.
+    if (steps >= maxSteps) {
+      this.accumulator = Math.min(this.accumulator, this.simDt);
+    }
   }
 
   private stepOnce(dt: number): void {

@@ -470,13 +470,9 @@ export class WeaponSystem implements System {
       bus.emit('notify', { text: 'Cooked off', kind: 'warn' });
     }
 
-    // The jump impulse has no event of its own, so read the edge directly:
-    // the weapon lifts as the legs push, then compresses again on landing
-    // (which does have an event).
-    if (input.pressed('jump') && this.stanceGrounded && this.timeNow - this.lastJumpAt > 0.25) {
-      this.lastJumpAt = this.timeNow;
-      this.viewModel.jump();
-    }
+    // Jump bob also has a present-path ack (tryJumpBob in update) so the first
+    // visible lift never waits a fixed step; this is the sim-edge fallback.
+    this.tryJumpBob();
 
     // Order matters and is the whole point: aim intent → the blend that intent
     // drives → the spread context that reads the blend → actions → the trigger.
@@ -669,15 +665,16 @@ export class WeaponSystem implements System {
       if (shellReload) this.tickShellReload();
       else this.tickMagReload();
       // Cancel windows (cat A):
-      // - Sprint always cancels (any progress).
+      // - Sprint always cancels (any progress), including pre-commit.
+      // - Mag: fire/ADS cancel at any progress — pre-commit discards the mag
+      //   in, post-commit keeps already-added ammo (consumeCommit already ran).
       // - Shell: fire cancels once at least one shell is chambered.
-      // - Mag: fire/ADS cancel only after addAmmo commits — window is 0 ms from
-      //   that fixed step (same-step cancel then fire is legal once reloading=false).
-      const magCancelReady = !shellReload && this.viewModel.ammoCommitted
-        && (input.held('fire') || input.held('ads') || input.pressed('fire') || input.pressed('ads'));
+      const wantCombatCancel = input.held('fire') || input.held('ads')
+        || input.pressed('fire') || input.pressed('ads');
+      const magCancel = !shellReload && wantCombatCancel;
       if (this.stanceSprinting
         || (shellReload && input.pressed('fire') && w.ammo > 0)
-        || magCancelReady) {
+        || magCancel) {
         this.finishReload(false);
       }
     }
@@ -699,6 +696,7 @@ export class WeaponSystem implements System {
 
     if (def.reload.perShell !== undefined) {
       this.viewModel.startShellReload(999);
+      // duration omitted: shell loop uses family choreography in Foley.
       bus.emit('weapon:reload:start', { weaponId: w.id, tactical: !empty });
       return;
     }
@@ -706,7 +704,10 @@ export class WeaponSystem implements System {
     const duration = base * slot.stats.reloadScale;
     this.viewModel.startReload(empty, duration);
     this.nextShotAt = Math.max(this.nextShotAt, this.timeNow + duration * def.reload.addAmmoAt);
-    bus.emit('weapon:reload:start', { weaponId: w.id, tactical: !empty });
+    // Stamp duration so reload audio stages scale with reloadScale (cat C).
+    bus.emit('weapon:reload:start', {
+      weaponId: w.id, tactical: !empty, duration,
+    } as { weaponId: string; tactical: boolean });
   }
 
   private tickMagReload(): void {
@@ -940,6 +941,80 @@ export class WeaponSystem implements System {
     this.presentShotIndex = -1;
   }
 
+  /**
+   * Display-rate jump bob. Fixed and present both call this; lastJumpAt
+   * debounce ensures a single impulse per press (cat A ≤50 ms first visible).
+   */
+  private tryJumpBob(): void {
+    if (!input.pressed('jump') || !this.stanceGrounded) return;
+    // Debounce shared with fixedUpdate so present + sim never double-impulse.
+    if (this.lastJumpAt >= 0 && this.timeNow - this.lastJumpAt <= 0.25) return;
+    this.lastJumpAt = this.timeNow;
+    this.viewModel.jump();
+  }
+
+  /**
+   * Display-rate melee / reload / weapon-swap acks so first-visible pose and
+   * audio start this frame instead of waiting for the next 120 Hz step.
+   * State flags make fixedUpdate idempotent (will not restart an in-flight action).
+   */
+  private tryPresentActions(): void {
+    const slot = this.slots[this.index];
+    if (!slot) return;
+    const w = slot.runtime;
+    const def = w.def;
+    const vm = this.viewModel;
+
+    // Weapon swap
+    if (this.state !== 'holstering' && this.state !== 'melee') {
+      let want = -1;
+      if (input.pressed('switchWeapon')) want = (this.index + 1) % Math.max(1, this.slots.length);
+      if (input.pressed('slot1')) want = 0;
+      if (input.pressed('slot2')) want = 1;
+      if (want >= 0 && want !== this.index && want < this.slots.length) {
+        this.switchTo = want;
+        this.state = 'holstering';
+        w.reloading = false;
+        vm.cancelAction();
+        vm.startHolster(slot.stats.drawTime * 0.55);
+        this.stampJuice('presentSwap', { to: want });
+      }
+    }
+
+    // Melee
+    if (input.pressed('melee') && this.state !== 'melee' && this.state !== 'holstering') {
+      this.state = 'melee';
+      w.reloading = false;
+      vm.cancelAction();
+      vm.startMelee(def.handling.meleeTime);
+      this.meleeUntil = this.timeNow + def.handling.meleeTime;
+      this.nextShotAt = Math.max(this.nextShotAt, this.meleeUntil);
+      this.stampJuice('presentMelee', { weaponId: w.id });
+    }
+
+    // Reload
+    const shellReload = def.reload.perShell !== undefined;
+    const wantsReload = input.pressed('reload') && w.ammo < w.magSize && w.reserve > 0;
+    if (wantsReload && !w.reloading
+      && (this.state === 'idle' || this.state === 'firing' || this.state === 'inspecting'
+        || this.state === 'sprinting')) {
+      this.beginReload();
+      this.stampJuice('presentReload', { weaponId: w.id });
+    }
+
+    // Present-path reload cancel (same windows as fixedUpdate) so audio
+    // interrupt does not lag a fixed step behind the pose cancel.
+    if (w.reloading) {
+      const wantCombatCancel = input.held('fire') || input.held('ads')
+        || input.pressed('fire') || input.pressed('ads');
+      if (this.stanceSprinting
+        || (shellReload && input.pressed('fire') && w.ammo > 0)
+        || (!shellReload && wantCombatCancel)) {
+        this.finishReload(false);
+      }
+    }
+  }
+
   private tryPresentFire(dt: number): void {
     if (this.presentLatched) {
       // Auth may have become blocked after the early present — drop the latch so
@@ -1073,7 +1148,18 @@ export class WeaponSystem implements System {
     // Body-tap freezes no longer live on this system (fought recovery at high RPM).
     const lifeScale = getPresentScale();
     const presentDt = lifeScale < 0.99 ? dt * lifeScale : dt;
+    // Present-path ADS intent (cat A): do not wait for the next fixed step to
+    // flip aim target — the pose spring needs the target this display frame.
+    this.readStance();
+    this.updateAds();
+    // Present-path action acks: melee / reload / swap / jump start the view
+    // model on this frame; fixedUpdate is the authority and is idempotent.
+    this.tryPresentActions();
+    this.tryJumpBob();
+
     this.viewModel.update(presentDt, {
+      // Binary intent from present-path updateAds (above). Pose spring runs at
+      // display rate; ballistics still read adsBlendSim from the fixed step only.
       ads: this.adsActive ? 1 : 0,
       sprint: this.stanceSprinting && this.state !== 'melee' ? 1 : 0,
       speed01: this.stanceSpeed01,

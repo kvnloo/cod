@@ -425,7 +425,13 @@ export class CombatController {
         this.profile.damageScale,
         null,
       );
-      const dmg = priced.damage;
+      // AIWeaponSpec.headshotMult was a dead field — apply it on pure head hits
+      // by replacing the shared table multi with the weapon-authored multi.
+      let dmg = priced.damage;
+      if (zone === 'head' && Number.isFinite(spec.headshotMult) && spec.headshotMult > 0) {
+        const tableHead = Math.max(1e-6, priced.zoneMultiplier);
+        dmg *= spec.headshotMult / tableHead;
+      }
 
       out.hitTarget = true;
       out.damage = dmg;

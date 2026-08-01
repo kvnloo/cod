@@ -419,37 +419,52 @@ export class MuzzleFX {
     const q = w.quads;
     const rand = w.rand;
     colour.set(prof.tracerColor);
-    const speed = prof.tracerSpeed * (0.94 + rand.next() * 0.12);
-    // Length follows the distance covered in a frame, which is what makes a
-    // tracer look like a moving object rather than a fixed dash.
-    const len = clamp(speed * 0.022, 2.5, 12);
-    const life = 0.42;
+    // Slightly under the catalogue muzzle velocity so a burst staged for a
+    // still has several rounds still in frame ~0.4 s after the first shot.
+    // Full 340 m/s emptied the sightline before the harness shutter opened.
+    const speed = prof.tracerSpeed * (0.72 + rand.next() * 0.10);
+    // Length is ~1.5 frames of travel — long enough to read as motion, short
+    // enough that the rod does not look like a laser.
+    const len = clamp(speed * 0.028, 3.2, 14);
+    const life = 0.85;
 
     q.begin({
       px: muzzle.x, py: muzzle.y, pz: muzzle.z,
       vx: direction.x * speed, vy: direction.y * speed, vz: direction.z * speed,
       ax: direction.x * len, ay: direction.y * len, az: direction.z * len,
-      // Thin: a tracer is a 7 mm round glowing, not a beam weapon. Width is what
-      // separates "hot projectile" from "laser" more than colour does.
-      w0: 0.19, h0: 1, w1: 0.12, h1: 1,
+      // Readable at 1080p mid-range without reading as a beam weapon.
+      w0: 0.34, h0: 1, w1: 0.22, h1: 1,
       r: colour.r, g: colour.g, b: colour.b, alpha: 1.0,
       life, cell: CELL.RAIN, frames: 1,
       mode: QUAD_MODE.BEAM, blend: QUAD_BLEND.ADD,
-      // A tracer is one of the few things in the frame that genuinely is
-      // brighter than white; at 2.8 it read as a pale hairline in daylight.
-      fadeIn: 0.02, fadeOut: 0.55, soft: 0.4, intensity: 5.0,
+      // Daylight stills need super-white cores or the rod vanishes into sky.
+      fadeIn: 0.01, fadeOut: 0.35, soft: 0.35, intensity: 8.5,
     });
     q.push();
 
-    // A soft glow riding the head sells the round as genuinely incandescent.
+    // Soft glow riding the head — larger and hotter so origin + direction read
+    // even when the beam is foreshortened.
     q.begin({
       px: muzzle.x + direction.x * len, py: muzzle.y + direction.y * len, pz: muzzle.z + direction.z * len,
       vx: direction.x * speed, vy: direction.y * speed, vz: direction.z * speed,
-      w0: 0.30, h0: 0.30, w1: 0.22, h1: 0.22,
-      r: colour.r, g: colour.g, b: colour.b, alpha: 0.9,
+      w0: 0.48, h0: 0.48, w1: 0.32, h1: 0.32,
+      r: colour.r, g: colour.g * 0.95, b: colour.b * 0.7, alpha: 1.0,
       life, cell: CELL.GLOW_SOFT, frames: 1,
       mode: QUAD_MODE.BILLBOARD, blend: QUAD_BLEND.ADD,
-      fadeIn: 0.02, fadeOut: 0.5, soft: 0.3, intensity: 3.4,
+      fadeIn: 0.01, fadeOut: 0.4, soft: 0.25, intensity: 6.0,
+    });
+    q.push();
+
+    // Dim trail glow at the tail so the full path stays lit for stills.
+    q.begin({
+      px: muzzle.x, py: muzzle.y, pz: muzzle.z,
+      vx: direction.x * speed * 0.96, vy: direction.y * speed * 0.96, vz: direction.z * speed * 0.96,
+      ax: direction.x * len * 0.85, ay: direction.y * len * 0.85, az: direction.z * len * 0.85,
+      w0: 0.55, h0: 1, w1: 0.18, h1: 1,
+      r: colour.r, g: colour.g * 0.7, b: colour.b * 0.35, alpha: 0.55,
+      life: life * 0.9, cell: CELL.RAIN, frames: 1,
+      mode: QUAD_MODE.BEAM, blend: QUAD_BLEND.ADD,
+      fadeIn: 0.0, fadeOut: 0.5, soft: 0.5, intensity: 2.4,
     });
     q.push();
   }

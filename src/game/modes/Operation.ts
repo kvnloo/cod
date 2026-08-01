@@ -60,11 +60,11 @@ export class OperationMode extends GameMode {
     d.minPressure = 2.5;
     d.maxPressure = 8;
     d.eliteBias = 1;
-    d.spawnMin = 20;
-    d.spawnIdeal = 34;
-    d.spawnMax = 74;
-    d.spawnIntervalSlow = 3.2;
-    d.spawnIntervalFast = 0.5;
+    d.spawnMin = 16;
+    d.spawnIdeal = 26;
+    d.spawnMax = 58;
+    d.spawnIntervalSlow = 2.6;
+    d.spawnIntervalFast = 0.4;
     d.pacing = true;
     d.faction = 'militia';
 

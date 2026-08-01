@@ -80,6 +80,7 @@ export interface AIWeaponSpec {
   magSize: number;
   /** Damage per bullet at ideal range, before difficulty scaling. */
   damage: number;
+  /** Applied on head/neck hits (see CombatController.resolveShot). */
   headshotMult: number;
   /** Damage falls off linearly from `rangeIdeal` to `rangeMax`, down to 40%. */
   rangeIdeal: number;

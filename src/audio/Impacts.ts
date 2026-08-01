@@ -17,6 +17,16 @@ import {
 
 let variantCursor = 0;
 
+/**
+ * Propagation delay for impact SFX. Inside the near-field bubble (own gun +
+ * point-blank hits) delay is forced to 0 so audio lands on the same frame as
+ * the visual (cat C). Beyond that, real speed-of-sound travel is kept.
+ */
+function impactTravelDelay(dist: number): number {
+  if (dist <= 5) return 0;
+  return dist / SPEED_OF_SOUND;
+}
+
 /* -------------------------------------------------------------- impacts -- */
 
 export interface ImpactOptions {
@@ -37,7 +47,7 @@ export function playImpact(sfx: SfxContext, o: ImpactOptions): void {
   if (dist > 95) return;
 
   const rand = new Rand(`impact:${variantCursor++}:${Math.round(o.x * 11)}`);
-  const t0 = sfx.now() + dist / SPEED_OF_SOUND;
+  const t0 = sfx.now() + impactTravelDelay(dist);
   const power = clamp01(o.energy / 1800);
 
   const voice = pool.acquire({
@@ -117,7 +127,7 @@ export function playRicochet(sfx: SfxContext, o: RicochetOptions): void {
   const dist = pool.distanceTo(o.x, o.y, o.z);
   if (dist > 80) return;
   const rand = new Rand(`ric:${variantCursor++}`);
-  const t0 = sfx.now() + dist / SPEED_OF_SOUND;
+  const t0 = sfx.now() + impactTravelDelay(dist);
   const power = clamp01(o.energy / 1600);
 
   const voice = pool.acquire({
@@ -553,7 +563,7 @@ export function playFleshHit(sfx: SfxContext, x: number, y: number, z: number, h
     priority: 0.7, refDistance: 2.5, maxDistance: 60,
   });
   if (!voice) return;
-  const t0 = sfx.now() + dist / SPEED_OF_SOUND;
+  const t0 = sfx.now() + impactTravelDelay(dist);
 
   const buf = bank.impact('flesh', rand.int(0, 3));
   const s = ctx.createBufferSource();

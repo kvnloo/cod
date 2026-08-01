@@ -472,10 +472,15 @@ function stagesFromReloadProfile(
 export function playReload(
   sfx: SfxContext, weaponId: string, tactical: boolean, firstPerson: boolean,
   x = 0, y = 0, z = 0,
+  /** Wall-clock duration matching the view-model (includes reloadScale). */
+  durationSeconds?: number,
 ): ReloadHandle {
   const { ctx, pool, bank } = sfx;
   const p = profileFor(weaponId);
-  const { seconds: total, stages } = stagesFromReloadProfile(weaponId, tactical, p.family);
+  const { seconds: baseTotal, stages } = stagesFromReloadProfile(weaponId, tactical, p.family);
+  // Attachment reloadScale (and empty vs tac) stretches the view-model; stages
+  // are fractions of that same total so audio beats stay lockstep with pose.
+  const total = durationSeconds != null && durationSeconds > 0.05 ? durationSeconds : baseTotal;
   const rand = new Rand(`reload:${weaponId}:${cursor++}`);
 
   const voice = pool.acquire({

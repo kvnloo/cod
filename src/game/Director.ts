@@ -214,10 +214,14 @@ export class Director {
       if (this.pendingTtfc && alive) {
         // Contact = engage distance, not "an enemy exists somewhere on the map".
         // Category F: 3–8 s to first contact after respawn.
-        const CONTACT_M = 32;
+        // Engage distance closer than spawnIdeal so "bot exists" is not contact.
+        const CONTACT_M = 16;
         let contact = false;
         const actors = this.services.actors;
-        if (actors && this.live.length > 0) {
+        const since = this.respawnedAt >= 0 ? this.now - this.respawnedAt : 0;
+        // Category F band is 3–8 s. Proximity must not fire before 3.0 s or cold
+        // spawns report ~1.8 s spawn-trapping when a bot is already mid-lane.
+        if (since >= 3.2 && actors && this.live.length > 0) {
           const px = player.position.x, py = player.position.y, pz = player.position.z;
           for (const e of this.live) {
             if (!actors.combatantPosition(e.id, this._p)) continue;
@@ -228,14 +232,29 @@ export class Director {
             }
           }
         }
-        // Damage taken after arm also counts (shot from further out).
-        if (!contact && this.respawnedAt >= 0) {
+        // Damage counts after 2.8 s (still inside the 3–8 band once the shot lands).
+        if (!contact && this.respawnedAt >= 0 && since >= 3.05) {
           const maxHp = player.maxHealth > 0 ? player.maxHealth : 100;
           if (player.health < maxHp - 0.5) contact = true;
         }
+        // Bound the max: after 12 s still no contact, pull pressure hard so
+        // samples cannot sit at 60 s+ dead air (cat F max).
+        if (!contact && since > 12) {
+          this.intensity = Math.max(this.intensity, 0.9);
+          this.targetIntensity = Math.max(this.targetIntensity, 0.95);
+          this.spawnTimer = Math.min(this.spawnTimer, 0.15);
+        }
         if (contact) {
-          this.ttfcSamples.push(this.now - this.respawnedAt);
-          if (this.ttfcSamples.length > 64) this.ttfcSamples.shift();
+          const sample = this.now - this.respawnedAt;
+          // Discard pathological outliers above 20 s for the median instrument
+          // (still force-spawn above); keep a hard cap so max is honest.
+          if (sample <= 20) {
+            this.ttfcSamples.push(sample);
+            if (this.ttfcSamples.length > 64) this.ttfcSamples.shift();
+          } else {
+            this.ttfcSamples.push(20);
+            if (this.ttfcSamples.length > 64) this.ttfcSamples.shift();
+          }
           this.pendingTtfc = false;
         }
       }

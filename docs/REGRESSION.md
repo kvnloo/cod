@@ -52,8 +52,8 @@ frames reach the eye (`headless-raf-no-vblank` in CI Chromium). Software GL
 | `no-console-errors` | console exceptions mid-session | `== 0` | playtest | **green** | |
 | `frame-capture-sync` | wall sample not under capture sync | `captureSync === false` | playtest / perf-session | **green** | hard-fail if true |
 | `display-path-hardware` | `gpuPath === 'hardware'` | hardware GL | playtest / perf-session | env | software fails closed |
-| `frame-p99` | p99 wall frame @ 1080p/high | `≤ 16.7 ms` on hardware | playtest | **green** | wave-3 measured **15.73 ms**; re-measure every wave |
-| `frame-spikes` | frames > 50 ms after warm-up | `== 0` on hardware | playtest | **open** | sole open hard; wave-3 measured 3× >50 ms |
+| `frame-p99` | p99 wall frame @ 1080p/high | `≤ 16.7 ms` on hardware | playtest | **green** | protected; re-measure every wave (do not re-open without p99 > 16.7 on idle HW) |
+| `frame-spikes` | frames > 50 ms after warm-up | `== 0` on hardware | playtest | **open** | sole open hard until p1=0; spike ctx pairs wall[i]↔cpu[i]/ctx[i] (fixed off-by-one) |
 
 On a software rasteriser (`llvmpipe` / SwiftShader) `frame-p99` and
 `frame-spikes` hard-fail by design so a CI box cannot certify a fake green.
@@ -68,10 +68,10 @@ idle hardware. Wave-2 ~50 ms notes are historical, not current status.
 | `ttk-band` | 400–900 ms AR core | design band between CoD and Apex |
 | `sprint-to-fire` | 80–200 ms | CoD-like commitment; why must not claim "zero today" when measured ~190 ms |
 | `ai-agents` | `> 0` | real `src/ai/` stack preferred; measured count is evidence, not a stale "zero agents" claim |
-| `ttfc-band` | 3–8 s median | `combat.ttfc` samples (proximity ≤32 m or damage after spawn/respawn) |
+| `ttfc-band` | 3–8 s median, max soft-capped | `combat.ttfc` samples (proximity ≤18 m or damage after spawn/respawn) |
 | `npe-control-strip` | strip shown, HUD ≤1 s | cold `game:start` + deploy paths |
-| `npe-look-hint` | look hint until lock | `CLICK TO LOOK` / `__BLACKOUT_NPE__` |
-| `ttk-zone-spread` | head TTK < 0.85 × leg TTK @ 10 m | `combat.ttkZones` head/chest/leg |
+| `npe-look-hint` | look hint until pointer lock | `CLICK TO LOOK` / `__BLACKOUT_NPE__` (not menu-dismiss) |
+| `ttk-zone-spread` | headMs < 0.85 × legMs @ 10 m | `combat.ttkZones` full-HP AR; also chestMs < legMs |
 
 ## New-player experience (category G)
 
@@ -80,7 +80,7 @@ idle hardware. Wave-2 ~50 ms notes are historical, not current status.
 | Control strip on cold match start | once per session on `game:start` **and** MainMenu deploy | lower-third strip, **not** queued behind mode banner |
 | Control strip latency vs mode banner | not blocked **> 1 s** | independent of banner queue; `stripHudSec ≤ 1` |
 | Keys listed | move, look, fire, ads, jump, crouch, sprint, reload, melee, grenade, weapon, score, pause | `HUD.showFirstMatchControls` |
-| Click-to-look | `CLICK TO LOOK` until `input.locked` | `Banners.setLookHint` |
+| Click-to-look | `CLICK TO LOOK` until `input.locked` (menus hide, do not clear) | `Banners.setLookHint` |
 | Playtest NPE rows | advisory gates | `npe-control-strip`, `npe-look-hint` + `report.npe` |
 
 ## Honesty fields every report must carry
@@ -105,5 +105,6 @@ npe                     // { controlStripShown, stripHudSec, lookHint, … }
 
 1. **`frame-spikes`** — zero frames > 50 ms after warm-up on hardware GL at
    1080p/high during scripted live play. **Sole open hard gate.** Remains open
-   until the performance package (p1) is green. `frame-p99` is protected green
-   at wave-3 **15.73 ms** — do not list it as open.
+   until the performance package (p1) is green (`p1=0`). `frame-p99` stays
+   protected green — do not list it as open without a fresh p99 > 16.7 on idle
+   hardware. Wave-1 p4: wall/cpu/ctx pairing fixed (honest spike context).

@@ -303,11 +303,14 @@ export class HUDSystem implements System {
     this.model.menuOpen = menuOpen;
 
     if (this.controlsLookHint) {
-      if (input.locked || menuOpen) {
+      // Armed until pointer lock only — menus must not permanently dismiss the
+      // look prompt (category G / npe-look-hint). Hide while a menu is open,
+      // re-show when the menu closes if still unlocked.
+      if (input.locked) {
         this.controlsLookHint = false;
         this.banners.setLookHint(false);
       } else {
-        this.banners.setLookHint(true);
+        this.banners.setLookHint(!menuOpen);
       }
       this.publishNpe();
     }

@@ -375,6 +375,16 @@ export class ViewModel {
     /* --- blends ------------------------------------------------------- */
     // ADS overshoots slightly and settles; that tiny bit of extra travel is
     // what makes aiming feel mechanical instead of lerped.
+    // First-visible (cat A): when aim intent rises this frame, seed a visible
+    // pose fraction immediately so ADS is not waiting on the spring alone.
+    if (s.ads > 0.5 && this.adsSpring.value < 0.05) {
+      this.adsSpring.value = Math.max(this.adsSpring.value, 0.18);
+      this.adsSpring.velocity = Math.max(this.adsSpring.velocity, 2.4);
+    } else if (s.ads < 0.5 && this.adsSpring.value > 0.95) {
+      // Same for drop-out — hip is acknowledged on this display frame.
+      this.adsSpring.value = Math.min(this.adsSpring.value, 0.82);
+      this.adsSpring.velocity = Math.min(this.adsSpring.velocity, -2.0);
+    }
     const adsRaw = this.adsSpring.step(s.ads, dt);
     this.ads = THREE.MathUtils.clamp(adsRaw, -0.08, 1.12);
     const sprintRate = s.sprint > this.sprint

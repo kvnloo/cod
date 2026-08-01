@@ -342,9 +342,15 @@ export class Agent {
     this.character = character;
     const c = this.controller;
     c?.setEntity?.(this.entityId, character.object);
-    // Prefer the character's authored volumes when present; fall back to the
-    // capsule-local layout already installed in attachPhysics.
+    // Combat hitboxes must stay on the capsule-local living layout (same as
+    // attachPhysics). Bone-local character.hitboxes are rest-pose volumes; at
+    // attach time matrixWorld is not yet combat-posed, so projecting them into
+    // the proxy swallowed bullets (playtest damage-model/hitbox-zones → 0).
+    // When the character authors a hitbox set we still re-install the living
+    // layout sized to this agent — never leave the prior entity's volumes.
     if (c?.setHitboxes && character.hitboxes && character.hitboxes.length >= 3) {
+      c.setHitboxes(livingHitboxLayout(this.height, AGENT.radius));
+    } else if (c?.setHitboxes) {
       c.setHitboxes(livingHitboxLayout(this.height, AGENT.radius));
     }
     this.ensureWeaponProp(character);

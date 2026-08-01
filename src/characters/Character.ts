@@ -27,6 +27,7 @@ export interface CharacterHost {
   /** Physics ragdoll spawner, when a physics world exists. */
   spawnRagdoll?(opts: {
     bones: Record<string, THREE.Object3D | null>;
+    root?: THREE.Object3D | null;
     mass?: number; entityId?: number; velocity?: THREE.Vector3; quality?: number;
   }): { applyImpulse(zone: HitZone, impulse: THREE.Vector3): void; remove(): void } | null;
   groundProbe?: GroundProbe | null;
@@ -228,10 +229,13 @@ export class Character implements CharacterAPI {
 
     const handle = this.host.spawnRagdoll?.({
       bones,
+      root: this.object,
       mass: appearanceMass(this.appearance),
       entityId: this.entityId,
       velocity: this.velocity,
-      quality: this.lod === 0 ? 6 : 3,
+      // Quality 0: cheapest crowd ragdoll (no neck/feet, 0 extra solver iters).
+      // lod0 used to pass 6 and manufactured death-window frame spikes.
+      quality: 0,
     }) ?? null;
 
     this.ragdollHandle = handle;

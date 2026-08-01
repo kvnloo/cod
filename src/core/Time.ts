@@ -32,14 +32,10 @@ export class Time {
   /**
    * Hard ceiling on fixed steps per display frame.
    *
-   * Must be large enough that a single hitch does not permanently drop input
-   * edges and weapon clocks, but small enough that death-window catch-up does
-   * not itself manufacture a second >50 ms frame. Three steps is ~25 ms of sim
-   * at 120 Hz fixed (matches Physics maxSteps); residual debt carries into the
-   * next display frames. Wave-2 death hitch: maxSteps=8 (~67 ms) stacked with
-   * multi-ragdoll create into a 3-frame >50 ms cluster at hp=0.
+   * Two steps ≈ 16.7 ms of sim at 120 Hz — enough to drain hitch debt without
+   * manufacturing a second >50 ms death-window frame. Residual debt carries.
    */
-  private maxSteps = 3;
+  private maxSteps = 2;
   /** Previous unscaled frame dt — used to shrink catch-up after a hitch. */
   private prevDt = 0;
 
@@ -77,12 +73,11 @@ export class Time {
     this.elapsed += this.delta;
     this.frame++;
 
-    // After a hitch frame, take fewer sim steps so catch-up itself cannot own
-    // the next wall frame (death-window / jump clusters were 50–60 ms of
-    // stacked sim+render). Residual debt carries and is repaid on quiet frames.
+    // After a hitch frame, take a single sim step so catch-up itself cannot own
+    // the next wall frame (death-window clusters were 50–60 ms of stacked
+    // sim+render+ragdoll). Residual debt carries and is repaid on quiet frames.
     let stepCap = this.maxSteps;
-    if (this.prevDt > 0.033 || dt > 0.033) stepCap = 2;
-    if (this.prevDt > 0.045 || dt > 0.045) stepCap = 1;
+    if (this.prevDt > 0.028 || dt > 0.028) stepCap = 1;
     this.prevDt = dt;
 
     this.accumulator += this.delta;

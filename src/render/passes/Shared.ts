@@ -99,15 +99,17 @@ export class ScreenFxState {
   constructor() {
     this.detach.push(bus.on('damage:taken', (p) => {
       const mag = Math.min(1, p.amount / 45);
-      this.damage = Math.min(1.2, this.damage + mag * 0.9);
+      // Soft-cap so stacked hits never full-wash the frame. CoD keeps the
+      // centre clear for aim; only the rim and impact bearing go red.
+      this.damage = Math.min(0.72, this.damage + mag * 0.42);
       // Project the incoming direction onto a screen-ish 2D compass.
       const d = p.fromDirection;
       if (d) {
         const len = Math.hypot(d.x, d.z) || 1;
         this.damageDir.set(d.x / len, d.z / len);
       }
-      if (p.lethal) this.blood = Math.min(1, this.blood + 0.6);
-      else this.blood = Math.min(1, this.blood + mag * 0.35);
+      if (p.lethal) this.blood = Math.min(0.55, this.blood + 0.28);
+      else this.blood = Math.min(0.45, this.blood + mag * 0.16);
     }));
     this.detach.push(bus.on('explosion', (p) => {
       const power = Math.min(1, p.power / 60);
@@ -138,7 +140,7 @@ export class ScreenFxState {
       if (req.flash.intensity >= 3) { this.blind = Math.min(1, this.blind + req.flash.intensity / 6); this.blindTime = 0; }
     }
     if (req.damage) {
-      this.damage = Math.min(1.4, this.damage + req.damage.intensity);
+      this.damage = Math.min(0.72, this.damage + req.damage.intensity * 0.55);
       const d = req.damage.direction;
       if (d) {
         const len = Math.hypot(d.x, d.z) || 1;
@@ -151,7 +153,7 @@ export class ScreenFxState {
     }
     if (req.spatter) {
       const v = req.spatter.intensity;
-      if (req.spatter.kind === 'blood') this.blood = Math.min(1, this.blood + v);
+      if (req.spatter.kind === 'blood') this.blood = Math.min(0.55, this.blood + v * 0.55);
       else if (req.spatter.kind === 'water') this.water = Math.min(1, this.water + v);
       else this.dirt = Math.min(1, this.dirt + v);
     }
@@ -170,7 +172,8 @@ export class ScreenFxState {
       const recover = 4.2;
       this.blind = t < hold ? 1 : Math.max(0, Math.pow(1 - (t - hold) / recover, 2.2));
     }
-    this.damage = Math.max(0, this.damage - d * 0.85);
+    // Decay fast enough that a single hit is gone in ~1 s, not a sticky wash.
+    this.damage = Math.max(0, this.damage - d * 1.15);
     if (this.concussion > 0) {
       this.concussionTime += d;
       this.concussion = Math.max(0, this.concussion - d * 0.42);

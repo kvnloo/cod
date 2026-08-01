@@ -217,7 +217,7 @@ export function livingHitboxLayout(
 
   return [
     // Playtest head band sits at 0.94 h; cover chin → crown. Flesh unless helmet.
-    band('head', 0.870, 1.015, 0.11 * s, 0.11 * s),
+    band('head', 0.830, 1.040, 0.16 * s, 0.16 * s),
     band('neck', 0.810, 0.885, 0.07 * s, 0.07 * s),
     // Chest covers playtest 0.72; overlaps neck above and stomach below.
     band('chest', 0.555, 0.825, torsoW, torsoD),

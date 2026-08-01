@@ -84,7 +84,7 @@ export class TracerPool {
     s.live = true;
     s.life = 0;
     s.ttl = 6;
-    s.width = 0.013;
+    s.width = 0.018;
     s.intensity = 1;
     s.from.copy(pos);
     this._d.copy(vel).normalize();
@@ -118,8 +118,8 @@ export class TracerPool {
     s.active = true;
     s.live = false;
     s.life = 0;
-    s.ttl = 0.075;
-    s.width = 0.010;
+    s.ttl = 0.22;
+    s.width = 0.028;
     s.intensity = intensity;
     s.from.copy(from);
     s.to.copy(to);
@@ -145,14 +145,16 @@ export class TracerPool {
       this._q.setFromUnitVectors(this._up.set(0, 0, 1), this._d);
       const fade = s.live ? 1 : Math.pow(1 - s.life / s.ttl, 0.7);
       // Widen with distance so a far tracer stays visible at 1080p.
+      // Hitscan streaks get a floor width so a 70–220 ms flash is still a
+      // readable orange rod at mid-range, not a sub-pixel hairline.
       const dist = this._p.copy(s.to).distanceTo(camera.position);
-      const w = s.width * (1 + dist * 0.020);
+      const w = Math.max(s.width * (1 + dist * 0.028), s.live ? 0.01 : 0.018);
       this._s.set(w, w, len);
       this._p.copy(s.to);
       this._m.compose(this._p, this._q, this._s);
       this.mesh.setMatrixAt(n, this._m);
       const k = fade * s.intensity;
-      this._colour.setRGB(1.9 * k, 0.78 * k, 0.26 * k);
+      this._colour.setRGB(2.6 * k, 1.05 * k, 0.32 * k);
       colours?.setXYZ(n, this._colour.r, this._colour.g, this._colour.b);
       n++;
     }

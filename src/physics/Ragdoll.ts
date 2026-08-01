@@ -176,10 +176,10 @@ export class Ragdoll implements RagdollHandle {
   private buildAll(opts: RagdollOptions): void {
     const pose = resolvePose(opts);
     const totalMass = opts.mass ?? 82;
-    // Cap solver iterations: Character lod0 used to pass quality 6, which made
-    // every shipping kill pay hero-death solver cost. Crowd deaths share the
-    // sim with live agents; 2 extra iterations is enough for stable limbs.
-    const quality = Math.max(1, Math.min(1, Math.round(opts.quality ?? 1)));
+    // Crowd deaths must stay cheap. Character used to pass quality 6 (lod0) /
+    // 3 (crowd) which stacked solver iterations into death-window hitches.
+    // Clamp to [0,2]: 0 = fewest segments + 0 extra iters, 2 = full limbs.
+    const quality = Math.max(0, Math.min(2, Math.round(opts.quality ?? 0)));
 
     // Body frame from the pelvis, used for hinge axes when a limb is straight.
     const hips = pose.get('hips');
@@ -194,14 +194,21 @@ export class Ragdoll implements RagdollHandle {
     const bodyFwd = vFwd.clone();
     const bodyUp = vUp.clone();
 
-    // Skip feet (indices 11, 14) on crowd deaths — 2 fewer bodies/joints and a
-    // cheaper construct. Lower legs still read as a full collapse.
+    // Segment budget by quality (dominant death-frame cost is body/joint create):
+    //   q0: 7 bodies — pelvis, chest, head, upper arms, upper legs
+    //   q1: +spine +lower limbs, still no neck/feet
+    //   q2: full minus feet
+    const skip = new Set<number>();
+    if (quality <= 2) { skip.add(11); skip.add(14); }           // feet
+    if (quality <= 1) { skip.add(3); }                           // neck
+    if (quality <= 0) {
+      skip.add(1);                                              // spine
+      skip.add(6); skip.add(8);                                 // lower arms
+      skip.add(10); skip.add(13);                               // lower legs
+    }
     for (let i = 0; i < SEGMENTS.length; i++) {
       const def = SEGMENTS[i];
-      if (quality <= 2 && (i === 11 || i === 14)) {
-        this.segments.push(null);
-        continue;
-      }
+      if (skip.has(i)) { this.segments.push(null); continue; }
       this.segments.push(this.buildSegment(def, pose, totalMass, quality, bodyUp, opts));
     }
 
@@ -228,7 +235,7 @@ export class Ragdoll implements RagdollHandle {
   }
 
   get bones(): number { return this.segments.reduce((a, s) => a + (s ? 1 : 0), 0); }
-  get settled(): boolean { return !this.deferred && this.restTicks > 18; }
+  get settled(): boolean { return !this.deferred && this.restTicks > 12; }
 
   /* --------------------------------------------------------------- building */
 
@@ -339,11 +346,12 @@ export class Ragdoll implements RagdollHandle {
   }
 
   private bindBones(bones: Record<string, THREE.Object3D | null>): void {
+    // Prefer already-updated world matrices from resolvePose; only refresh if
+    // a bone has no parent chain we trust.
     for (const d of BONE_DRIVERS) {
       const obj = bones[d.bone];
       const seg = this.segments[d.segment];
       if (!obj || !seg) continue;
-      obj.updateWorldMatrix(true, false);
       mBody.makeTranslation(seg.origin.x, seg.origin.y, seg.origin.z);
       mBody.invert();
       const offset = new THREE.Matrix4().multiplyMatrices(mBody, obj.matrixWorld);
@@ -373,7 +381,7 @@ export class Ragdoll implements RagdollHandle {
     this.restTicks = moving ? 0 : this.restTicks + 1;
     // Force-sleep after a short rest so a pile of corpses cannot keep the
     // solver busy through the death-window frames the hard gate samples.
-    if (this.restTicks === 18) {
+    if (this.restTicks === 12) {
       for (const s of this.segments) {
         if (s && !s.body.isSleeping()) s.body.sleep();
       }
@@ -485,6 +493,14 @@ export class Ragdoll implements RagdollHandle {
     return out.length;
   }
 
+  /** Puts every segment to sleep so a queued teardown stops costing the solver. */
+  forceSleep(): void {
+    if (this.removed || this.deferred) return;
+    for (const s of this.segments) {
+      if (s && !s.body.isSleeping()) s.body.sleep();
+    }
+  }
+
   remove(): void {
     if (this.removed) return;
     this.removed = true;
@@ -521,9 +537,13 @@ export class RagdollManager {
    * one budget (acceptance: ≤1 full ragdoll construct per kill display frame).
    */
   private constructsThisFrame = 0;
+  private teardownsThisFrame = 0;
+  /** Queued body frees — never stack with a full construct on the same frame. */
+  private pendingTeardown: Ragdoll[] = [];
   /** True after `update()` until the next frame's first fixed/`update` opens it. */
   private frameOpen = true;
   private static readonly MAX_CONSTRUCTS_PER_FRAME = 1;
+  private static readonly MAX_TEARDOWNS_PER_FRAME = 1;
 
   constructor(private host: RagdollHost) { }
 
@@ -533,11 +553,19 @@ export class RagdollManager {
     if (!this.frameOpen) return;
     this.frameOpen = false;
     this.constructsThisFrame = 0;
-    this.completeOneDeferred();
+    this.teardownsThisFrame = 0;
+    // Drain pending frees first (up to 2). Never construct on a teardown frame.
+    this.flushOneTeardown();
+    this.flushOneTeardown();
+    if (this.teardownsThisFrame === 0 && this.pendingTeardown.length === 0) {
+      this.completeOneDeferred();
+    }
   }
 
   private completeOneDeferred(): void {
     if (this.constructsThisFrame >= RagdollManager.MAX_CONSTRUCTS_PER_FRAME) return;
+    // Never construct on a frame that already tore bodies down.
+    if (this.teardownsThisFrame > 0) return;
     for (let i = 0; i < this.ragdolls.length; i++) {
       const r = this.ragdolls[i];
       if (!r.isDeferred) continue;
@@ -547,13 +575,28 @@ export class RagdollManager {
     }
   }
 
+  private flushOneTeardown(): void {
+    if (this.teardownsThisFrame >= RagdollManager.MAX_TEARDOWNS_PER_FRAME) return;
+    if (this.constructsThisFrame > 0) return;
+    const r = this.pendingTeardown.shift();
+    if (!r) return;
+    r.remove();
+    this.teardownsThisFrame++;
+  }
+
+  private queueTeardown(r: Ragdoll): void {
+    // Sleep immediately so the corpse leaves the active island while waiting
+    // for its free — otherwise pending free bodies stack death-window cost.
+    r.forceSleep();
+    this.pendingTeardown.push(r);
+  }
+
   spawn(opts: RagdollOptions): Ragdoll {
-    // Spawns from AI/Character run *after* Physics.update; do not re-open the
-    // frame here — only consume the existing per-frame budget.
+    // Always defer body construction off the death-event frame. Multi-kill
+    // stacks + kill FX already own that wall frame; completeOneDeferred builds
+    // at most one full ragdoll on a later frame open.
     this.enforceBudget(1);
-    const defer = this.constructsThisFrame >= RagdollManager.MAX_CONSTRUCTS_PER_FRAME;
-    if (!defer) this.constructsThisFrame++;
-    const r = new Ragdoll(this.nextId++, this.host, opts, defer);
+    const r = new Ragdoll(this.nextId++, this.host, opts, /* defer */ true);
     this.ragdolls.push(r);
     return r;
   }
@@ -564,8 +607,15 @@ export class RagdollManager {
       const r = this.ragdolls[i];
       r.tick(dt);
       if (r.age > this.maxAge && r.settled) {
-        r.remove();
         this.ragdolls.splice(i, 1);
+        // Age-out teardown shares the per-frame budget with budget enforcement.
+        if (this.teardownsThisFrame < RagdollManager.MAX_TEARDOWNS_PER_FRAME
+          && this.constructsThisFrame === 0) {
+          r.remove();
+          this.teardownsThisFrame++;
+        } else {
+          this.queueTeardown(r);
+        }
       }
     }
   }
@@ -574,6 +624,7 @@ export class RagdollManager {
   update(): void {
     // Zero-step frames never call fixedUpdate; open the budget here instead.
     this.openFrameIfNeeded();
+    // Only complete a deferred construct if we did not already tear down.
     this.completeOneDeferred();
     for (const r of this.ragdolls) r.syncToRig();
     // Close the frame after presentation; next fixed step re-opens.
@@ -587,14 +638,23 @@ export class RagdollManager {
   remove(r: RagdollHandle): void {
     const i = this.ragdolls.findIndex((x) => x.id === r.id);
     if (i >= 0) {
-      this.ragdolls[i].remove();
+      const doomed = this.ragdolls[i];
       this.ragdolls.splice(i, 1);
+      if (this.teardownsThisFrame < RagdollManager.MAX_TEARDOWNS_PER_FRAME
+        && this.constructsThisFrame === 0) {
+        doomed.remove();
+        this.teardownsThisFrame++;
+      } else {
+        this.queueTeardown(doomed);
+      }
     }
   }
 
   clear(): void {
     for (const r of this.ragdolls) r.remove();
     this.ragdolls.length = 0;
+    for (const r of this.pendingTeardown) r.remove();
+    this.pendingTeardown.length = 0;
   }
 
   private enforceBudget(incoming: number): void {
@@ -602,8 +662,17 @@ export class RagdollManager {
       // Prefer retiring something that has already come to rest.
       let idx = this.ragdolls.findIndex((r) => r.settled);
       if (idx < 0) idx = 0;
-      this.ragdolls[idx].remove();
+      const doomed = this.ragdolls[idx];
       this.ragdolls.splice(idx, 1);
+      // If this frame already built a ragdoll, defer the free; otherwise free
+      // now so the world body count never quietly grows past budget.
+      if (this.constructsThisFrame > 0
+        || this.teardownsThisFrame >= RagdollManager.MAX_TEARDOWNS_PER_FRAME) {
+        this.queueTeardown(doomed);
+      } else {
+        doomed.remove();
+        this.teardownsThisFrame++;
+      }
     }
   }
 }
@@ -613,10 +682,12 @@ export class RagdollManager {
 function resolvePose(opts: RagdollOptions): Map<string, BonePose> {
   const map = new Map<string, BonePose>();
   if (opts.bones) {
+    // One full graph walk instead of N parent walks (death-frame cost).
+    if (opts.root) opts.root.updateWorldMatrix(true, true);
     for (const key of Object.keys(opts.bones)) {
       const obj = opts.bones[key];
       if (!obj) continue;
-      obj.updateWorldMatrix(true, false);
+      if (!opts.root) obj.updateWorldMatrix(true, false);
       const p = new THREE.Vector3();
       const q = new THREE.Quaternion();
       const s = new THREE.Vector3();

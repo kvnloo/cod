@@ -343,23 +343,31 @@ export function playShot(sfx: SfxContext, state: WeaponSoundState, o: ShotOption
 
   /* --- 1. crack --------------------------------------------------------- */
   {
+    // HF crack carries ILD/ITD. Body/sub are omni-ish LF and must not bury it
+    // at mid-range (10–50 m) where localisation matters most (cat C).
+    // Soft distance falloff keeps snap audible past the body thump envelope.
+    const crackReach = fp
+      ? 1.08
+      : (0.22 + 0.78 * Math.pow(clamp01(1 - dist / 110), 0.55));
     const gainAmt = suppressed
-      ? p.crackGain * 0.5
-      : p.crackGain * 1.75 * (0.07 + 0.93 * Math.pow(closeness, 1.25)) * (fp ? 1.08 : 1);
+      ? p.crackGain * 0.55 * crackReach
+      : p.crackGain * 2.15 * crackReach;
     if (gainAmt > 0.004) {
       const src = noiseVoice(ctx, suppressed ? 'pink' : 'white', rand);
-      const bp = filterNode(ctx, 'bandpass', p.crackHz * brightness, p.crackQ);
-      const drive = shaperNode(ctx, asymCurve(p.crackDrive), sfx.cheap ? 'none' : '2x');
-      const hp = filterNode(ctx, 'highpass', suppressed ? 700 : 460, 0.7);
+      // Slightly higher/tighter BP for world shots so stereo image is sharper.
+      const crackHz = p.crackHz * brightness * (fp ? 1 : 1.12);
+      const bp = filterNode(ctx, 'bandpass', crackHz, p.crackQ * (fp ? 1 : 1.25));
+      const drive = shaperNode(ctx, asymCurve(p.crackDrive * (fp ? 1 : 1.15)), sfx.cheap ? 'none' : '2x');
+      const hp = filterNode(ctx, 'highpass', suppressed ? 700 : (fp ? 460 : 900), 0.75);
       const g = gainNode(ctx, 0);
       src.connect(bp); bp.connect(drive); drive.connect(hp); hp.connect(g); g.connect(dest);
 
-      const decay = p.crackDecay * (suppressed ? 1.5 : 1) * (1 + far * 0.55);
+      const decay = p.crackDecay * (suppressed ? 1.5 : 1) * (1 + far * 0.4);
       // The sweep is the whole trick: the band falls an octave and a half in a
       // few milliseconds, which is what the ear reads as a supersonic snap.
-      sweep(bp.frequency, t0, p.crackHz * brightness * (1 + p.crackSweep),
-        p.crackHz * brightness * (1 - p.crackSweep * 0.55), decay * 0.9);
-      const end = arLin(g.gain, t0, gainAmt, 0.0009, decay);
+      sweep(bp.frequency, t0, crackHz * (1 + p.crackSweep),
+        crackHz * (1 - p.crackSweep * 0.55), decay * 0.9);
+      const end = arLin(g.gain, t0, gainAmt, 0.0007, decay);
       startNoise(src, t0, rand, decay + 0.05);
       src.stop(end + 0.02);
       endsAt = Math.max(endsAt, end);
@@ -368,15 +376,18 @@ export function playShot(sfx: SfxContext, state: WeaponSoundState, o: ShotOption
 
   /* --- 2. body / muzzle blast ------------------------------------------- */
   {
-    const bodyGain = p.bodyGain * (suppressed ? 0.42 : 0.82) * (0.5 + 0.5 * closeness);
+    // World-space reports pull body/sub down so the crack owns the spectrum
+    // above ~1 kHz (where HRTF ILD lives). FP keeps chest thump.
+    const bodySpat = fp ? 1 : 0.48;
+    const bodyGain = p.bodyGain * (suppressed ? 0.42 : 0.82) * (0.5 + 0.5 * closeness) * bodySpat;
     const decay = p.bodyDecay * (1 + dist / 130) * (suppressed ? 0.7 : 1);
 
     const src = noiseVoice(ctx, 'brown', rand);
-    const lp = filterNode(ctx, 'lowpass', p.bodyTone, 1.05);
+    const lp = filterNode(ctx, 'lowpass', p.bodyTone * (fp ? 1 : 0.85), 1.05);
     // Brown noise is −6 dB/oct: without this highpass the layer is dominated by
     // 20-60 Hz rumble that no speaker reproduces and that eats every dB of
     // headroom the limiter has.
-    const hp = filterNode(ctx, 'highpass', 92, 0.72);
+    const hp = filterNode(ctx, 'highpass', fp ? 92 : 140, 0.72);
     const drive = shaperNode(ctx, softClipCurve(suppressed ? 1.4 : 2.4), sfx.cheap ? 'none' : '2x');
     const g = gainNode(ctx, 0);
     src.connect(lp); lp.connect(hp); hp.connect(drive); drive.connect(g); g.connect(dest);
@@ -395,8 +406,9 @@ export function playShot(sfx: SfxContext, state: WeaponSoundState, o: ShotOption
       osc.connect(og); og.connect(dest);
       const from = p.bodyFrom * (suppressed ? 0.75 : 1);
       sweep(osc.frequency, t0, from, p.bodyTo, p.bodyGlide * 2.2);
-      const subEnd = arLin(og.gain, t0, p.subGain * (suppressed ? 0.4 : 0.72) * (0.45 + 0.55 * closeness),
-        0.0016, p.subDecay * (1 + far * 0.6));
+      const subAmt = p.subGain * (suppressed ? 0.4 : 0.72) * (0.45 + 0.55 * closeness)
+        * (fp ? 1 : 0.32);
+      const subEnd = arLin(og.gain, t0, subAmt, 0.0016, p.subDecay * (1 + far * 0.6));
       osc.start(t0);
       osc.stop(subEnd + 0.02);
       endsAt = Math.max(endsAt, subEnd);
@@ -406,10 +418,14 @@ export function playShot(sfx: SfxContext, state: WeaponSoundState, o: ShotOption
   /* --- 3. punch / mid --------------------------------------------------- */
   if (!sfx.cheap && p.punchGain > 0.02) {
     const src = noiseVoice(ctx, 'pink', rand);
-    const bp = filterNode(ctx, 'bandpass', p.punchHz, p.punchQ / p.spread);
+    const bp = filterNode(ctx, 'bandpass', p.punchHz * (fp ? 1 : 1.15), p.punchQ / p.spread);
     const g = gainNode(ctx, 0);
     src.connect(bp); bp.connect(g); g.connect(dest);
-    const amt = p.punchGain * (suppressed ? 0.5 : 1.6) * Math.pow(clamp01(closeness + 0.22), 0.7);
+    // Mid punch is stereo-friendly; keep it alive for world shots at range.
+    const midReach = fp
+      ? Math.pow(clamp01(closeness + 0.22), 0.7)
+      : (0.35 + 0.65 * Math.pow(clamp01(1 - dist / 80), 0.6));
+    const amt = p.punchGain * (suppressed ? 0.5 : 1.75) * midReach * (fp ? 1 : 1.25);
     const end = arLin(g.gain, t0, amt, 0.0018, p.punchDecay * (1 + far * 0.8));
     startNoise(src, t0, rand, p.punchDecay + 0.05);
     src.stop(end + 0.02);

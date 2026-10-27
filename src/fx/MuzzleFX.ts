@@ -43,7 +43,7 @@ export interface MuzzleProfile {
 const AR: MuzzleProfile = {
   scale: 1.0, lightIntensity: 26, lightRadius: 9, starChance: 0.6,
   coneLength: 0.55, smoke: 1, gasSpeed: 13, color: 0xffb464,
-  casing: 'rifle', ejectSpeed: 2.7, tracerEvery: 4, tracerColor: 0xffd070,
+  casing: 'rifle', ejectSpeed: 2.7, tracerEvery: 2, tracerColor: 0xffd070,
   tracerSpeed: 340, heatPerShot: 0.055, shake: 0.008,
 };
 
@@ -419,26 +419,24 @@ export class MuzzleFX {
     const q = w.quads;
     const rand = w.rand;
     colour.set(prof.tracerColor);
-    // Slightly under the catalogue muzzle velocity so a burst staged for a
-    // still has several rounds still in frame ~0.4 s after the first shot.
-    // Full 340 m/s emptied the sightline before the harness shutter opened.
-    const speed = prof.tracerSpeed * (0.72 + rand.next() * 0.10);
-    // Length is ~1.5 frames of travel — long enough to read as motion, short
-    // enough that the rod does not look like a laser.
-    const len = clamp(speed * 0.028, 3.2, 14);
-    const life = 0.85;
+    // Presentation speed is intentionally well under catalogue muzzle velocity:
+    // a 340 m/s rod empties a 20 m sightline in ~60 ms — gone before still
+    // capture or the gunfeel sandwich can read it. ~90 m/s keeps origin-correct
+    // beams in frame across a burst while still reading as bullets, not lasers.
+    const speed = prof.tracerSpeed * (0.24 + rand.next() * 0.06);
+    // Length is ~2 frames of travel at presentation speed — thick readable rod.
+    const len = clamp(speed * 0.045, 4.5, 16);
+    const life = 1.05;
 
     q.begin({
       px: muzzle.x, py: muzzle.y, pz: muzzle.z,
       vx: direction.x * speed, vy: direction.y * speed, vz: direction.z * speed,
       ax: direction.x * len, ay: direction.y * len, az: direction.z * len,
-      // Readable at 1080p mid-range without reading as a beam weapon.
-      w0: 0.34, h0: 1, w1: 0.22, h1: 1,
+      w0: 0.48, h0: 1, w1: 0.30, h1: 1,
       r: colour.r, g: colour.g, b: colour.b, alpha: 1.0,
       life, cell: CELL.RAIN, frames: 1,
       mode: QUAD_MODE.BEAM, blend: QUAD_BLEND.ADD,
-      // Daylight stills need super-white cores or the rod vanishes into sky.
-      fadeIn: 0.01, fadeOut: 0.35, soft: 0.35, intensity: 8.5,
+      fadeIn: 0.0, fadeOut: 0.4, soft: 0.2, intensity: 12.0,
     });
     q.push();
 
@@ -447,11 +445,11 @@ export class MuzzleFX {
     q.begin({
       px: muzzle.x + direction.x * len, py: muzzle.y + direction.y * len, pz: muzzle.z + direction.z * len,
       vx: direction.x * speed, vy: direction.y * speed, vz: direction.z * speed,
-      w0: 0.48, h0: 0.48, w1: 0.32, h1: 0.32,
+      w0: 0.62, h0: 0.62, w1: 0.38, h1: 0.38,
       r: colour.r, g: colour.g * 0.95, b: colour.b * 0.7, alpha: 1.0,
       life, cell: CELL.GLOW_SOFT, frames: 1,
       mode: QUAD_MODE.BILLBOARD, blend: QUAD_BLEND.ADD,
-      fadeIn: 0.01, fadeOut: 0.4, soft: 0.25, intensity: 6.0,
+      fadeIn: 0.0, fadeOut: 0.45, soft: 0.2, intensity: 8.5,
     });
     q.push();
 
@@ -459,12 +457,12 @@ export class MuzzleFX {
     q.begin({
       px: muzzle.x, py: muzzle.y, pz: muzzle.z,
       vx: direction.x * speed * 0.96, vy: direction.y * speed * 0.96, vz: direction.z * speed * 0.96,
-      ax: direction.x * len * 0.85, ay: direction.y * len * 0.85, az: direction.z * len * 0.85,
-      w0: 0.55, h0: 1, w1: 0.18, h1: 1,
-      r: colour.r, g: colour.g * 0.7, b: colour.b * 0.35, alpha: 0.55,
-      life: life * 0.9, cell: CELL.RAIN, frames: 1,
+      ax: direction.x * len * 0.9, ay: direction.y * len * 0.9, az: direction.z * len * 0.9,
+      w0: 0.72, h0: 1, w1: 0.24, h1: 1,
+      r: colour.r, g: colour.g * 0.7, b: colour.b * 0.35, alpha: 0.7,
+      life: life * 0.95, cell: CELL.RAIN, frames: 1,
       mode: QUAD_MODE.BEAM, blend: QUAD_BLEND.ADD,
-      fadeIn: 0.0, fadeOut: 0.5, soft: 0.5, intensity: 2.4,
+      fadeIn: 0.0, fadeOut: 0.55, soft: 0.4, intensity: 3.8,
     });
     q.push();
   }

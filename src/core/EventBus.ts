@@ -18,7 +18,7 @@ export interface GameEvents {
   /* --- weapons --- */
   'weapon:fire': { weaponId: string; origin: Vector3; direction: Vector3; shotIndex: number; suppressed: boolean };
   'weapon:dryfire': { weaponId: string };
-  'weapon:reload:start': { weaponId: string; tactical: boolean };
+  'weapon:reload:start': { weaponId: string; tactical: boolean; duration?: number };
   'weapon:reload:end': { weaponId: string };
   'weapon:switch': { from: string | null; to: string };
   'weapon:ads': { active: boolean };
@@ -44,7 +44,7 @@ export interface GameEvents {
   /* --- player --- */
   'player:spawn': { point: Vector3 };
   'player:move:state': { state: string };
-  'player:footstep': { point: Vector3; surface: string; sprinting: boolean };
+  'player:footstep': { point: Vector3; surface: string; sprinting: boolean; isLocal?: boolean };
   'player:land': { point: Vector3; force: number; surface: string };
   'player:mantle': void;
   'player:slide': { start: boolean };
@@ -52,8 +52,8 @@ export interface GameEvents {
 
   /* --- ai --- */
   'ai:alert': { id: number; level: number };
-  'ai:fire': { id: number; origin: Vector3; direction: Vector3 };
-  'ai:voice': { id: number; line: string };
+  'ai:fire': { id: number; origin: Vector3; direction: Vector3; weaponId?: string; suppressed?: boolean };
+  'ai:voice': { id: number; line: string; point?: Vector3 };
 
   /* --- meta --- */
   'score:add': { amount: number; reason: string };

@@ -1006,11 +1006,43 @@ const THROW: ClipDef = {
   ],
 };
 
+
+/** Apex-style slide: low hips, lead leg extended, trailing tucked, lean back. */
+const SLIDE: ClipDef = {
+  name: 'slide', duration: 0.9, loop: true,
+  keys: [
+    {
+      t: 0, ease: 'sine',
+      pose: {
+        hips: [22, 0, 4], spine: [10, 0, 2], chest: [-8, 6, -4], neck: [-6, 0, 0], head: [-4, 4, 0],
+        upperLegL: [-18, 6, 10], lowerLegL: [28, 0, 0], footL: [-8, 8, 0], toeL: [4, 0, 0],
+        upperLegR: [-78, -8, -12], lowerLegR: [118, 0, 0], footR: [-28, -10, 0], toeR: [-6, 0, 0],
+        shoulderL: [8, 12, 10], shoulderR: [4, -8, -8],
+        upperArmL: [-36, 18, 12], lowerArmL: [42, 0, 0],
+        upperArmR: [-48, -14, -10], lowerArmR: [55, 0, 0],
+      },
+      offset: { hips: [0, -0.32, 0.18] },
+    },
+    {
+      t: 0.5, ease: 'sine',
+      pose: {
+        hips: [24, 1, 3], spine: [11, 1, 2], chest: [-9, 5, -3], neck: [-5, 0, 0], head: [-3, 3, 0],
+        upperLegL: [-22, 5, 9], lowerLegL: [32, 0, 0], footL: [-10, 8, 0], toeL: [3, 0, 0],
+        upperLegR: [-74, -7, -11], lowerLegR: [112, 0, 0], footR: [-26, -9, 0], toeR: [-5, 0, 0],
+        shoulderL: [7, 11, 9], shoulderR: [3, -7, -7],
+        upperArmL: [-34, 16, 11], lowerArmL: [40, 0, 0],
+        upperArmR: [-46, -12, -9], lowerArmR: [52, 0, 0],
+      },
+      offset: { hips: [0, -0.335, 0.20] },
+    },
+  ],
+};
+
 /* ------------------------------------------------------------------ export */
 
 const DEFS: ClipDef[] = [
   gaitClip(WALK), gaitClip(RUN), gaitClip(SPRINT), gaitClip(CROUCH_WALK),
-  IDLE, IDLE_ALERT, CROUCH_IDLE, PRONE, PRONE_CRAWL,
+  IDLE, IDLE_ALERT, CROUCH_IDLE, SLIDE, PRONE, PRONE_CRAWL,
   strafeClip('strafeL', 1), strafeClip('strafeR', -1),
   HIT_FRONT, HIT_BACK, HIT_LEFT, HIT_RIGHT,
   DEATH_FRONT, DEATH_BACK, DEATH_HEAD,
@@ -1082,5 +1114,5 @@ export function mantleClipName(rise: number): 'vaultLow' | 'mantle' | 'climb' {
  */
 export const STRIDE: Record<string, number> = {
   walk: 1.421, run: 2.044, sprint: 2.431,
-  crouchWalk: 0.848, strafeL: 0.550, strafeR: 0.550, proneCrawl: 0.253,
+  crouchWalk: 0.848, slide: 2.20, strafeL: 0.550, strafeR: 0.550, proneCrawl: 0.253,
 };

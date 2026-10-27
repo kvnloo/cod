@@ -293,7 +293,10 @@ function impact(
   });
 }
 
-/** A short burst of fire from `origin` toward `dir`, spaced like a real rifle. */
+/** A short burst of fire from `origin` toward `dir`, spaced like a real rifle.
+ *  Delays are relative to *now* (when burst is invoked). `stage()` either
+ *  schedules the whole burst near the end of the settle window or runs it
+ *  immediately and steps — never double-apply SETTLE inside the delays. */
 function burst(
   origin: THREE.Vector3, dir: THREE.Vector3, rounds: number,
   suppressed = false, weapon = 'ar_test', spacing = 0.083, firstIndex = 0,
@@ -301,15 +304,13 @@ function burst(
   const fx = fxRef;
   if (!fx) return;
   for (let i = 0; i < rounds; i++) {
-    const delay = (rounds - 1 - i) * spacing;
+    const delay = i * spacing;
     const shot = firstIndex + i;
-    if (delay <= 0.0001) {
+    const fire = (): void => {
       bus.emit('weapon:fire', { weaponId: weapon, origin, direction: dir, shotIndex: shot, suppressed });
-    } else {
-      fx.after(SETTLE - delay, () => {
-        bus.emit('weapon:fire', { weaponId: weapon, origin, direction: dir, shotIndex: shot, suppressed });
-      });
-    }
+    };
+    if (delay <= 0.0001) fire();
+    else fx.after(delay, fire);
   }
 }
 
@@ -567,13 +568,13 @@ export function registerFxDebugScene(fx: FXSystem, engine: EngineContext['engine
       name: 'fx-impact-concrete',
       description: 'Concrete impact: pale dust puff, hanging plume and a scatter of chips off a sunlit wall',
       position: [-9.5, 2.4, -1.5], yaw: 35, pitch: -5, fov: 50, hour: HOUR, viewModel: false,
-      setup: stage(0.34, () => impact(V(-13.4, 1.85, -6.98), V(0, 0, 1), 'concrete')),
+      setup: stage(0.16, () => impact(V(-13.4, 1.85, -6.98), V(0, 0, 1), 'concrete')),
     },
     {
       name: 'fx-impact-metal',
       description: 'Steel impact: shower of cooling sparks with hot glow ribbons and a ricochet arc',
       position: [-4.2, 2.3, -2.0], yaw: 38, pitch: -5, fov: 50, hour: HOUR, viewModel: false,
-      setup: stage(0.13, () => impact(V(-8, 1.8, -6.83), V(0, 0, 1), 'metal')),
+      setup: stage(0.10, () => impact(V(-8, 1.8, -6.83), V(0, 0, 1), 'metal')),
     },
     {
       name: 'fx-sparks',
@@ -590,31 +591,31 @@ export function registerFxDebugScene(fx: FXSystem, engine: EngineContext['engine
       name: 'fx-impact-wood',
       description: 'Wood impact: pale splinters tumbling out of the board with a puff of sawdust',
       position: [3.6, 2.2, -2.2], yaw: 38, pitch: -4, fov: 50, hour: HOUR, viewModel: false,
-      setup: stage(0.26, () => impact(V(0, 1.8, -6.83), V(0, 0, 1), 'wood')),
+      setup: stage(0.14, () => impact(V(0, 1.8, -6.83), V(0, 0, 1), 'wood')),
     },
     {
       name: 'fx-impact-glass',
       description: 'Glass impact: shards thrown through the pane, fragments falling out of the hole',
       position: [7.6, 2.2, -2.4], yaw: 39, pitch: -4, fov: 50, hour: HOUR, viewModel: false,
-      setup: stage(0.30, () => impact(V(4, 1.8, -6.88), V(0, 0, 1), 'glass')),
+      setup: stage(0.14, () => impact(V(4, 1.8, -6.88), V(0, 0, 1), 'glass')),
     },
     {
       name: 'fx-impact-dirt',
       description: 'Dirt impact: heavy clods and a rising column of earth-coloured dust',
       position: [-11.9, 1.55, 2.6], yaw: 37, pitch: -19, fov: 50, hour: HOUR, viewModel: false,
-      setup: stage(0.40, () => impact(V(-14, 0.22, 0), V(0, 1, 0), 'dirt')),
+      setup: stage(0.18, () => impact(V(-14, 0.22, 0), V(0, 1, 0), 'dirt')),
     },
     {
       name: 'fx-impact-water',
       description: 'Water impact: crown of droplets and two expanding rings on the surface',
       position: [14.3, 1.35, 3.9], yaw: 40, pitch: -18, fov: 48, hour: HOUR, viewModel: false,
-      setup: stage(0.22, () => impact(V(12, 0.04, 1), V(0, 1, 0), 'water')),
+      setup: stage(0.12, () => impact(V(12, 0.04, 1), V(0, 1, 0), 'water')),
     },
     {
       name: 'fx-impact-flesh',
       description: 'Flesh impact: fine red mist and droplets spraying back toward the shooter',
       position: [4.6, 1.75, 2.4], yaw: 37, pitch: -3, fov: 45, hour: HOUR, viewModel: false,
-      setup: stage(0.17, () => impact(V(2, 1.5, -1.0), V(0, 0, 1), 'flesh', 1500, V(0, -0.05, -1))),
+      setup: stage(0.12, () => impact(V(2, 1.5, -1.0), V(0, 0, 1), 'flesh', 1500, V(0, -0.05, -1))),
     },
     {
       name: 'fx-muzzle',
@@ -637,15 +638,12 @@ export function registerFxDebugScene(fx: FXSystem, engine: EngineContext['engine
       // Age must be >= SETTLE so `burst` runs during setup: it anchors its own
       // per-round delays to the settle window, and scheduling the burst itself
       // pushes every round past the captured frame.
-      setup: stage(0.42, () => {
-        // A profile that tracers every round, 12 ms apart, so four of them sit
-        // evenly down the firing line at capture instead of one blur. (An AR
-        // tracers one round in four, which would put a single round off-frame.)
-        // A 340 m/s round crosses the visible width of the sightline in about
-        // 40 ms, so the firing point has to sit far enough off-frame that the
-        // rounds still in the air are the ones inside it.
+      setup: stage(0.10, () => {
+        // Sniper profile tracers every round. Burst delays are relative to the
+        // staged spawn (near the end of settle), so rods are still mid-frame at
+        // capture rather than 100 m past the camera.
         const dir = V(-1, 0.003, -0.028).normalize();
-        burst(V(21.0, 1.70, 2.1), dir, 6, false, 'sniper_test', 0.012, 0);
+        burst(V(16.5, 1.70, 3.4), dir, 6, false, 'sniper_test', 0.014, 0);
       }),
     },
     {

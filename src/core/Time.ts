@@ -1,3 +1,5 @@
+import { settings } from './Settings';
+
 /**
  * Simulation clock with a fixed-step accumulator and a deterministic mode used by
  * the capture harness.
@@ -32,10 +34,13 @@ export class Time {
   /**
    * Hard ceiling on fixed steps per display frame.
    *
-   * Two steps ≈ 16.7 ms of sim at 120 Hz — enough to drain hitch debt without
-   * manufacturing a second >50 ms death-window frame. Residual debt carries.
+   * One step ≈ 8.3 ms of sim at 120 Hz. Wave-2 measured CPU-bound frames where
+   * the body was ~86% of the wall; a second fixed step on the same display
+   * frame manufactures the over50 class. Residual debt carries into quiet
+   * frames. cpuLod ≥ 2 already forces 1; the ceiling is now 1 by default so
+   * high cannot double-sim under load.
    */
-  private maxSteps = 2;
+  private maxSteps = 1;
   /** Previous unscaled frame dt — used to shrink catch-up after a hitch. */
   private prevDt = 0;
 
@@ -76,8 +81,13 @@ export class Time {
     // After a hitch frame, take a single sim step so catch-up itself cannot own
     // the next wall frame (death-window clusters were 50–60 ms of stacked
     // sim+render+ragdoll). Residual debt carries and is repaid on quiet frames.
-    let stepCap = this.maxSteps;
+    // cpuLod from the free budget ladder can also force a single step so the
+    // sim body cannot double-fire under CPU pressure (wave-2: ~86% CPU body).
+    const cpuLod = settings.gfx.cpuLod | 0;
+    let stepCap = cpuLod >= 2 ? 1 : this.maxSteps;
     if (this.prevDt > 0.028 || dt > 0.028) stepCap = 1;
+    // At cpuLod ≥ 3, also shrink residual debt aggressively after any slow frame.
+    if (cpuLod >= 3 && (this.prevDt > 0.018 || dt > 0.018)) stepCap = 1;
     this.prevDt = dt;
 
     this.accumulator += this.delta;

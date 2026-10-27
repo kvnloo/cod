@@ -1,3 +1,4 @@
+import { settings } from '../core/Settings';
 /**
  * Articulated ragdolls.
  *
@@ -526,9 +527,9 @@ export class RagdollManager {
   private ragdolls: Ragdoll[] = [];
   private nextId = 1;
   /** Hard cap; the oldest settled ragdoll is retired when exceeded. */
-  budget = 5;
+  budget = 3;
   /** Seconds a settled ragdoll persists before it is reclaimed. */
-  maxAge = 16;
+  maxAge = 12;
   /**
    * Full constructs on the current display frame. The frame opens on the first
    * fixed step (or on `update` if the frame had zero sim steps). Physics
@@ -542,6 +543,7 @@ export class RagdollManager {
   private pendingTeardown: Ragdoll[] = [];
   /** True after `update()` until the next frame's first fixed/`update` opens it. */
   private frameOpen = true;
+  private syncParity = 0;
   private static readonly MAX_CONSTRUCTS_PER_FRAME = 1;
   private static readonly MAX_TEARDOWNS_PER_FRAME = 1;
 
@@ -602,6 +604,10 @@ export class RagdollManager {
   }
 
   fixedUpdate(dt: number): void {
+    // Free ladder cpuLod trims active corpses before age-out (CPU body cut).
+    const lod = settings.gfx.cpuLod | 0;
+    this.budget = lod >= 3 ? 2 : lod >= 2 ? 3 : lod >= 1 ? 4 : 5;
+    this.maxAge = lod >= 3 ? 8 : lod >= 2 ? 10 : 16;
     this.openFrameIfNeeded();
     for (let i = this.ragdolls.length - 1; i >= 0; i--) {
       const r = this.ragdolls[i];
@@ -626,7 +632,17 @@ export class RagdollManager {
     this.openFrameIfNeeded();
     // Only complete a deferred construct if we did not already tear down.
     this.completeOneDeferred();
-    for (const r of this.ragdolls) r.syncToRig();
+    // cpuLod ≥ 2: sync every other frame; ≥ 3: only unsettled bodies.
+    const lod = settings.gfx.cpuLod | 0;
+    this.syncParity ^= 1;
+    if (lod >= 2 && this.syncParity === 0) {
+      // skip full sync this display frame under CPU pressure
+    } else {
+      for (const r of this.ragdolls) {
+        if (lod >= 3 && r.settled) continue;
+        r.syncToRig();
+      }
+    }
     // Close the frame after presentation; next fixed step re-opens.
     this.frameOpen = true;
   }

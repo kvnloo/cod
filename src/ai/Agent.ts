@@ -17,6 +17,7 @@
 
 import * as THREE from 'three';
 import { bus } from '../core/EventBus';
+import { settings } from '../core/Settings';
 import { Rand } from '../core/Rand';
 import type {
   CharacterController, CharacterMoveResult, HitZone, PhysicsAPI, RayHit,
@@ -442,11 +443,14 @@ export class Agent {
     this.coverSearchTimer -= dt;
     this.pathAge += dt;
 
-    /* --- perceive (staggered, 15 Hz) ----------------------------------- */
+    /* --- perceive (staggered; cpuLod drops Hz under budget pressure) --- */
     this.perceptionTimer -= dt;
     this.perceptionAccum += dt;
     if (this.perceptionTimer <= 0) {
-      this.perceptionTimer = 1 / 15;
+      // 15 → 10 → 7 → 5 Hz as free ladder raises cpuLod (wave-2 CPU body).
+      const lod = settings.gfx.cpuLod | 0;
+      const percHz = lod >= 3 ? 5 : lod >= 2 ? 7 : lod >= 1 ? 10 : 15;
+      this.perceptionTimer = 1 / percHz;
       const wasCombat = this.perception.state === 'combat';
       this.perception.tick(
         this.perceptionAccum, now, this.eye, this.forward, this.target,
@@ -457,10 +461,12 @@ export class Agent {
       this.onPerception(wasCombat, now);
     }
 
-    /* --- decide (staggered, ~6 Hz plus event-driven) -------------------- */
+    /* --- decide (staggered; cpuLod coarsens think rate) ----------------- */
     this.thinkTimer -= dt;
     if (this.thinkTimer <= 0 || this.action === null) {
-      this.thinkTimer = 1 / 6;
+      const lod = settings.gfx.cpuLod | 0;
+      const thinkHz = lod >= 3 ? 3 : lod >= 2 ? 4 : lod >= 1 ? 5 : 6;
+      this.thinkTimer = 1 / thinkHz;
       this.think(now);
     }
 

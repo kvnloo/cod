@@ -174,6 +174,8 @@ export class Engine {
 
     // fixedDelta is constant; scale only changes *how many* steps run via
     // Time.tick's scaled accumulator. Multiplying here would sim at scale².
+    // Fixed-step count is already cpuLod-aware via Time.tick (maxSteps).
+    // Do not multiply scale into fdt — that would sim at scale².
     const fdt = time.fixedDelta;
     for (let i = 0; i < steps; i++) {
       for (const s of this.systems) {

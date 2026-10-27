@@ -203,9 +203,9 @@ export function registerUiDebugScene(hud: HUDSystem, ctx: EngineContext): void {
     hud.subtitle({ speaker: 'OVERLORD', text: 'Uplink secured. Hold that position.' });
 
     // Beats that must land inside the harness's 0.4 s settle window.
-    // Hitmarker + killfeed fire early so they are mid-punch (~70–150 ms old)
-    // when the shutter opens — not scheduled so late they barely appear.
-    hud.schedule(0.04, () => {
+    // Spawn hitmarkers early so at shutter-open (~0.4 s) both the headshot
+    // tick and the kill X are mid-life (lives ≥ 0.7 s after the juice pass).
+    hud.schedule(0.02, () => {
       hud.killfeed({
         killer: 'HAVOC', victim: 'GHOST-ACTUAL', weapon: 'lmg', headshot: false,
         killerIsPlayer: false, victimIsPlayer: true,
@@ -216,10 +216,12 @@ export function registerUiDebugScene(hud: HUDSystem, ctx: EngineContext): void {
       });
       bus.emit('hud:hitmarker', { headshot: true, killed: false, armor: false });
     });
-    hud.schedule(0.10, () => hud.scorePopup(25, 'HIT'));
-    hud.schedule(0.14, () => hud.damageFrom(Math.atan2(0.55, -0.83), 0.28));
-    // Second marker keeps the sandwich alive if the first fades before settle ends.
-    hud.schedule(0.22, () => bus.emit('hud:hitmarker', { headshot: false, killed: true, armor: false }));
+    hud.schedule(0.08, () => hud.scorePopup(25, 'HIT'));
+    hud.schedule(0.10, () => hud.damageFrom(Math.atan2(0.55, -0.83), 0.28));
+    // Kill marker on top of the headshot tick — the CoD sandwich.
+    hud.schedule(0.16, () => bus.emit('hud:hitmarker', { headshot: false, killed: true, armor: false }));
+    // Refresh mid-settle so a late shutter still sees juice.
+    hud.schedule(0.28, () => bus.emit('hud:hitmarker', { headshot: false, killed: true, armor: false }));
     hud.promptProgress(0.62);
 
     // Wall-clock pause so DOM transitions (subtitles) finish. It does not

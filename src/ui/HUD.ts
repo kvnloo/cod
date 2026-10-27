@@ -504,8 +504,8 @@ export class HUDSystem implements System {
     const life = returning ? 4.0 : 6.5;
     this.banners.showControlStrip('CONTROLS', [
       'WASD MOVE  ·  MOUSE LOOK  ·  LMB FIRE  ·  RMB ADS',
-      'SPACE JUMP  ·  C / CTRL CROUCH  ·  SHIFT SPRINT  ·  R RELOAD',
-      'V MELEE  ·  G GRENADE  ·  1/2 WEAPON  ·  TAB SCORE  ·  ESC PAUSE',
+      'SHIFT SPRINT  ·  C / CTRL CROUCH-AT-SPEED SLIDE  ·  SPACE JUMP / SLIDE-JUMP',
+      'SPACE+W NEAR LEDGE MANTLE  ·  R RELOAD  ·  V MELEE  ·  G GRENADE  ·  1/2 WEAPON  ·  TAB  ·  ESC',
     ], life);
     this.controlsStripShownAt = performance.now();
     this.controlsStripHudAt = this.elapsed;

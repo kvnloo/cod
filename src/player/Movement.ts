@@ -174,7 +174,7 @@ export const TUNING: Record<string, number> & {
    *  ~0.4 s covers a kerb / stair lip without eating a full slide-jump window. */
   slideAirGrace: 0.48,
   /** Horizontal mult on a slide-jump. Chains must clear ~1.25× tacSprint mean. */
-  slideJumpBoost: 1.14,
+  slideJumpBoost: 1.22,
   /** Above this the slide-jump boost is not applied; the chain plateaus. */
   slideJumpCap: 16.0,
 

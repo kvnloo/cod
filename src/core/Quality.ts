@@ -153,6 +153,14 @@ export interface GfxSettings {
    * property of the tail.
    */
   targetFrameMs: number;
+  /**
+   * CPU simulation LOD for the free budget ladder. 0 = full AI/physics body.
+   * Higher values drop AI tick rates, ragdoll caps, and fixed-step catch-up
+   * without touching GPU allocations. Wave-2 measured ~86% CPU / ~5 ms GPU at
+   * high/1080p with the dial parked on shadows-off — GPU-only free rungs could
+   * not close that class of fail.
+   */
+  cpuLod: number;
 }
 
 /**
@@ -218,6 +226,7 @@ const ULTRA: GfxSettings = {
   // what it would aim for if the player turns adaptive on themselves.
   adaptive: false,
   targetFrameMs: 16.7,
+  cpuLod: 0,
 };
 
 function derive(base: GfxSettings, o: Partial<GfxSettings>): GfxSettings {
@@ -252,26 +261,24 @@ export const PRESETS: Record<QualityPreset, GfxSettings> = {
    * these knobs moved.
    */
   high: derive(ULTRA, {
-    // Atlas cost dominates the frame. Wave-3 still saw over50 clusters on a
-    // 2-cascade rebuild (dc≈1000 / tri≈1.49M on the rebuild frame) even after
-    // wave-1 cut 4×1536→2×1024. high authors a single 1024 cascade at 10 Hz
-    // with SSR/volumetrics off so a rebuild frame cannot own a hitch, and the
-    // free dial (hz / distance / shadows-off) can close residual over50 without
-    // any REALLOC mid-fight. Honesty over showcase: p99 ≤ 16.7 is the claim.
+    // Atlas + CPU body. Wave-2 live sprint on busy host: frame-p99 53 ms with
+    // GPU ~5 ms and cpu ~86% of the wall — shadows-off (dial 6) still left the
+    // CPU body. high therefore authors a cheap atlas *and* starts at cpuLod 0
+    // with free ladder rungs that raise cpuLod before REALLOC. Target stays
+    // 16.7 ms (the 60 fps claim); if a machine cannot hold it the dial walks
+    // free GPU+CPU concessions, never a dishonest targetFrameMs rewrite.
     shadowMapSize: 1024,
     shadowCascades: 1,
-    shadowDistance: 60,
+    shadowDistance: 55,
     contactShadows: false,
     depthPrepass: false,
-    // SSR + volumetrics are post costs the adaptive dial used to spend free
-    // rungs on; authoring them off leaves those rungs for real emergencies.
-    ssr: false, volumetrics: false,
+    ssr: false, volumetrics: false, ssao: false,
     ssrSteps: 12, volumetricSteps: 12, taaSamples: 8,
-    ssaoQuality: 0.45, maxParticles: 10000, lensDirt: 0.15, dofQuality: 0.4,
-    pcssSoftness: 0.45,
-    shadowUpdateHz: 10, exposureUpdateHz: 15, motionBlur: false, dof: false,
-    drawDistance: 600,
-    adaptive: true, targetFrameMs: 16.7,
+    ssaoQuality: 0.35, maxParticles: 8000, lensDirt: 0.1, dofQuality: 0.35,
+    pcssSoftness: 0.35, foliageDensity: 0.75,
+    shadowUpdateHz: 8, exposureUpdateHz: 12, motionBlur: false, dof: false,
+    drawDistance: 520,
+    adaptive: true, targetFrameMs: 16.7, cpuLod: 0,
   }),
 
   /**

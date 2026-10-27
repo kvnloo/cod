@@ -129,6 +129,8 @@ export class AudioSystem implements System, AudioAPI {
   private started = false;
   private zones: ReverbZoneDesc[] = [];
   private zoneFallback: ImpulseId = DEFAULT_FALLBACK;
+  /** Last known world positions for AI agents (from fire/voice) for spatial VO. */
+  private readonly aiLastPos = new Map<number, THREE.Vector3>();
 
   /* ------------------------------------------------------------- init -- */
 
@@ -367,10 +369,9 @@ export class AudioSystem implements System, AudioAPI {
     this.on('weapon:reload:start', (e) => {
       if (!this.running) return;
       this.reload?.cancel();
-      // Optional duration is stamped by WeaponSystem when reloadScale stretches
-      // the view-model; stages are fractions of that total (cat C AV sync).
-      const duration = (e as { duration?: number }).duration;
-      this.reload = playReload(this.sfx, e.weaponId, e.tactical, true, 0, 0, 0, duration);
+      // duration on the contract is stamped by WeaponSystem when reloadScale
+      // stretches the view-model; stages are fractions of that total (cat C).
+      this.reload = playReload(this.sfx, e.weaponId, e.tactical, true, 0, 0, 0, e.duration);
     });
 
     this.on('weapon:reload:end', () => {
@@ -442,14 +443,20 @@ export class AudioSystem implements System, AudioAPI {
     /* ------------------------------------------------------------ player -- */
     this.on('player:footstep', (e) => {
       if (!this.running) return;
+      // Local player steps are head-locked; AI / remote plants are spatial so
+      // they ILD-localise instead of stacking on the listener (cat C).
+      const local = e.isLocal !== false;
       const now = this.ctx!.currentTime;
-      if (now - this.lastFootstepAt < 0.09) return; // de-bounce double reports
-      this.lastFootstepAt = now;
+      // Debounce only local double-reports; AI agents plant independently.
+      if (local) {
+        if (now - this.lastFootstepAt < 0.09) return;
+        this.lastFootstepAt = now;
+      }
       playFootstep(this.sfx, {
         x: e.point.x, y: e.point.y, z: e.point.z,
         surface: e.surface,
         gait: e.sprinting ? 'sprint' : this.gait,
-        firstPerson: true,
+        firstPerson: local,
         foot: this.footIndex++,
       });
     });
@@ -521,9 +528,14 @@ export class AudioSystem implements System, AudioAPI {
     /* --------------------------------------------------------------- ai -- */
     this.on('ai:fire', (e) => {
       if (!this.running) return;
+      let last = this.aiLastPos.get(e.id);
+      if (!last) { last = new THREE.Vector3(); this.aiLastPos.set(e.id, last); }
+      last.copy(e.origin);
+      const weaponId = e.weaponId ?? 'ar';
       playShot(this.sfx, this.weapons, {
-        weaponId: 'ar',
+        weaponId,
         x: e.origin.x, y: e.origin.y, z: e.origin.z,
+        suppressed: e.suppressed,
         gain: 0.95,
       });
       this.ambience.bumpTension(0.22);
@@ -536,10 +548,20 @@ export class AudioSystem implements System, AudioAPI {
 
     this.on('ai:voice', (e) => {
       if (!this.running) return;
-      playChatter(this.sfx, {
-        x: this.listenerPos.x, y: this.listenerPos.y, z: this.listenerPos.z,
-        urgency: 0.6, radio: false, seed: e.id * 7919 + e.line.length,
-      });
+      // Prefer authored point, else last muzzle/fire origin for this agent so
+      // callouts spatialise instead of collapsing onto the listener.
+      const pos = e.point ?? this.aiLastPos.get(e.id);
+      if (pos) {
+        playChatter(this.sfx, {
+          x: pos.x, y: pos.y, z: pos.z,
+          urgency: 0.6, radio: false, seed: e.id * 7919 + e.line.length,
+        });
+      } else {
+        // Unknown position: radio path (head-locked, intentionally non-world).
+        playChatter(this.sfx, {
+          urgency: 0.55, radio: true, seed: e.id * 7919 + e.line.length,
+        });
+      }
     });
 
     /* -------------------------------------------------- explosions/props -- */
@@ -632,6 +654,24 @@ export class AudioSystem implements System, AudioAPI {
       this.slide = null;
       this.reload = null;
       this.mixer.clearDeafness();
+      this.aiLastPos.clear();
+      // Levels that never call setReverbZones still get a listener-tracking
+      // acoustic field: open exterior under a street-canyon playspace.
+      if (this.zones.length === 0) {
+        this.setReverbZones([
+          {
+            id: 'playspace-street', ir: 'streetCanyon',
+            center: [0, 8, 0], half: [180, 24, 180], feather: 28, wet: 0.85, priority: 1,
+          },
+          {
+            id: 'playspace-open', ir: 'openField',
+            center: [0, 8, 0], half: [520, 60, 520], feather: 80, wet: 0.45, priority: 0,
+          },
+        ], DEFAULT_FALLBACK);
+      } else {
+        // Re-apply authored set so the rack tracks the new level's listener path.
+        this.reverb.setZones(this.zones, this.zoneFallback);
+      }
     });
 
     this.on('settings:changed', (e) => {

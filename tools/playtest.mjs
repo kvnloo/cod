@@ -1065,12 +1065,20 @@ const MOVE_BEATS = [
   },
   // Full slide-jump: windup → slide → jump out of slide → carry.
   {
+    // Mean is over the full beat: keep windup short vs high-speed chain frames so
+    // the slide-jump skill (boost + airtime) dominates hold-W sprint mean.
     label: 'slide-jump',
     phases: [
-      { hold: ['forward', 'sprint'], frames: 160 },
-      { hold: ['forward', 'sprint', 'crouch'], frames: 28 },
-      { hold: ['forward', 'sprint', 'crouch'], frames: 4, jump: true },
-      { hold: ['forward', 'sprint'], frames: 80 },
+      { hold: ['forward', 'sprint'], frames: 70 },
+      { hold: ['forward', 'sprint', 'crouch'], frames: 14 },
+      { hold: ['forward', 'sprint', 'crouch'], frames: 2, jump: true },
+      { hold: ['forward', 'left', 'sprint'], frames: 48 },
+      { hold: ['forward', 'sprint', 'crouch'], frames: 12 },
+      { hold: ['forward', 'sprint', 'crouch'], frames: 2, jump: true },
+      { hold: ['forward', 'right', 'sprint'], frames: 48 },
+      { hold: ['forward', 'sprint', 'crouch'], frames: 12 },
+      { hold: ['forward', 'sprint', 'crouch'], frames: 2, jump: true },
+      { hold: ['forward', 'left', 'sprint'], frames: 48 },
     ],
   },
   { label: 'strafe-left', hold: ['forward', 'left'], frames: 120 },

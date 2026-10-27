@@ -141,13 +141,14 @@ void main() {
     float r = length(d) * 1.35;
     vec2 nd = normalize(d + vec2(1e-6));
     float side = sat(dot(nd, uDamageDir) * 0.5 + 0.5);
-    // A ring around the frame, heaviest on the side the shot came from.
-    float ring = smoothstep(0.34, 1.05, r);
-    float w = ring * mix(0.25, 1.0, pow(side, 2.2)) * uDamage;
+    // Rim-only ring — centre FOV stays clear for aim (CoD gunfeel contract).
+    // smoothstep starts further out so stacked hits cannot wash the reticle.
+    float ring = smoothstep(0.58, 1.12, r);
+    float w = ring * mix(0.18, 1.0, pow(side, 2.4)) * uDamage;
     vec3 blood = vec3(0.42, 0.015, 0.01);
-    color = mix(color, blood, sat(w * 0.9));
-    // Desaturate as the player takes damage.
-    color = mix(color, vec3(luma(color)), sat(uDamage * 0.35));
+    color = mix(color, blood, sat(w * 0.72));
+    // Light edge desat only — never collapse mid-frame contrast.
+    color = mix(color, vec3(luma(color)), sat(uDamage * ring * 0.22));
   }
 
   /* --- flashbang ---------------------------------------------------------- */

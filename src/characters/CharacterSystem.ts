@@ -57,11 +57,27 @@ export class CharacterSystem implements System, CharacterFactory {
       },
       groundProbe: null,
       onFootPlant: (character, foot, speed) => {
+        // Plant point is the character root projected to the sole; AI plants are
+        // world-spatial (isLocal: false) so footsteps localise via HRTF rather
+        // than stacking head-locked on the listener (cat C).
         character.object.getWorldPosition(_p);
+        _p.y += 0.05;
+        let surface = 'dirt';
+        const phys = this.physics;
+        if (phys?.ready) {
+          _origin.set(_p.x, _p.y + 1.2, _p.z);
+          _down.set(0, -1, 0);
+          const hit = phys.raycast(_origin, _down, 2.6, MASK_MOVE, _ray);
+          if (hit.hit) {
+            surface = hit.surface || surface;
+            _p.y = hit.point.y + 0.02;
+          }
+        }
+        // Slight lateral offset so L/R plants aren't mono-collocated.
+        _p.x += foot === 0 ? -0.12 : 0.12;
         bus.emit('player:footstep', {
-          point: _p.clone(), surface: 'dirt', sprinting: speed > 4,
+          point: _p.clone(), surface, sprinting: speed > 4, isLocal: false,
         });
-        void foot;
       },
       onDeath: (character) => {
         // Death clip finished — hand off to physics ragdoll. Impulse/zone may

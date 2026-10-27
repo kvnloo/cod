@@ -154,12 +154,12 @@ export class Impacts {
       d.py = p.y + nrm.y * 0.12 + tmp.y * 0.05;
       d.pz = p.z + nrm.z * 0.12 + tmp.z * 0.05;
       d.vx = tmp.x * s; d.vy = tmp.y * s + 0.25; d.vz = tmp.z * s;
-      d.sizeBegin = (0.10 + rand.next() * 0.08) * dustMul;
-      d.sizeEnd = (0.48 + rand.next() * 0.42) * dustMul * (0.7 + power * 0.5);
-      d.lifetime = 0.7 + rand.next() * 0.8;
+      d.sizeBegin = (0.14 + rand.next() * 0.12) * dustMul;
+      d.sizeEnd = (0.62 + rand.next() * 0.55) * dustMul * (0.7 + power * 0.5);
+      d.lifetime = 0.95 + rand.next() * 1.0;
       d.rot = rand.range(0, 6.28);
       d.spin = rand.signed() * 1.2;
-      d.opacity = 0.58 + rand.next() * 0.28;
+      d.opacity = 0.72 + rand.next() * 0.26;
       void i;
     });
 
@@ -618,8 +618,49 @@ export class Impacts {
   private flesh(w: FxWorld, p: THREE.Vector3, power: number, detail: number, floorY: number): void {
     // Always a punch of light so the hit is readable even with blood off, and
     // so a still capture has a hot core when the mist is mid-expand.
-    this.impactFlash(w, p, 0.09 * power, w.blood ? 0xc02018 : 0x886655, 0.38);
-    if (!w.blood) return;
+    this.impactFlash(w, p, 0.14 * power, w.blood ? 0xc02018 : 0xccaa88, 0.72);
+    if (!w.blood) {
+      // Fabric/dust substitute when blood is disabled — still surface-ID readable.
+      const { particles: g, rand } = w;
+      g.begin({
+        cell: CELL.DUST, frames: CELL.DUST_FRAMES, model: MODEL.MEDIA,
+        flags: FLAG.ANIM | FLAG.FADEIN | FLAG.SHADOW,
+        r: 0.62, g: 0.52, b: 0.42, opacity: 0.85,
+        drag: 2.4, gravity: 0.15, turbulence: 0.45,
+      });
+      g.pushMany(10 + Math.round(8 * detail), () => {
+        const d = g.desc;
+        const s = 1.2 + rand.next() * 2.4 * power;
+        tmp.copy(ref).multiplyScalar(0.7 + rand.next() * 0.8)
+          .addScaledVector(tan, rand.signed() * 0.7)
+          .addScaledVector(bit, rand.signed() * 0.7).normalize();
+        d.px = p.x; d.py = p.y; d.pz = p.z;
+        d.vx = tmp.x * s; d.vy = tmp.y * s + 0.3; d.vz = tmp.z * s;
+        d.sizeBegin = 0.10; d.sizeEnd = 0.48 + rand.next() * 0.35;
+        d.lifetime = 0.55 + rand.next() * 0.45;
+        d.rot = rand.range(0, 6.28); d.spin = rand.signed() * 1.4;
+        d.opacity = 0.7 + rand.next() * 0.25;
+      });
+      g.begin({
+        cell: CELL.CHIP_A, frames: CELL.CHIP_FRAMES, model: MODEL.SOLID,
+        flags: FLAG.COLLIDE | FLAG.SHADOW,
+        r: 0.45, g: 0.38, b: 0.30, opacity: 1,
+        drag: 0.4, gravity: 1, bounce: 0.1, floorY,
+      });
+      g.pushMany(5 + Math.round(4 * detail), () => {
+        const d = g.desc;
+        const s = 1.8 + rand.next() * 3.5 * power;
+        tmp.copy(ref).multiplyScalar(0.6 + rand.next())
+          .addScaledVector(tan, rand.signed()).addScaledVector(bit, rand.signed()).normalize();
+        d.px = p.x; d.py = p.y; d.pz = p.z;
+        d.vx = tmp.x * s; d.vy = tmp.y * s + 0.8; d.vz = tmp.z * s;
+        const sz = 0.02 + rand.next() * 0.03;
+        d.sizeBegin = sz; d.sizeEnd = sz;
+        d.lifetime = 0.8 + rand.next() * 0.6;
+        d.rot = rand.range(0, 6.28); d.spin = rand.signed() * 10;
+      });
+      return;
+    }
     const { particles: g, rand } = w;
 
     // --- mist: saturated arterial red, MEDIA so it holds opacity in sun
@@ -766,13 +807,25 @@ export class Impacts {
   /** The sub-frame flash of the round's own energy dumping into the surface. */
   private impactFlash(w: FxWorld, p: THREE.Vector3, size: number, color: number, gain: number): void {
     const c = new THREE.Color(color);
+    // Dual flash: hot core (short) + larger linger so staged stills at 0.15–0.4 s
+    // still read surface identity instead of an empty wall.
     w.quads.begin({
       px: p.x + nrm.x * 0.02, py: p.y + nrm.y * 0.02, pz: p.z + nrm.z * 0.02,
-      w0: size * 0.5, h0: size * 0.5, w1: size * 2.4, h1: size * 2.4,
+      w0: size * 0.7, h0: size * 0.7, w1: size * 2.8, h1: size * 2.8,
       r: c.r * gain, g: c.g * gain, b: c.b * gain, alpha: 1,
-      life: 0.075, cell: CELL.GLOW_TIGHT, frames: 1,
+      life: 0.14, cell: CELL.GLOW_TIGHT, frames: 1,
       mode: 0, blend: QUAD_BLEND.ADD, lit: false,
-      fadeIn: 0.12, fadeOut: 0.2, soft: 0, intensity: 2.4,
+      fadeIn: 0.06, fadeOut: 0.28, soft: 0, intensity: 4.2,
+      rot: w.rand.range(0, 6.28),
+    });
+    w.quads.push();
+    w.quads.begin({
+      px: p.x + nrm.x * 0.03, py: p.y + nrm.y * 0.03, pz: p.z + nrm.z * 0.03,
+      w0: size * 1.2, h0: size * 1.2, w1: size * 4.5, h1: size * 4.5,
+      r: c.r * gain * 0.7, g: c.g * gain * 0.65, b: c.b * gain * 0.55, alpha: 0.85,
+      life: 0.38, cell: CELL.GLOW_SOFT, frames: 1,
+      mode: 0, blend: QUAD_BLEND.ADD, lit: false,
+      fadeIn: 0.04, fadeOut: 0.55, soft: 0.2, intensity: 1.8,
       rot: w.rand.range(0, 6.28),
     });
     w.quads.push();

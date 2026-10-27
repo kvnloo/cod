@@ -33,7 +33,7 @@ import { setWorldRotation, twoBoneIK } from './Ik';
 
 const DEG = Math.PI / 180;
 
-export type Locomotion = 'idle' | 'walk' | 'run' | 'sprint' | 'crouch' | 'prone';
+export type Locomotion = 'idle' | 'walk' | 'run' | 'sprint' | 'crouch' | 'prone' | 'slide';
 export type CarryPose = 'ready' | 'aim' | 'run' | 'sprint' | 'relaxed' | 'cover';
 
 /** Where the weapon sits relative to the chest bone, per carry. */
@@ -114,6 +114,7 @@ export class Animator {
   private cyclePhase = 0;
   private idlePhase = 0;
   private crouchW = 0;
+  private slideW = 0;
   private proneW = 0;
   private moveW = 0;
   private runW = 0;
@@ -269,7 +270,9 @@ export class Animator {
       this.dying = true;
       this.footIKWeight = 0;
       this.armIKWeight = 0;
-      action.fade = 0.05;
+      // Was 0.05 — a one-frame pop into the death pose. Cross-fade long enough
+      // that the collapse reads as a performance, not a teleport.
+      action.fade = Math.max(fade, 0.18);
       action.done = () => {
         this.frozen = true;
         this.hooks.onDeathComplete?.();
@@ -367,10 +370,11 @@ export class Animator {
   /* ------------------------------------------------------- state advance */
 
   private advance(dt: number): void {
-    const standing = this.state !== 'crouch' && this.state !== 'prone';
+    const standing = this.state !== 'crouch' && this.state !== 'prone' && this.state !== 'slide';
     const k = 1 - Math.exp(-dt * 9);
     this.crouchW += ((this.state === 'crouch' ? 1 : 0) - this.crouchW) * k;
     this.proneW += ((this.state === 'prone' ? 1 : 0) - this.proneW) * k;
+    this.slideW += ((this.state === 'slide' ? 1 : 0) - this.slideW) * (1 - Math.exp(-dt * 12));
 
     // Speed → locomotion weights.
     const s = this.speed;
@@ -388,7 +392,8 @@ export class Animator {
     const stride = THREE.MathUtils.lerp(
       THREE.MathUtils.lerp(STRIDE.walk, STRIDE.run, this.runW),
       STRIDE.sprint, this.sprintW,
-    ) * THREE.MathUtils.lerp(1, STRIDE.crouchWalk / STRIDE.walk, this.crouchW);
+    ) * THREE.MathUtils.lerp(1, STRIDE.crouchWalk / STRIDE.walk, this.crouchW)
+      * THREE.MathUtils.lerp(1, (STRIDE.slide ?? 2.2) / STRIDE.walk, this.slideW);
     const cycleRate = s > 0.05 ? s / Math.max(stride, 0.2) : 0.55;
     const prev = this.cyclePhase;
     this.cyclePhase = (this.cyclePhase + dt * cycleRate) % 1;
@@ -409,9 +414,10 @@ export class Animator {
 
     // Carry pose follows the locomotion unless something overrode it.
     if (this.carry !== 'aim' && this.carry !== 'cover') {
-      const want: CarryPose = this.sprintW > 0.5 ? 'sprint'
-        : this.runW > 0.55 ? 'run'
-          : this.alert ? 'ready' : 'relaxed';
+      const want: CarryPose = this.slideW > 0.4 ? 'sprint'
+        : this.sprintW > 0.5 ? 'sprint'
+          : this.runW > 0.55 ? 'run'
+            : this.alert ? 'ready' : 'relaxed';
       if (want !== this.carry) this.applyCarry(want, false);
     }
     const ck = 1 - Math.exp(-dt * 8);
@@ -479,6 +485,13 @@ export class Animator {
         this.tmpA.blend(this.tmpB, this.moveW);
       }
       out.blend(this.tmpA, this.crouchW);
+    }
+
+    if (this.slideW > 0.001) {
+      const sl = clips().get('slide')!;
+      // Phase from distance so the slide pose holds while drifting, not cycling.
+      sl.sample(Math.min(0.92, this.cyclePhase * 0.35 + 0.2), this.tmpA);
+      out.blend(this.tmpA, this.slideW);
     }
 
     if (this.proneW > 0.001) {

@@ -69,7 +69,9 @@ export class HitMarkers implements Widget {
     m.active = true;
     m.kind = kind;
     m.age = 0;
-    m.life = kind === 'kill' ? 0.72 : kind === 'crit' ? 0.55 : 0.42;
+    // Lives long enough that a 0.4 s harness settle still sees the sandwich
+    // (normal under kill) mid-punch rather than empty reticle.
+    m.life = kind === 'kill' ? 1.05 : kind === 'crit' ? 0.85 : 0.70;
     m.scale.set(0.52);
     m.scale.to(1);
     m.scale.kick(kind === 'kill' ? 7 : 4.5);
@@ -113,7 +115,7 @@ export class HitMarkers implements Widget {
       c.globalAlpha = a;
       const sc = k.scale.value * d.s;
       switch (k.kind) {
-        case 'normal': drawTicks(c, sc, 5.5, 12.5, 2.0, rgba([0xef, 0xf5, 0xff], 1)); break;
+        case 'normal': drawTicks(c, sc, 6.0, 14.0, 2.4, rgba([0xef, 0xf5, 0xff], 1)); break;
         case 'armor': drawArmor(c, sc, p, a); break;
         case 'crit': drawCrit(c, sc, p, t); break;
         case 'kill': drawKill(c, sc, p, t); break;

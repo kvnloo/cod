@@ -103,10 +103,14 @@ const LADDER: Rung[] = [
     },
   },
 
-  // 2 — metering + DoF out.
+  // 2 — metering + DoF out + first CPU LOD (AI rates / ragdoll caps).
   {
-    name: 'meter-15hz+dof-off',
-    apply: (g) => { g.exposureUpdateHz = slowTo(g.exposureUpdateHz, 15); g.dof = false; },
+    name: 'meter-15hz+dof-off+cpu1',
+    apply: (g) => {
+      g.exposureUpdateHz = slowTo(g.exposureUpdateHz, 15);
+      g.dof = false;
+      g.cpuLod = Math.max(g.cpuLod, 1);
+    },
   },
 
   // 3 — far shadow range, motion blur, atlas 10 Hz, draw distance cut.
@@ -120,14 +124,15 @@ const LADDER: Rung[] = [
     },
   },
 
-  // 4 — SSR and SSAO out, atlas 8 Hz.
+  // 4 — SSR/SSAO out, atlas 8 Hz, CPU LOD 2 (coarser AI + 1 fixed step).
   {
-    name: 'ssr-off+ssao-off+shadows-8hz',
+    name: 'ssr-off+ssao-off+shadows-8hz+cpu2',
     apply: (g) => {
       g.ssr = false;
       g.ssao = false;
       g.shadowUpdateHz = slowTo(g.shadowUpdateHz, 8);
       g.lensDirt = 0;
+      g.cpuLod = Math.max(g.cpuLod, 2);
     },
   },
 
@@ -147,19 +152,19 @@ const LADDER: Rung[] = [
     },
   },
 
-  // 6 — last allocation-free floor: kill the atlas entirely + pull draw distance.
-  // Wave-3: dial sat at 5 while residual cascade+opaque submit still produced
-  // over50 clusters; REALLOC was unused because of the 4 s dwell. shadows-off
-  // is free, measured −5.66 ms / −70% draws on the reference machine, and is
-  // the only free concession that can zero a rebuild hitch.
+  // 6 — last free floor: shadows-off + draw cut + CPU LOD 3 (AI/ragdoll floor).
+  // Wave-2: dial ended at 6 shadows-off while frame body stayed CPU-bound
+  // (~86% CPU / ~5 ms GPU). GPU-only free rungs cannot close that; cpuLod 3
+  // is the free concession that actually trims the sim body.
   {
-    name: 'shadows-off+draw-55%',
+    name: 'shadows-off+draw-55%+cpu3',
     apply: (g, b) => {
       g.shadows = false;
       g.shadowUpdateHz = slowTo(g.shadowUpdateHz, 4);
       g.drawDistance = b.drawDistance * 0.55;
       g.ssr = false;
       g.volumetrics = false;
+      g.cpuLod = Math.max(g.cpuLod, 3);
     },
   },
 
@@ -196,28 +201,26 @@ export const BUDGET_LADDER = LADDER.map((r) => r.name);
 /** Frames sampled before the governor is allowed to act on the estimate. */
 const WINDOW = 96;
 /**
- * A frame this long is a load, a first-draw compile or a tab switch, not a
- * budget signal, and it is excluded from the estimate.
+ * Outlier ceiling for budget sampling.
  *
- * 80 ms rather than something larger because of what the measurements actually
- * contain: a scripted 12 s firefight has exactly two frames over 50 ms, both
- * around 85 ms, both at a one-off resource upload. Letting those into a 96-frame
- * window is enough to push `low` — running at 2.4 ms, a third of its budget —
- * four rungs down the ladder and keep it there. Nothing the ladder can do would
- * have prevented either frame, so reacting to them only costs image quality.
+ * Hard gates are p99 and frames > 50 ms. Wave-2 measured worst frames of
+ * 80–120 ms after warm-up (live sprint). Clamping those to a synthetic 51 ms
+ * (old SPIKE_MS=80) under-weighted the hitch class against the hard over50
+ * gate — the dial saw "barely red" while the harness counted real fails.
  *
- * Frames in the 50–80 ms band (rebuild hitches, dial commits that force a full
- * atlas rebuild) are deliberately *kept*: hard gates are p99 and over50, and
- * those are exactly the frames the dial must close.
+ * Keep 50–150 ms samples at face value so p99/over50 pressure walks free
+ * rungs. Only true outliers above 150 ms (tab switch / first-compile) are
+ * de-weighted to a single over50 tick so they still push the dial without
+ * monopolising a 96-frame window.
  */
-const SPIKE_MS = 80;
+const SPIKE_MS = 150;
 
 /** Gfx keys the ladder mutates — compared to detect no-op rungs. */
 const LADDER_KEYS: (keyof GfxSettings)[] = [
   'shadowUpdateHz', 'exposureUpdateHz', 'contactShadows', 'depthPrepass',
   'dof', 'motionBlur', 'shadowDistance', 'ssr', 'volumetrics', 'shadowCascades',
   'ssao', 'taaSamples', 'renderScale', 'maxParticles', 'lensDirt', 'shadowMapSize',
-  'pcssSoftness', 'maxDecals', 'shadows', 'drawDistance',
+  'pcssSoftness', 'maxDecals', 'shadows', 'drawDistance', 'cpuLod',
 ];
 
 function gfxEqual(a: GfxSettings, b: GfxSettings): boolean {
@@ -353,7 +356,8 @@ export class FrameBudget {
     // not pollute p90/p99. Record a synthetic 51 ms sample so over50 pressure
     // still walks free rungs to shadows-off — and keep evaluating (early return
     // here left the dial frozen during multi-frame hitch trains).
-    const sample = ms > SPIKE_MS ? 51 : ms;
+    // Face-value below SPIKE_MS; outliers become one over50 tick (55 ms).
+    const sample = ms > SPIKE_MS ? 55 : ms;
     this.ring[this.cursor] = sample;
     this.cursor = (this.cursor + 1) % WINDOW;
     if (this.filled < WINDOW) this.filled++;

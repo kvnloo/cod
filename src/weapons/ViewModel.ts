@@ -47,6 +47,8 @@ export interface ViewModelState {
   stepPhase: number;
   grounded: boolean;
   crouch: number;
+  /** 0..1 slide presentation blend (distinct from sprint tuck). */
+  slide?: number;
   /** Raw mouse delta this frame, device units. */
   lookDX: number;
   lookDY: number;
@@ -86,6 +88,9 @@ export class ViewModel {
   private adsSpring = new Spring1(7.5, 0.66);
   private ads = 0;
   private sprint = 0;
+  private slideW = 0;
+  private crouchW = 0;
+  private mantleT = -1;
   private lowReady = 0;
   private hidden = false;
 
@@ -132,6 +137,7 @@ export class ViewModel {
   private readonly _p2 = new THREE.Vector3();
   private readonly _q = new THREE.Quaternion();
   private readonly _q2 = new THREE.Quaternion();
+  private readonly _qTmp = new THREE.Quaternion();
   private readonly _e = new THREE.Euler(0, 0, 0, 'XYZ');
   private readonly _add = new THREE.Vector3();
   private readonly _addRot = new THREE.Vector3();
@@ -359,10 +365,11 @@ export class ViewModel {
     this.kickRot.impulse(-2.2, 0, 0);
   }
 
-  /** Called when the player mantles or vaults — a big, low, two-handed swing. */
+  /** Called when the player mantles or vaults — timed two-handed pull, not a dead impulse. */
   mantle(): void {
-    this.impulsePos.impulse(0.4, -2.2, 0.9);
-    this.kickRot.impulse(9, 6, 12);
+    this.mantleT = 0;
+    this.impulsePos.impulse(0.35, -1.6, 0.7);
+    this.kickRot.impulse(6, 4, 8);
   }
 
   /* ---------------------------------------------------------------- update */
@@ -390,22 +397,61 @@ export class ViewModel {
     const sprintRate = s.sprint > this.sprint
       ? 1 / Math.max(0.04, def.handling.sprintIn)
       : 1 / Math.max(0.04, this.stats?.sprintOut ?? def.handling.sprintOut);
-    this.sprint = approach(this.sprint, s.sprint, sprintRate, dt);
+    const slideTarget = Math.max(0, Math.min(1, s.slide ?? 0));
+    // Slide is not sprint: drop out of sprint blend when sliding so the
+    // dedicated low-gun pose can take over.
+    const sprintTarget = slideTarget > 0.5 ? 0 : s.sprint;
+    this.sprint = approach(this.sprint, sprintTarget, sprintRate, dt);
+    this.slideW = approach(this.slideW, slideTarget, 14, dt);
+    this.crouchW = approach(this.crouchW, Math.max(0, Math.min(1, s.crouch)) * (1 - this.slideW), 10, dt);
     this.lowReady = approach(this.lowReady, s.lowReady, 14, dt);
 
     const busy = this.action.kind === 'reload' || this.action.kind === 'reloadShell'
       || this.action.kind === 'melee' || this.action.kind === 'inspect';
     const adsW = busy ? this.ads * 0.15 : this.ads;
-    const sprintW = this.sprint * (1 - adsW);
-    const lowW = this.lowReady * (1 - adsW) * (1 - sprintW);
+    const sprintW = this.sprint * (1 - adsW) * (1 - this.slideW);
+    const slideW = this.slideW * (1 - adsW);
+    const crouchW = this.crouchW * (1 - adsW) * (1 - slideW) * (1 - sprintW);
+    const lowW = this.lowReady * (1 - adsW) * (1 - sprintW) * (1 - slideW);
 
     /* --- base pose ---------------------------------------------------- */
     this._p.copy(this.pHip).lerp(this.pAds, adsW);
     this._q.copy(this.qHip).slerp(this.qAds, adsW);
     this._p.lerp(this.pSprint, sprintW);
     this._q.slerp(this.qSprint, sprintW);
+    // Slide: gun lower and more forward than sprint tuck, slight roll into the dive.
+    if (slideW > 0.001) {
+      this._p.x += 0.04 * slideW;
+      this._p.y += -0.12 * slideW;
+      this._p.z += 0.08 * slideW;
+      this._e.set(18 * DEG * slideW, -8 * DEG * slideW, -14 * DEG * slideW);
+      this._q.multiply(this._qTmp.setFromEuler(this._e));
+    }
+    // Crouch: subtle drop + nose-up so hip-fire from crouch reads distinct.
+    if (crouchW > 0.001) {
+      this._p.y += -0.045 * crouchW;
+      this._p.z += 0.02 * crouchW;
+      this._e.set(6 * DEG * crouchW, 0, 0);
+      this._q.multiply(this._qTmp.setFromEuler(this._e));
+    }
     this._p.lerp(this.pLow, lowW);
     this._q.slerp(this.qLow, lowW);
+
+    // Timed mantle pull: plant → haul → settle over ~0.42 s.
+    if (this.mantleT >= 0) {
+      this.mantleT += dt;
+      const u = Math.min(1, this.mantleT / 0.42);
+      const haul = u < 0.45
+        ? (u / 0.45)
+        : 1 - ((u - 0.45) / 0.55);
+      const pull = haul * haul * (3 - 2 * haul);
+      this._p.y += -0.18 * pull;
+      this._p.z += 0.12 * pull;
+      this._p.x += 0.05 * pull;
+      this._e.set(22 * DEG * pull, 10 * DEG * pull, 14 * DEG * pull);
+      this._q.multiply(this._qTmp.setFromEuler(this._e));
+      if (u >= 1) this.mantleT = -1;
+    }
 
     /* --- weapon bob: a figure-8 on the footstep phase ------------------ */
     const bobScale = settings.game.weaponBob * def.view.bobScale

@@ -490,6 +490,7 @@ export class WeaponSystem implements System {
 
   /* --------------------------------------------------------------- stance */
 
+  private stanceSliding = false;
   private stanceSprinting = false;
   private stanceCrouched = false;
   private stanceProne = false;
@@ -501,7 +502,8 @@ export class WeaponSystem implements System {
     const p = this.player;
     if (!p) return;
     const st = p.state;
-    this.stanceSprinting = st === 'sprint' || st === 'tacSprint' || st === 'slide';
+    this.stanceSliding = st === 'slide';
+    this.stanceSprinting = st === 'sprint' || st === 'tacSprint';
     this.stanceCrouched = st === 'crouchIdle' || st === 'crouchWalk' || st === 'slide';
     this.stanceProne = st === 'prone' || st === 'proneCrawl';
     this.stanceSpeed01 = p.speed01;
@@ -1165,7 +1167,8 @@ export class WeaponSystem implements System {
       speed01: this.stanceSpeed01,
       stepPhase: this.stepPhase,
       grounded: this.stanceGrounded,
-      crouch: this.stanceCrouched ? 1 : 0,
+      crouch: this.stanceCrouched && !this.stanceSliding ? 1 : 0,
+      slide: this.stanceSliding ? 1 : 0,
       lookDX: s.mouseDX,
       lookDY: s.mouseDY,
       strafe: s.moveX,

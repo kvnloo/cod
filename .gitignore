@@ -1,0 +1,21 @@
+# OS / editor
+.DS_Store
+.idea
+.vscode/*
+!.vscode/extensions.json
+*.sw?
+*.suo
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+*.local
+*.pem
+*.key
+
+# Dependencies / build
+node_modules
+dist
+dist-ssr
+*.log
